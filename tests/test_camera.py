@@ -12,12 +12,13 @@ from core.camera import CameraReader
 def main():
     # 测试配置
     config = {
-        "mode": "camera",      # 模式: camera, video, stream
+        "mode": "stream",      # 模式: camera, video, stream
         "device_id": 0,        # 默认摄像头设备号
         "width": 640,          # 测试分辨率宽
         "height": 480,         # 测试分辨率高
         "fps": 30,             # 帧率
-        "mirror": True         # 是否镜像翻转
+        "mirror": False,        # 是否镜像翻转
+        "stream_url": "http://192.168.3.223:8080/ar_feed"
     }
 
     print("正在初始化摄像头...")
