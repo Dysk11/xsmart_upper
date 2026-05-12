@@ -1,0 +1,183 @@
+app:
+  # FPS 数字显示的平滑系数，越大越灵敏，越小越稳定。
+  fps_smoothing_alpha: 0.2
+
+camera:
+  # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，stream 表示网络流。
+  mode: camera
+  # 摄像头设备号，Linux 下常见为 0、1、2。
+  device_id: 0
+  # 视频模式下使用的视频路径。
+  video_path: ""
+  # 网络流模式下的 http/rtsp 视频地址流。
+  stream_url: ""
+  # 视频是否循环播放。
+  loop_video: false
+  # 采集或回放后希望使用的图像尺寸。
+  width: 1280
+  height: 720
+  fps: 30
+  # 是否镜像翻转，部分摄像头安装方向反了时很有用。
+  mirror: false
+  reconnect_interval_sec: 0.5
+  max_reconnect_attempts: 5
+
+preprocess:
+  resize:
+    # 是否先统一缩放，方便后续参数固定。
+    enable: true
+    width: 1280
+    height: 720
+  roi:
+    # ROI 用比例表示，减少分辨率变化带来的重复调参。
+    top_ratio: 0.61
+    bottom_ratio: 1.0
+    left_ratio: 0.05
+    right_ratio: 0.95
+  gaussian_blur:
+    # 轻度模糊能压掉部分噪点，但太大可能让边界发糊。
+    enable: true
+    kernel_size: 5
+    sigma_x: 0.0
+  clahe:
+    # CLAHE 用于缓解局部过曝或阴影导致的对比度问题。
+    enable: true
+    clip_limit: 2.0
+    tile_grid_size: 8
+  brightness_normalization:
+    # 亮度归一化用于降低左右光照不均的影响。
+    enable: true
+    target_mean: 150.0
+    min_gain: 0.7
+    max_gain: 1.35
+
+detector:
+  # 颜色空间可选 hsv 或 lab，现场建议都试一下再定。
+  color_space: hsv
+  hsv:
+    # 蓝色航道的 HSV 阈值。
+    lower: [89, 90, 62]
+    upper: [110, 255, 255]
+  lab:
+    # 蓝色航道的 Lab 阈值。
+    lower: [20, 120, 80]
+    upper: [255, 170, 135]
+  morphology:
+    # 开闭运算参数，用于去噪和补洞。
+    open_kernel: 1
+    close_kernel: 5
+    erode_iterations: 0
+    dilate_iterations: 1
+  connected_components:
+    # 连通域筛选参数，避免把零散小蓝块当成主航道。
+    min_area: 680
+    min_height: 21
+    max_components: 3
+    # 下面这一组参数用于“主航道链连接约束”，不是去删远处蓝色航道。
+    # 原则是：宁可停止继续往上接，也不要把墙上广告牌或航道外蓝块接进中心线。
+    min_component_chain_score: 35.0
+    short_gap_y_threshold: 24
+    short_gap_max_dx_px: 120
+    max_far_width_growth_ratio: 1.45
+    width_growth_guard_top_ratio: 0.48
+    environment_guard_top_ratio: 0.34
+    environment_guard_min_chain_length: 2
+    environment_compact_aspect_ratio_max: 2.2
+    environment_small_area_max: 4200
+    environment_small_width_ratio: 0.72
+    environment_side_penalty: 28.0
+  centerline:
+    # scan_step 越小点越密，效果更细，但计算量略大。
+    scan_step: 4
+    min_valid_points: 6
+    min_lane_width_px: 18
+    default_lane_width_px: 60
+    # 这条赛道是块状蓝白航道，默认关闭单侧推中心，避免把中心线推到航道外。
+    single_side_infer_ratio: 0.55
+    enable_single_side_inference: false
+    single_side_edge_margin_px: 28
+    prediction_blend: 0.2
+    distance_weight: 0.12
+    center_bias: 0.02
+    lookahead_ratio: 0.45
+    max_center_jump_px: 120
+    fit_top_extension_rows: 1
+  confidence:
+    # 置信度低于 lost_threshold 时认为本帧基本不可用。
+    lost_threshold: 0.22
+    expected_area_ratio: 0.04
+    residual_tolerance_px: 22.0
+
+tracker:
+  # EMA 平滑参数和短时丢线预测参数。
+  ema_alpha: 0.25
+  recovery_alpha: 0.45
+  confidence_gate: 0.45
+  max_prediction_frames: 6
+  prediction_decay: 0.88
+  min_prediction_confidence: 0.10
+  centerline_alpha: 0.25
+  max_centerline_point_shift_px: 80
+
+planner:
+  # 这些参数只用于上位机高层策略，不是底层 PID。
+  lateral_gain: 0.065
+  heading_gain: 0.85
+  curvature_gain: 140.0
+  max_steer_deg: 28.0
+  base_speed: 1.6
+  max_speed: 2.2
+  min_speed: 0.45
+  straight_curvature_threshold: 0.0025
+  straight_boost_speed: 0.2
+  curvature_speed_gain: 120.0
+  heading_speed_gain: 0.03
+  confidence_speed_gain: 0.7
+  caution_confidence_threshold: 0.55
+  lost_speed: 0.25
+  lost_steer_decay: 0.6
+
+bridge:
+  # bridge.type 选 mock 时只打印，选 serial 时走真实串口。
+  type: mock
+  mode_name: LINE
+  serial:
+    # 这里是串口参数，后续和 TC264 联调时重点关注这一段。
+    port: /dev/ttyUSB0
+    baudrate: 115200
+    timeout: 0.02
+    write_timeout: 0.02
+    reconnect_interval_sec: 0.5
+    max_reconnect_attempts: 3
+
+visualizer:
+  # show_window 适合本地调试；车上无屏时可关掉。
+  show_window: true
+  window_name: X-SmartCar Upper
+  # 如果屏幕上的中文变成问号，可以把这里指向一个中文字体文件。
+  # Windows 常见示例：C:/Windows/Fonts/msyh.ttc
+  # Linux 常见示例：/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc
+  font_path: "C:/Windows/Fonts/msyh.ttc"
+  font_size: 22
+  save_video: false
+  save_screenshot: true
+  save_dir: outputs/visual
+  video_name: debug.mp4
+  video_fourcc: mp4v
+  video_fps: 25
+
+logger:
+  # CSV 日志方便赛后分析误差和调速效果。
+  enable: false
+  output_dir: outputs/logs
+
+extensions:
+  # 下面这些是后续扩展模块的预留开关，当前版本还未启用。
+  target_detector:
+    enable: false
+  ocr:
+    enable: false
+  traffic_light:
+    enable: false
+  coin_planner:
+    enable: false

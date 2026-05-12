@@ -1,0 +1,1224 @@
+"""蓝色航道检测模块。"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+
+from utils.math_utils import (
+    clamp,
+    compute_curvature,
+    evaluate_poly,
+    mean_abs_residual,
+    polyfit_with_fallback,
+    safe_divide,
+)
+
+
+@dataclass
+class LaneDetectionResult:
+    """保存单帧巡线检测结果。"""
+
+    centerline_points: List[Tuple[int, int]]
+    lateral_error_px: float
+    heading_error_deg: float
+    curvature: float
+    confidence: float
+    is_lane_lost: bool
+    mask: np.ndarray
+    filtered_mask: np.ndarray
+    fit_coeffs: Optional[np.ndarray]
+    lane_width_px: float
+    valid_row_count: int
+    fit_point_count: int
+
+
+@dataclass(frozen=True)
+class LaneAnchorSample:
+    """保存单个连通域内部可用于连接中心线的候选锚点。"""
+
+    x: float
+    y: int
+    width: int
+
+
+@dataclass
+class LaneComponent:
+    """保存单个蓝色候选连通域的几何信息。"""
+
+    label: int
+    x: int
+    y: int
+    width: int
+    height: int
+    area: int
+    centroid_x: float
+    centroid_y: float
+    bottom_y: int
+    touches_side: bool
+    anchor_samples: Tuple[LaneAnchorSample, ...]
+
+
+class LaneDetector:
+    """使用传统视觉方法检测蓝色航道中心线。"""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        """读取阈值与拟合参数并初始化检测器。
+
+        输入:
+            config: lane_detector 对应配置字典。
+
+        输出:
+            无返回值，内部缓存检测参数与少量历史状态。
+        """
+
+        self.config = config
+        self.color_space = str(config.get("color_space", "hsv")).lower()
+        self.hsv_config = config.get("hsv", {})
+        self.lab_config = config.get("lab", {})
+        self.morphology_config = config.get("morphology", {})
+        self.component_config = config.get("connected_components", {})
+        self.centerline_config = config.get("centerline", {})
+        self.confidence_config = config.get("confidence", {})
+
+        self.scan_step = int(self.centerline_config.get("scan_step", 6))
+        self.min_valid_points = int(self.centerline_config.get("min_valid_points", 8))
+        self.min_lane_width_px = float(self.centerline_config.get("min_lane_width_px", 18.0))
+        self.default_lane_width_px = float(self.centerline_config.get("default_lane_width_px", 60.0))
+        self.single_side_infer_ratio = float(self.centerline_config.get("single_side_infer_ratio", 0.55))
+        self.enable_single_side_inference = bool(
+            self.centerline_config.get("enable_single_side_inference", False)
+        )
+        self.single_side_edge_margin_px = int(
+            self.centerline_config.get("single_side_edge_margin_px", 28)
+        )
+        self.prediction_blend = float(self.centerline_config.get("prediction_blend", 0.2))
+        self.distance_weight = float(self.centerline_config.get("distance_weight", 0.12))
+        self.center_bias = float(self.centerline_config.get("center_bias", 0.02))
+        self.lookahead_ratio = float(self.centerline_config.get("lookahead_ratio", 0.45))
+        self.max_center_jump_px = float(self.centerline_config.get("max_center_jump_px", 120.0))
+        self.fit_top_extension_rows = int(self.centerline_config.get("fit_top_extension_rows", 1))
+        # 箭头赛道不是连续实线，连通域内部会有“宽头 + 窄颈”结构。
+        # 这里优先在组件内部找更窄、更靠上的锚点，避免中心线钻进底部尖角。
+        self.anchor_sample_ratios = (0.35, 0.45, 0.55)
+        self.anchor_width_weight = 0.12
+        self.max_component_dx_px = 210.0
+        self.max_component_gap_px = 240.0
+        self.start_bottom_ratio = 0.55
+        # 下面几条是“不要把环境蓝色接进主航道链”的几何约束。
+        self.min_component_chain_score = float(
+            self.component_config.get("min_component_chain_score", 12.0)
+        )
+        self.short_gap_y_threshold = float(
+            self.component_config.get("short_gap_y_threshold", 24.0)
+        )
+        self.short_gap_max_dx_px = float(
+            self.component_config.get("short_gap_max_dx_px", 120.0)
+        )
+        self.max_far_width_growth_ratio = float(
+            self.component_config.get("max_far_width_growth_ratio", 1.45)
+        )
+        self.width_growth_guard_top_ratio = float(
+            self.component_config.get("width_growth_guard_top_ratio", 0.48)
+        )
+        # 这一组参数只在主航道链连接阶段生效，用来忽略墙面广告、
+        # 赛道外蓝块等环境蓝色，不会直接删除远处真实航道。
+        self.environment_guard_top_ratio = float(
+            self.component_config.get("environment_guard_top_ratio", 0.34)
+        )
+        self.environment_guard_min_chain_length = int(
+            self.component_config.get("environment_guard_min_chain_length", 2)
+        )
+        self.environment_compact_aspect_ratio_max = float(
+            self.component_config.get("environment_compact_aspect_ratio_max", 2.2)
+        )
+        self.environment_small_area_max = float(
+            self.component_config.get("environment_small_area_max", 4200.0)
+        )
+        self.environment_small_width_ratio = float(
+            self.component_config.get("environment_small_width_ratio", 0.72)
+        )
+        self.environment_side_penalty = float(
+            self.component_config.get("environment_side_penalty", 28.0)
+        )
+
+        self.lost_threshold = float(self.confidence_config.get("lost_threshold", 0.28))
+        self.expected_area_ratio = float(self.confidence_config.get("expected_area_ratio", 0.08))
+        self.residual_tolerance_px = float(self.confidence_config.get("residual_tolerance_px", 18.0))
+
+        self.last_fit_coeffs: Optional[np.ndarray] = None
+        self.last_lane_width_px = self.default_lane_width_px
+        self.last_centerline_points: List[Tuple[int, int]] = []
+
+    def detect(self, roi_frame: np.ndarray) -> LaneDetectionResult:
+        """对单帧 ROI 图像执行蓝色航道检测。
+
+        输入:
+            roi_frame: 经过预处理后的 ROI BGR 图像。
+
+        输出:
+            返回 LaneDetectionResult，包含中心线、误差、曲率、置信度和调试掩膜。
+        """
+
+        if roi_frame.size == 0:
+            return self._empty_result((1, 1))
+
+        # 先做蓝色阈值分割，得到“哪里像蓝色航道”的初始掩膜。
+        mask = self._segment_lane(roi_frame)
+        # 先提取所有可用蓝色连通域，再从中选出“沿地面连续前进”的主链条。
+        labels, candidate_components = self._extract_candidate_components(mask)
+        selected_components = self._select_main_lane_components(candidate_components, mask.shape)
+        selected_mask = self._build_mask_from_components(labels, selected_components)
+        # 当主链条太短时，不要让调试窗口里整片蓝箭头忽隐忽现，先显示全部候选区域。
+        filtered_mask = selected_mask if len(selected_components) >= 2 else mask
+
+        # 优先使用“箭头块内部锚点链 + 折线插值”生成中心线。
+        # 这样能显著减少二次曲线在尖角处钻出、再突然跳到下一块箭头的情况。
+        support_points = self._build_support_points_from_components(selected_components, mask.shape)
+        centerline_points = self._build_polyline_centerline(support_points, filtered_mask.shape)
+        lane_width_px = self._estimate_lane_width_from_components(selected_components)
+
+        # 如果组件链不够稳定，再退回到逐行扫描作为兜底方案。
+        if len(centerline_points) < self.min_valid_points:
+            fallback_mask = selected_mask if cv2.countNonZero(selected_mask) > 0 else mask
+            raw_points, lane_width_px = self._extract_centerline(fallback_mask)
+            centerline_points = self._filter_centerline_points(raw_points)
+            support_points = list(centerline_points)
+
+        # 曲线拟合只用于提取曲率和做少量历史预测，显示与控制主链路改用折线，避免拟合翻折。
+        fit_coeffs = self._fit_centerline(centerline_points)
+
+        # 根据中心线计算车辆当前最关心的三个量：横向误差、航向误差、曲率。
+        lateral_error_px, heading_error_deg, curvature = self._compute_lane_metrics(
+            centerline_points=centerline_points,
+            fit_coeffs=fit_coeffs,
+            shape=filtered_mask.shape,
+            support_points=support_points,
+        )
+        # 置信度用于告诉后面的跟踪器和规划器：这帧结果到底靠不靠谱。
+        confidence = self._estimate_confidence(
+            filtered_mask=filtered_mask,
+            raw_points=centerline_points,
+            fit_coeffs=fit_coeffs,
+            lane_width_px=lane_width_px,
+        )
+        is_lane_lost = len(centerline_points) < max(2, self.min_valid_points // 2) or confidence < self.lost_threshold
+
+        if not is_lane_lost and centerline_points:
+            self.last_fit_coeffs = fit_coeffs
+            self.last_lane_width_px = lane_width_px
+            self.last_centerline_points = centerline_points
+
+        return LaneDetectionResult(
+            centerline_points=centerline_points,
+            lateral_error_px=lateral_error_px,
+            heading_error_deg=heading_error_deg,
+            curvature=curvature,
+            confidence=confidence,
+            is_lane_lost=is_lane_lost,
+            mask=mask,
+            filtered_mask=filtered_mask,
+            fit_coeffs=fit_coeffs,
+            lane_width_px=lane_width_px,
+            valid_row_count=len(selected_components),
+            fit_point_count=len(centerline_points),
+        )
+
+    def _segment_lane(self, roi_frame: np.ndarray) -> np.ndarray:
+        """根据颜色空间阈值提取蓝色航道候选区域。
+
+        输入:
+            roi_frame: 预处理后的 ROI BGR 图像。
+
+        输出:
+            返回单通道二值掩膜，非零像素表示蓝色候选区域。
+        """
+
+        if self.color_space == "lab":
+            converted = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
+            lower = np.asarray(self.lab_config.get("lower", [20, 120, 80]), dtype=np.uint8)
+            upper = np.asarray(self.lab_config.get("upper", [255, 170, 135]), dtype=np.uint8)
+        else:
+            converted = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
+            lower = np.asarray(self.hsv_config.get("lower", [85, 70, 40]), dtype=np.uint8)
+            upper = np.asarray(self.hsv_config.get("upper", [140, 255, 255]), dtype=np.uint8)
+
+        mask = cv2.inRange(converted, lower, upper)
+        return self._apply_morphology(mask)
+
+    def _apply_morphology(self, mask: np.ndarray) -> np.ndarray:
+        """对二值掩膜执行开闭运算去噪与补洞。
+
+        输入:
+            mask: 初始二值掩膜。
+
+        输出:
+            返回形态学处理后的掩膜。
+        """
+
+        open_kernel_size = max(1, int(self.morphology_config.get("open_kernel", 3)))
+        close_kernel_size = max(1, int(self.morphology_config.get("close_kernel", 7)))
+        erode_iterations = int(self.morphology_config.get("erode_iterations", 0))
+        dilate_iterations = int(self.morphology_config.get("dilate_iterations", 1))
+
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (open_kernel_size, open_kernel_size))
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_kernel_size, close_kernel_size))
+
+        cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_kernel)
+        if erode_iterations > 0:
+            cleaned = cv2.erode(cleaned, open_kernel, iterations=erode_iterations)
+        if dilate_iterations > 0:
+            cleaned = cv2.dilate(cleaned, close_kernel, iterations=dilate_iterations)
+        return cleaned
+
+    def _suppress_environment_blue(self, mask: np.ndarray) -> np.ndarray:
+        """抑制明显不属于地面航道的蓝色环境干扰。
+
+        输入:
+            mask: 颜色阈值分割并完成形态学处理后的二值掩膜。
+
+        输出:
+            返回去除了高位紧凑蓝色干扰后的二值掩膜。
+        """
+
+        if mask.size == 0:
+            return mask
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        filtered_mask = mask.copy()
+
+        for label in range(1, num_labels):
+            x, y, component_width, component_height, area = stats[label]
+            if self._is_high_compact_environment_component(
+                x=int(x),
+                y=int(y),
+                width=int(component_width),
+                height=int(component_height),
+                area=int(area),
+                shape=mask.shape,
+            ):
+                filtered_mask[labels == label] = 0
+
+        return filtered_mask
+
+    def _is_high_compact_environment_component(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        area: int,
+        shape: Tuple[int, int],
+    ) -> bool:
+        """判断一个蓝色连通域是否更像墙面广告牌等环境干扰。
+
+        输入:
+            x: 连通域包围框左上角 x 坐标。
+            y: 连通域包围框左上角 y 坐标。
+            width: 连通域包围框宽度。
+            height: 连通域包围框高度。
+            area: 连通域面积。
+            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
+
+        输出:
+            如果该连通域明显属于高位紧凑干扰，则返回 True，否则返回 False。
+        """
+
+        image_height, image_width = shape[:2]
+        if width <= 0 or height <= 0 or area <= 0:
+            return False
+
+        aspect_ratio = safe_divide(float(width), float(height), default=999.0)
+        near_top = y <= int(image_height * self.high_compact_top_ratio)
+        near_side = (
+            x <= self.high_compact_side_margin_px
+            or (x + width) >= (image_width - self.high_compact_side_margin_px)
+        )
+        compact_shape = aspect_ratio <= self.compact_aspect_ratio_threshold
+        small_to_mid_area = area <= self.high_compact_max_area
+
+        return near_top and near_side and compact_shape and small_to_mid_area
+
+    def _extract_candidate_components(
+        self,
+        mask: np.ndarray,
+    ) -> Tuple[np.ndarray, List[LaneComponent]]:
+        """提取所有满足基础面积条件的蓝色候选连通域。
+
+        输入:
+            mask: 形态学处理后的二值掩膜。
+
+        输出:
+            返回二元组 (labels, components)，其中 labels 为连通域标签图，
+            components 为所有候选连通域的几何信息列表。
+        """
+
+        height, width = mask.shape[:2]
+        min_area = int(self.component_config.get("min_area", 250))
+        min_height = int(self.component_config.get("min_height", 12))
+        side_margin = int(self.centerline_config.get("single_side_edge_margin_px", 28))
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        components: List[LaneComponent] = []
+        for label in range(1, num_labels):
+            x, y, component_width, component_height, area = stats[label]
+            if area < min_area or component_height < min_height:
+                continue
+            component_mask = labels == label
+            ys, xs = np.where(component_mask)
+            if xs.size == 0 or ys.size == 0:
+                continue
+            centroid_x = float(np.mean(xs))
+            centroid_y = float(np.mean(ys))
+            bottom_y = int(np.max(ys))
+            touches_side = x <= side_margin or (x + component_width) >= (width - side_margin)
+            anchor_samples = self._build_component_anchor_samples(
+                component_mask=component_mask,
+                top_y=int(y),
+                height=int(component_height),
+                fallback_x=centroid_x,
+            )
+            if not anchor_samples:
+                continue
+            components.append(
+                LaneComponent(
+                    label=label,
+                    x=int(x),
+                    y=int(y),
+                    width=int(component_width),
+                    height=int(component_height),
+                    area=int(area),
+                    centroid_x=centroid_x,
+                    centroid_y=centroid_y,
+                    bottom_y=bottom_y,
+                    touches_side=touches_side,
+                    anchor_samples=anchor_samples,
+                )
+            )
+
+        return labels, components
+
+    def _build_component_anchor_samples(
+        self,
+        component_mask: np.ndarray,
+        top_y: int,
+        height: int,
+        fallback_x: float,
+    ) -> Tuple[LaneAnchorSample, ...]:
+        """在单个连通域内部采样多个候选锚点。
+
+        输入:
+            component_mask: 当前连通域的布尔掩膜。
+            top_y: 连通域包围框顶部 y 坐标。
+            height: 连通域高度。
+            fallback_x: 当某一采样行为空时使用的回退横坐标。
+
+        输出:
+            返回候选锚点元组，每个锚点包含横坐标、纵坐标和该行宽度。
+        """
+
+        samples: List[LaneAnchorSample] = []
+        bottom_y = component_mask.shape[0] - 1
+
+        for ratio in self.anchor_sample_ratios:
+            sample_y = top_y + int(height * ratio)
+            sample_y = int(clamp(float(sample_y), float(top_y), float(bottom_y)))
+            row_indices = np.where(component_mask[sample_y])[0]
+            if row_indices.size > 0:
+                sample_x = float(row_indices[0] + row_indices[-1]) * 0.5
+                sample_width = int(row_indices[-1] - row_indices[0] + 1)
+            else:
+                sample_x = fallback_x
+                sample_width = max(1, int(round(self.last_lane_width_px)))
+
+            samples.append(
+                LaneAnchorSample(
+                    x=float(sample_x),
+                    y=int(sample_y),
+                    width=int(sample_width),
+                )
+            )
+
+        return tuple(samples)
+
+    def _choose_component_anchor(
+        self,
+        component: LaneComponent,
+        predicted_x: float,
+    ) -> LaneAnchorSample:
+        """从组件候选锚点中挑出最贴合当前航向预测的一点。
+
+        输入:
+            component: 待评估的连通域组件。
+            predicted_x: 当前帧根据历史或链条趋势预测的横向位置。
+
+        输出:
+            返回一个最适合作为中心线支撑点的锚点。
+        """
+
+        best_sample = component.anchor_samples[0]
+        best_score = float("inf")
+
+        for sample in component.anchor_samples:
+            score = abs(sample.x - predicted_x)
+            score += sample.width * self.anchor_width_weight
+            if score < best_score:
+                best_score = score
+                best_sample = sample
+
+        return best_sample
+
+    def _compute_environment_penalty(
+        self,
+        component: LaneComponent,
+        anchor: LaneAnchorSample,
+        current_anchor: LaneAnchorSample,
+        chain_length: int,
+        shape: Tuple[int, int],
+    ) -> float:
+        """????????????????????????
+        ??:
+            component: ????????????
+            anchor: ?????????????????
+            current_anchor: ????????????
+            chain_length: ????????????
+            shape: ?? ROI ?????? (?, ?)?
+        ??:
+            ??????????????????????????
+        """
+
+        if chain_length < self.environment_guard_min_chain_length:
+            return 0.0
+
+        top_limit = int(shape[0] * self.environment_guard_top_ratio)
+        if anchor.y > top_limit:
+            return 0.0
+
+        aspect_ratio = safe_divide(float(component.width), float(component.height), default=999.0)
+        width_ratio = safe_divide(float(anchor.width), float(max(current_anchor.width, 1)), default=1.0)
+
+        penalty = 0.0
+        # ??????/??????????????????????????
+        if aspect_ratio <= self.environment_compact_aspect_ratio_max:
+            penalty += 42.0
+        # ????????????????????????????????
+        if component.area <= self.environment_small_area_max and width_ratio <= self.environment_small_width_ratio:
+            penalty += 38.0
+        if component.touches_side:
+            penalty += self.environment_side_penalty
+        return penalty
+
+    def _select_main_lane_components(
+        self,
+        components: Sequence[LaneComponent],
+        shape: Tuple[int, int],
+    ) -> List[LaneComponent]:
+        """从所有蓝色候选块中挑出沿地面主方向连续排列的一串主航道箭头。
+
+        输入:
+            components: 候选连通域列表。
+            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
+
+        输出:
+            返回按从下往上排序的主航道组件列表。
+        """
+
+        if not components:
+            return []
+
+        height, width = shape[:2]
+        image_center = width * 0.5
+        remaining = sorted(components, key=lambda item: item.bottom_y, reverse=True)
+
+        start_candidates = [
+            component
+            for component in remaining
+            if component.bottom_y >= int(height * self.start_bottom_ratio)
+        ]
+        if not start_candidates:
+            start_candidates = remaining
+
+        best_start_score = -1e9
+        best_start = start_candidates[0]
+        best_start_anchor = self._choose_component_anchor(best_start, image_center)
+        for component in start_candidates:
+            target_y = component.anchor_samples[len(component.anchor_samples) // 2].y
+            predicted_x = self._predict_chain_x([], target_y, image_center)
+            anchor = self._choose_component_anchor(component, predicted_x)
+
+            score = component.bottom_y * 1.35
+            score += min(component.area, 5000) * 0.02
+            score -= abs(anchor.x - predicted_x) * 0.95
+            score -= anchor.width * 0.05
+            if component.touches_side:
+                score -= 80.0
+            if score > best_start_score:
+                best_start_score = score
+                best_start = component
+                best_start_anchor = anchor
+
+        chain: List[LaneComponent] = [best_start]
+        chain_points: List[Tuple[float, float]] = [(best_start_anchor.x, float(best_start_anchor.y))]
+        chain_anchors: List[LaneAnchorSample] = [best_start_anchor]
+        used_labels = {best_start.label}
+
+        while True:
+            current_x, current_y = chain_points[-1]
+            current_anchor = chain_anchors[-1]
+            best_next: Optional[LaneComponent] = None
+            best_next_anchor: Optional[LaneAnchorSample] = None
+            best_next_score = -1e9
+
+            for component in remaining:
+                if component.label in used_labels:
+                    continue
+
+                target_y = component.anchor_samples[len(component.anchor_samples) // 2].y
+                predicted_x = self._predict_chain_x(chain_points, float(target_y), image_center)
+                anchor = self._choose_component_anchor(component, predicted_x)
+                delta_y = current_y - anchor.y
+                if delta_y <= self.scan_step:
+                    continue
+                if delta_y > self.max_component_gap_px:
+                    continue
+
+                delta_x = abs(anchor.x - predicted_x)
+                max_allowed_dx = self.max_component_dx_px + max(0.0, delta_y - 80.0) * 0.45
+                if delta_x > max_allowed_dx:
+                    continue
+                # 如果两个组件在纵向上几乎贴在一起，但横向却猛地跳到一边，
+                # 往往是连到了墙面广告牌或赛道外蓝色物体，而不是继续沿地面航道前进。
+                if delta_y < self.short_gap_y_threshold and delta_x > self.short_gap_max_dx_px:
+                    continue
+                # 远处组件通常不会突然比前一个组件“宽出很多”，
+                # 一旦高处宽度暴增，常见原因就是接到了墙面蓝色标牌。
+                if (
+                    anchor.y <= int(shape[0] * self.width_growth_guard_top_ratio)
+                    and anchor.width > current_anchor.width * self.max_far_width_growth_ratio
+                ):
+                    continue
+                environment_penalty = self._compute_environment_penalty(
+                    component=component,
+                    anchor=anchor,
+                    current_anchor=current_anchor,
+                    chain_length=len(chain),
+                    shape=shape,
+                )
+                # 明显更像环境蓝块时，直接停止把它接进主航道链。
+                if environment_penalty >= 75.0:
+                    continue
+
+                score = 220.0
+                score -= delta_x * 1.08
+                score -= abs(delta_y - 72.0) * 0.18
+                score += min(component.area, 4000) * 0.01
+                score -= anchor.width * 0.035
+                score -= environment_penalty
+                if component.touches_side:
+                    score -= 55.0
+
+                if score > best_next_score:
+                    best_next_score = score
+                    best_next = component
+                    best_next_anchor = anchor
+
+            if best_next is None or best_next_anchor is None:
+                break
+            if best_next_score < self.min_component_chain_score:
+                break
+
+            chain.append(best_next)
+            chain_points.append((best_next_anchor.x, float(best_next_anchor.y)))
+            chain_anchors.append(best_next_anchor)
+            used_labels.add(best_next.label)
+            if len(chain) >= 12:
+                break
+
+        return chain
+
+    def _predict_chain_x(
+        self,
+        chain_points: Sequence[Tuple[float, float]],
+        target_y: float,
+        image_center: Optional[float] = None,
+    ) -> float:
+        """根据历史链条走势预测目标高度处的横向位置。
+
+        输入:
+            chain_points: 已经选中的主航道锚点链。
+            target_y: 目标纵坐标。
+            image_center: 当前 ROI 的中心横坐标，作为没有历史时的回退值。
+
+        输出:
+            返回预测的横向位置。
+        """
+
+        history_prediction: Optional[float] = None
+        if self.last_fit_coeffs is not None:
+            history_prediction = float(evaluate_poly(self.last_fit_coeffs, [target_y])[0])
+
+        if len(chain_points) >= 2:
+            x1, y1 = chain_points[-2]
+            x2, y2 = chain_points[-1]
+            if abs(y2 - y1) > 1e-3:
+                slope = (x2 - x1) / (y2 - y1)
+                chain_prediction = float(x2 + slope * (target_y - y2))
+            else:
+                chain_prediction = float(x2)
+        elif chain_points:
+            chain_prediction = float(chain_points[-1][0])
+        else:
+            chain_prediction = float(image_center if image_center is not None else 0.0)
+
+        if history_prediction is None:
+            return chain_prediction
+        if not chain_points:
+            return history_prediction
+
+        return float(
+            chain_prediction * (1.0 - self.prediction_blend)
+            + history_prediction * self.prediction_blend
+        )
+
+    def _build_mask_from_components(
+        self,
+        labels: np.ndarray,
+        components: Sequence[LaneComponent],
+    ) -> np.ndarray:
+        """根据选中的组件列表重新构造主航道掩膜。
+
+        输入:
+            labels: 连通域标签图。
+            components: 需要保留的组件列表。
+
+        输出:
+            返回只包含主航道组件的二值掩膜。
+        """
+
+        mask = np.zeros_like(labels, dtype=np.uint8)
+        for component in components:
+            mask[labels == component.label] = 255
+        return mask
+
+    def _build_support_points_from_components(
+        self,
+        components: Sequence[LaneComponent],
+        shape: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """从主航道组件链中提取用于拟合的支撑点。
+
+        输入:
+            components: 按从下往上排序的主航道组件链。
+            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
+
+        输出:
+            返回用于拟合中心线的支撑点列表，顺序为从下往上。
+        """
+
+        if not components:
+            return []
+
+        _, width = shape[:2]
+        image_center = width * 0.5
+        support_points: List[Tuple[int, int]] = []
+
+        for component in components:
+            target_y = component.anchor_samples[len(component.anchor_samples) // 2].y
+            predicted_x = self._predict_chain_x(
+                [(float(x), float(y)) for x, y in support_points],
+                float(target_y),
+                image_center,
+            )
+            anchor = self._choose_component_anchor(component, predicted_x)
+            support_points.append((int(round(anchor.x)), int(anchor.y)))
+
+        return self._filter_centerline_points(support_points)
+
+    def _build_polyline_centerline(
+        self,
+        support_points: Sequence[Tuple[int, int]],
+        shape: Tuple[int, int],
+    ) -> List[Tuple[int, int]]:
+        """根据支撑点链做折线插值，生成稳定的中心线点集。
+
+        输入:
+            support_points: 按从下往上排序的支撑点列表。
+            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
+
+        输出:
+            返回经过折线插值和轻度平滑后的中心线点集。
+        """
+
+        if not support_points:
+            return []
+        if len(support_points) == 1:
+            return list(support_points)
+
+        _, width = shape[:2]
+        ordered_points = sorted(support_points, key=lambda item: item[1], reverse=True)
+        polyline_points: List[Tuple[int, int]] = []
+
+        for index in range(len(ordered_points) - 1):
+            x1, y1 = ordered_points[index]
+            x2, y2 = ordered_points[index + 1]
+            if y1 == y2:
+                continue
+
+            for y in range(y1, y2, -self.scan_step):
+                ratio = safe_divide(float(y - y1), float(y2 - y1), default=0.0)
+                x = x1 + (x2 - x1) * ratio
+                polyline_points.append((int(round(clamp(x, 0.0, width - 1.0))), int(y)))
+
+        polyline_points.append(ordered_points[-1])
+        return self._smooth_polyline_points(polyline_points, width)
+
+    def _smooth_polyline_points(
+        self,
+        points: Sequence[Tuple[int, int]],
+        image_width: int,
+    ) -> List[Tuple[int, int]]:
+        """对折线中心线做轻度一维平滑，减少局部小抖动。
+
+        输入:
+            points: 折线插值后的中心线点集。
+            image_width: 当前 ROI 宽度。
+
+        输出:
+            返回轻度平滑后的中心线点集。
+        """
+
+        if len(points) <= 2:
+            return list(points)
+
+        x_values = np.asarray([point[0] for point in points], dtype=np.float32)
+        smoothed_x = x_values.copy()
+        for index in range(1, len(points) - 1):
+            smoothed_x[index] = (
+                x_values[index - 1] * 0.25
+                + x_values[index] * 0.50
+                + x_values[index + 1] * 0.25
+            )
+
+        return [
+            (int(round(clamp(float(smoothed_x[index]), 0.0, image_width - 1.0))), int(point[1]))
+            for index, point in enumerate(points)
+        ]
+
+    def _estimate_lane_width_from_components(
+        self,
+        components: Sequence[LaneComponent],
+    ) -> float:
+        """根据主航道组件链估计航道宽度，用于置信度和备用逻辑。
+
+        输入:
+            components: 按从下往上排序的主航道组件链。
+
+        输出:
+            返回估计的航道宽度像素值。
+        """
+
+        if not components:
+            return self.last_lane_width_px
+
+        widths = [
+            min(sample.width for sample in component.anchor_samples)
+            for component in components
+        ]
+        lane_width_px = float(np.median(np.asarray(widths, dtype=np.float32)))
+        return max(lane_width_px, self.min_lane_width_px)
+
+    def _extract_centerline(self, mask: np.ndarray) -> Tuple[List[Tuple[int, int]], float]:
+        """按行扫描主航道掩膜，提取中心线原始点集。
+
+        输入:
+            mask: 连通域筛选后的主航道掩膜。
+
+        输出:
+            返回二元组 (raw_points, lane_width_px)，分别是原始中心线点集与估计航道宽度。
+        """
+
+        height, width = mask.shape[:2]
+        raw_points: List[Tuple[int, int]] = []
+        widths: List[float] = []
+        previous_center: Optional[float] = None
+
+        for y in range(height - 1, -1, -self.scan_step):
+            row = mask[y]
+            segments = self._find_row_segments(row)
+            if not segments:
+                continue
+
+            # 优先参考上一帧拟合结果，帮助当前行在遮挡、断裂时少跑偏。
+            predicted_center: Optional[float] = None
+            if self.last_fit_coeffs is not None:
+                predicted_center = float(evaluate_poly(self.last_fit_coeffs, [y])[0])
+            elif previous_center is not None:
+                predicted_center = previous_center
+
+            start, end = self._select_best_segment(segments, predicted_center, width)
+            segment_width = float(end - start + 1)
+            segment_center = (start + end) * 0.5
+            estimated_center = segment_center
+            width_for_stat = segment_width
+
+            # 单边推中心只适合“真正只露出一侧边界”的情况。
+            # 对现在这种块状蓝白航道，误用它会把中心线强行推到航道外侧，所以默认关闭。
+            infer_threshold = max(self.min_lane_width_px, self.last_lane_width_px * self.single_side_infer_ratio)
+            touches_border = (
+                start <= self.single_side_edge_margin_px
+                or end >= width - 1 - self.single_side_edge_margin_px
+            )
+            if (
+                self.enable_single_side_inference
+                and predicted_center is not None
+                and segment_width < infer_threshold
+                and touches_border
+            ):
+                if segment_center < predicted_center - self.last_lane_width_px * 0.15:
+                    estimated_center = end + self.last_lane_width_px * 0.5
+                    width_for_stat = self.last_lane_width_px
+                elif segment_center > predicted_center + self.last_lane_width_px * 0.15:
+                    estimated_center = start - self.last_lane_width_px * 0.5
+                    width_for_stat = self.last_lane_width_px
+
+            # 当前观测值和历史预测值做一点融合，减少中心线跳动。
+            if predicted_center is not None:
+                estimated_center = (
+                    estimated_center * (1.0 - self.prediction_blend)
+                    + predicted_center * self.prediction_blend
+                )
+
+            estimated_center = clamp(estimated_center, 0.0, width - 1.0)
+            raw_points.append((int(round(estimated_center)), int(y)))
+            widths.append(float(width_for_stat))
+            previous_center = estimated_center
+
+        if not widths:
+            return raw_points, self.last_lane_width_px
+
+        lane_width_px = float(np.median(np.asarray(widths, dtype=np.float32)))
+        return raw_points, max(lane_width_px, self.min_lane_width_px)
+
+    def _filter_centerline_points(
+        self,
+        raw_points: Sequence[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        """根据行间连续性筛掉容易导致拟合翻折的离群点。
+
+        输入:
+            raw_points: 原始中心线点集，顺序为从下往上。
+
+        输出:
+            返回经过连续性筛选后的稳定点集。
+        """
+
+        if len(raw_points) <= 2:
+            return list(raw_points)
+
+        filtered_points: List[Tuple[int, int]] = []
+        previous_x: Optional[float] = None
+        max_jump = max(self.max_center_jump_px, self.last_lane_width_px * 0.9)
+
+        for x, y in raw_points:
+            current_x = float(x)
+            if previous_x is None:
+                filtered_points.append((x, y))
+                previous_x = current_x
+                continue
+
+            if abs(current_x - previous_x) <= max_jump:
+                filtered_points.append((x, y))
+                previous_x = current_x
+                continue
+
+            if self.last_fit_coeffs is not None:
+                predicted_x = float(evaluate_poly(self.last_fit_coeffs, [y])[0])
+                if abs(current_x - predicted_x) <= max_jump:
+                    filtered_points.append((x, y))
+                    previous_x = current_x
+
+        if len(filtered_points) < max(2, self.min_valid_points // 2):
+            return list(raw_points)
+        return filtered_points
+
+    def _find_row_segments(self, row: np.ndarray) -> List[Tuple[int, int]]:
+        """在单行掩膜中寻找连续非零像素段。
+
+        输入:
+            row: 单行二值掩膜数组。
+
+        输出:
+            返回连续区间列表，每项格式为 (start_x, end_x)。
+        """
+
+        indices = np.where(row > 0)[0]
+        if indices.size == 0:
+            return []
+
+        segments: List[Tuple[int, int]] = []
+        start = int(indices[0])
+        end = int(indices[0])
+
+        for index in indices[1:]:
+            current = int(index)
+            if current == end + 1:
+                end = current
+            else:
+                segments.append((start, end))
+                start = current
+                end = current
+
+        segments.append((start, end))
+        return segments
+
+    def _select_best_segment(
+        self,
+        segments: Sequence[Tuple[int, int]],
+        predicted_center: Optional[float],
+        image_width: int,
+    ) -> Tuple[int, int]:
+        """从多个候选蓝色段中选出最可能属于主航道的段。
+
+        输入:
+            segments: 当前扫描行的连续蓝色区间列表。
+            predicted_center: 根据上一帧或上一行估计得到的中心位置。
+            image_width: 当前 ROI 的宽度。
+
+        输出:
+            返回最优区间，格式为 (start_x, end_x)。
+        """
+
+        if len(segments) == 1:
+            return segments[0]
+
+        image_center = image_width * 0.5
+        best_score = -1e9
+        best_segment = segments[0]
+
+        for start, end in segments:
+            width = float(end - start + 1)
+            center = (start + end) * 0.5
+            score = width
+            if predicted_center is not None:
+                score -= abs(center - predicted_center) * self.distance_weight
+            else:
+                score -= abs(center - image_center) * self.center_bias
+
+            if score > best_score:
+                best_score = score
+                best_segment = (start, end)
+
+        return best_segment
+
+    def _fit_centerline(self, raw_points: Sequence[Tuple[int, int]]) -> Optional[np.ndarray]:
+        """对原始中心线点集进行二次曲线拟合。
+
+        输入:
+            raw_points: 原始中心线点集，格式为 [(x, y), ...]。
+
+        输出:
+            返回二次曲线系数数组 [a, b, c]；若点数不足则可能返回低阶退化结果或 None。
+        """
+
+        if not raw_points:
+            return None
+
+        x_values = [point[0] for point in raw_points]
+        y_values = [point[1] for point in raw_points]
+        return polyfit_with_fallback(y_values=y_values, x_values=x_values, degree=2)
+
+    def _generate_centerline_points(
+        self,
+        fit_coeffs: Optional[np.ndarray],
+        shape: Tuple[int, int],
+        support_points: Sequence[Tuple[int, int]],
+    ) -> List[Tuple[int, int]]:
+        """根据拟合曲线重新采样得到更平滑的中心线点集。
+
+        输入:
+            fit_coeffs: 拟合得到的曲线系数。
+            shape: 当前 ROI 掩膜尺寸，格式为 (高, 宽)。
+            support_points: 真正参与拟合的中心线点集。
+
+        输出:
+            返回平滑后的中心线点集。
+        """
+
+        if fit_coeffs is None or not support_points:
+            return []
+
+        _, width = shape[:2]
+        support_y_values = [point[1] for point in support_points]
+        bottom_y = max(support_y_values)
+        top_y = max(0, min(support_y_values) - self.fit_top_extension_rows * self.scan_step)
+
+        points: List[Tuple[int, int]] = []
+        for y in range(bottom_y, top_y - 1, -self.scan_step):
+            x = float(evaluate_poly(fit_coeffs, [y])[0])
+            x = clamp(x, 0.0, width - 1.0)
+            points.append((int(round(x)), int(y)))
+        return points
+
+    def _compute_lane_metrics(
+        self,
+        centerline_points: Sequence[Tuple[int, int]],
+        fit_coeffs: Optional[np.ndarray],
+        shape: Tuple[int, int],
+        support_points: Sequence[Tuple[int, int]],
+    ) -> Tuple[float, float, float]:
+        """根据中心线计算横向误差、航向误差与曲率。
+
+        输入:
+            centerline_points: 平滑后的中心线点集。
+            fit_coeffs: 中心线拟合系数。
+            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
+            support_points: 真正参与拟合的中心线点集。
+
+        输出:
+            返回三元组 (lateral_error_px, heading_error_deg, curvature)。
+        """
+
+        _, width = shape[:2]
+        if not centerline_points or not support_points:
+            return 0.0, 0.0, 0.0
+
+        support_y_values = [point[1] for point in support_points]
+        bottom_y = max(support_y_values)
+        top_y = min(support_y_values)
+        support_span = max(self.scan_step * 2, bottom_y - top_y)
+        lookahead_distance = max(self.scan_step * 2, int(support_span * self.lookahead_ratio))
+        lookahead_y = max(top_y, bottom_y - lookahead_distance)
+        image_center_x = width * 0.5
+
+        bottom_x = float(centerline_points[0][0])
+        lookahead_x = self._sample_centerline_x(centerline_points, lookahead_y)
+
+        lateral_error_px = bottom_x - image_center_x
+        heading_error_deg = math.degrees(
+            math.atan2(lookahead_x - bottom_x, max(1.0, bottom_y - lookahead_y))
+        )
+        curvature = compute_curvature(fit_coeffs, bottom_y)
+        return float(lateral_error_px), float(heading_error_deg), float(curvature)
+
+    def _sample_centerline_x(
+        self,
+        centerline_points: Sequence[Tuple[int, int]],
+        target_y: int,
+    ) -> float:
+        """按目标纵坐标在中心线上插值采样横坐标。
+
+        输入:
+            centerline_points: 按从下往上排序的中心线点集。
+            target_y: 需要采样的目标纵坐标。
+
+        输出:
+            返回插值得到的横坐标。
+        """
+
+        if not centerline_points:
+            return 0.0
+        if len(centerline_points) == 1:
+            return float(centerline_points[0][0])
+
+        ordered_points = sorted(centerline_points, key=lambda item: item[1], reverse=True)
+        if target_y >= ordered_points[0][1]:
+            return float(ordered_points[0][0])
+        if target_y <= ordered_points[-1][1]:
+            return float(ordered_points[-1][0])
+
+        for index in range(len(ordered_points) - 1):
+            x1, y1 = ordered_points[index]
+            x2, y2 = ordered_points[index + 1]
+            if y1 >= target_y >= y2 and y1 != y2:
+                ratio = safe_divide(float(target_y - y1), float(y2 - y1), default=0.0)
+                return float(x1 + (x2 - x1) * ratio)
+
+        return float(ordered_points[-1][0])
+
+    def _estimate_confidence(
+        self,
+        filtered_mask: np.ndarray,
+        raw_points: Sequence[Tuple[int, int]],
+        fit_coeffs: Optional[np.ndarray],
+        lane_width_px: float,
+    ) -> float:
+        """综合覆盖率、拟合残差与面积特征估计当前检测置信度。
+
+        输入:
+            filtered_mask: 筛选后的主航道掩膜。
+            raw_points: 原始中心线点集。
+            fit_coeffs: 中心线拟合系数。
+            lane_width_px: 当前帧估计的航道宽度。
+
+        输出:
+            返回 0 到 1 之间的置信度分数。
+        """
+
+        height, width = filtered_mask.shape[:2]
+        expected_rows = max(1, int(math.ceil(height / float(self.scan_step))))
+        if len(raw_points) <= 12:
+            expected_points = max(4.0, min(8.0, float(expected_rows)))
+        else:
+            expected_points = float(expected_rows)
+        row_score = clamp(len(raw_points) / expected_points, 0.0, 1.0)
+
+        non_zero_pixels = float(cv2.countNonZero(filtered_mask))
+        expected_area = max(1.0, height * width * self.expected_area_ratio)
+        area_score = clamp(non_zero_pixels / expected_area, 0.0, 1.0)
+        if non_zero_pixels > expected_area * 3.0:
+            overflow_ratio = safe_divide(non_zero_pixels - expected_area * 3.0, height * width, default=0.0)
+            area_score *= clamp(1.0 - overflow_ratio * 4.0, 0.2, 1.0)
+
+        if fit_coeffs is not None and raw_points:
+            x_values = [point[0] for point in raw_points]
+            y_values = [point[1] for point in raw_points]
+            residual = mean_abs_residual(fit_coeffs, y_values=y_values, x_values=x_values)
+            fit_score = clamp(1.0 - residual / max(self.residual_tolerance_px, 1.0), 0.0, 1.0)
+        else:
+            fit_score = 0.0
+
+        width_score = clamp(lane_width_px / max(self.default_lane_width_px, 1.0), 0.0, 1.0)
+        if lane_width_px > self.default_lane_width_px * 1.8:
+            width_score *= 0.7
+
+        confidence = (
+            0.45 * row_score
+            + 0.25 * fit_score
+            + 0.20 * area_score
+            + 0.10 * width_score
+        )
+        if len(raw_points) < self.min_valid_points:
+            confidence *= 0.6
+
+        return clamp(confidence, 0.0, 1.0)
+
+    def _empty_result(self, shape: Tuple[int, int]) -> LaneDetectionResult:
+        """在输入异常时构造一份空检测结果。
+
+        输入:
+            shape: 需要构造的掩膜尺寸，格式为 (高, 宽)。
+
+        输出:
+            返回表示丢线状态的 LaneDetectionResult。
+        """
+
+        mask = np.zeros(shape, dtype=np.uint8)
+        return LaneDetectionResult(
+            centerline_points=[],
+            lateral_error_px=0.0,
+            heading_error_deg=0.0,
+            curvature=0.0,
+            confidence=0.0,
+            is_lane_lost=True,
+            mask=mask,
+            filtered_mask=mask.copy(),
+            fit_coeffs=None,
+            lane_width_px=self.last_lane_width_px,
+            valid_row_count=0,
+            fit_point_count=0,
+        )
