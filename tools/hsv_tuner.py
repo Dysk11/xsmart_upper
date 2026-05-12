@@ -402,7 +402,7 @@ class HsvTunerApp:
         filtered_mask: np.ndarray,
         state: TrackbarState,
     ) -> np.ndarray:
-        """构建调参工具的四宫格预览画面。
+        """构建调参工具的双画面预览。
 
         输入:
             preprocess_result: 当前帧预处理结果。
@@ -428,18 +428,6 @@ class HsvTunerApp:
             font_size=self.font_size,
         )
 
-        roi_raw_panel = overlay_mask(preprocess_result.roi_frame, raw_mask, color=(255, 0, 0), alpha=0.35)
-        roi_raw_panel = draw_text_lines(
-            roi_raw_panel,
-            [
-                "窗口2：ROI区域与原始HSV掩膜",
-                "第2到5步调：蓝色H范围、纯度S下界、亮度V下界",
-                "目标：只罩住蓝色航道，尽量不要把地面反光和背景带进来",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
-
         filtered_panel = ensure_bgr(filtered_mask)
         filtered_panel = draw_text_lines(
             filtered_panel,
@@ -452,28 +440,10 @@ class HsvTunerApp:
             font_size=self.font_size,
         )
 
-        info_panel = overlay_mask(preprocess_result.roi_frame, filtered_mask, color=(255, 0, 0), alpha=0.30)
-        info_panel = draw_text_lines(
-            info_panel,
-            [
-                "窗口4：当前参数与操作提示",
-                "调参顺序：1裁ROI -> 2/3定蓝色范围 -> 4提纯度 -> 5压暗部 -> 6补白洞 -> 7去小块",
-                "按键说明：Q/Esc退出  P打印参数  S保存参数快照",
-                "左侧滑块窗口使用英文标签，避免 OpenCV 在 Windows 下中文乱码",
-                f"ROI上边界: {state.roi_top_ratio:.2f}  蓝色H: [{state.h_low}, {state.h_high}]",
-                f"纯度S下界: {state.s_low}  亮度V下界: {state.v_low}",
-                f"补洞强度(核大小): {state.close_kernel}  最小面积: {state.min_area}",
-                f"原始掩膜像素: {cv2.countNonZero(raw_mask)}  筛选后像素: {cv2.countNonZero(filtered_mask)}",
-                f"快照保存位置: {self.snapshot_output_path}",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
-
         cell_width = max(360, preprocess_result.resized_frame.shape[1] // 2)
         cell_height = max(220, preprocess_result.resized_frame.shape[0] // 2)
         return stack_images(
-            [original_panel, roi_raw_panel, filtered_panel, info_panel],
+            [original_panel, filtered_panel],
             cols=2,
             cell_size=(cell_width, cell_height),
         )

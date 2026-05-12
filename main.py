@@ -6,6 +6,7 @@ import argparse
 import copy
 import sys
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -17,11 +18,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.camera import CameraReader
+from core.avoidance_target_planner import AvoidanceTargetPlanner, AvoidanceTargetResult
+from core.blocking_analyzer import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
+from core.gold_target_planner import GoldTargetPlanner, GoldTargetResult
 from core.lane_detector import LaneDetectionResult, LaneDetector
 from core.lane_tracker import LaneTracker, TrackedLaneState
 from core.logger import CsvLogger
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
 from core.preprocess import ImagePreprocessor, PreprocessResult
+from core.rknn_object_detector import RknnObjectDetector
+from core.target_selector import TargetPointResult, TargetSelector
 from core.visualizer import Visualizer
 from utils.fps import FPSCounter
 
@@ -81,6 +87,12 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
     visualizer_config = runtime_config.setdefault("visualizer", {})
     visualizer_config["save_dir"] = str(resolve_project_path(project_root, str(visualizer_config.get("save_dir", "outputs/visual"))))
 
+    rknn_detector_config = runtime_config.setdefault("rknn_object_detector", {})
+    if rknn_detector_config.get("model_path"):
+        rknn_detector_config["model_path"] = str(
+            resolve_project_path(project_root, str(rknn_detector_config["model_path"]))
+        )
+
     return runtime_config
 
 
@@ -132,11 +144,24 @@ class UpperMachineApp:
         self.preprocessor = ImagePreprocessor(config.get("preprocess", {}))
         self.detector = LaneDetector(config.get("detector", {}))
         self.tracker = LaneTracker(config.get("tracker", {}))
+        self.target_selector = TargetSelector(config.get("target_selector", {}))
+        self.object_detector = RknnObjectDetector(config.get("rknn_object_detector", {}))
+        self.gold_target_planner = GoldTargetPlanner(config.get("gold_target", {}))
+        self.blocking_analyzer = BlockingAnalyzer(config.get("blocking_analyzer", {}))
+        self.avoidance_planner = AvoidanceTargetPlanner(
+            config.get("avoidance_target_planner", {}),
+            target_selector=self.target_selector,
+        )
         self.planner = HighLevelPlanner(config.get("planner", {}))
         self.bridge: BaseVehicleBridge = build_vehicle_bridge(config.get("bridge", {}))
         self.visualizer = Visualizer(config.get("visualizer", {}))
         self.csv_logger = CsvLogger(config.get("logger", {}))
         self.fps_counter = FPSCounter(config.get("app", {}).get("fps_smoothing_alpha", 0.2))
+        self.last_target_result: TargetPointResult | None = None
+        self.last_blocking_result: BlockingAnalysisResult | None = None
+        self.last_avoidance_result: AvoidanceTargetResult | None = None
+        self.last_detected_objects: list[DetectedObject] = []
+        self.last_gold_result: GoldTargetResult | None = None
 
     def run(self) -> None:
         """执行上位机主循环。
@@ -167,17 +192,22 @@ class UpperMachineApp:
             detection_result = self.detector.detect(preprocess_result.roi_frame)
             # 第 3 步：把当前帧结果和历史结果融合，减少抖动。
             tracked_state = self.tracker.update(detection_result)
-            # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
-            module_hints = self._collect_future_module_hints(
+            planning_state = self._build_planning_state(
                 preprocess_result=preprocess_result,
                 detection_result=detection_result,
                 tracked_state=tracked_state,
             )
+            # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
+            module_hints = self._collect_future_module_hints(
+                preprocess_result=preprocess_result,
+                detection_result=detection_result,
+                tracked_state=planning_state,
+            )
             # 第 5 步：把视觉结果变成“高层目标速度、目标转向”。
-            control_command = self.planner.plan(tracked_state, module_hints=module_hints)
+            control_command = self.planner.plan(planning_state, module_hints=module_hints)
 
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
-            payload = self._build_payload(control_command, tracked_state)
+            payload = self._build_payload(control_command, planning_state)
             self.bridge.send(payload)
             fps_value = self.fps_counter.update()
 
@@ -185,10 +215,10 @@ class UpperMachineApp:
             self.csv_logger.log(
                 {
                     "timestamp_ms": control_command.ts_ms,
-                    "lateral_error_px": tracked_state.lateral_error_px,
-                    "heading_error_deg": tracked_state.heading_error_deg,
-                    "curvature": tracked_state.curvature,
-                    "confidence": tracked_state.confidence,
+                    "lateral_error_px": planning_state.lateral_error_px,
+                    "heading_error_deg": planning_state.heading_error_deg,
+                    "curvature": planning_state.curvature,
+                    "confidence": planning_state.confidence,
                     "target_speed": control_command.target_speed,
                     "steer_deg": control_command.steer_deg,
                     "lane_lost_count": tracked_state.lane_lost_count,
@@ -199,9 +229,14 @@ class UpperMachineApp:
             should_continue = self.visualizer.render(
                 preprocess_result=preprocess_result,
                 detection_result=detection_result,
-                tracked_state=tracked_state,
+                tracked_state=planning_state,
                 control_command=control_command,
                 fps_value=fps_value,
+                target_result=self.last_target_result,
+                blocking_result=self.last_blocking_result,
+                avoidance_result=self.last_avoidance_result,
+                detected_objects=self.last_detected_objects,
+                gold_result=self.last_gold_result,
             )
             if not should_continue:
                 break
@@ -218,6 +253,7 @@ class UpperMachineApp:
 
         self.camera.release()
         self.bridge.close()
+        self.object_detector.close()
         self.visualizer.close()
         self.csv_logger.close()
 
@@ -270,7 +306,145 @@ class UpperMachineApp:
         _ = preprocess_result
         _ = detection_result
         _ = tracked_state
+        if (
+            self.last_gold_result is not None
+            and self.last_gold_result.active
+            and self.last_avoidance_result is not None
+            and self.last_avoidance_result.mode == "gold_target"
+        ):
+            return ModuleHints(
+                speed_limit=self.last_gold_result.speed_limit,
+                force_mode="GOLD",
+                note=self.last_gold_result.reason,
+            )
         return ModuleHints()
+
+    def _detect_objects_for_roi(
+        self,
+        preprocess_result: PreprocessResult,
+        detection_result: LaneDetectionResult,
+        tracked_state: TrackedLaneState,
+    ) -> list[DetectedObject]:
+        """Return vehicle/person boxes with ROI coordinates attached.
+
+        This hook intentionally defaults to no detections. A real ObjectDetector should
+        provide DetectedObject(class_name, confidence, bbox_frame) in resized_frame
+        coordinates; this method clips each bbox into bbox_roi for BlockingAnalyzer.
+        """
+
+        _ = detection_result
+        _ = tracked_state
+        objects_from_detector = [
+            obj for obj in self.last_detected_objects
+            if obj.class_name.casefold() not in self.gold_target_planner.class_names
+        ]
+        roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
+        return attach_roi_bboxes(
+            objects=objects_from_detector,
+            roi_rect=preprocess_result.roi_rect,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
+
+    def _build_planning_state(
+        self,
+        preprocess_result: PreprocessResult,
+        detection_result: LaneDetectionResult,
+        tracked_state: TrackedLaneState,
+    ) -> TrackedLaneState:
+        """Replace lane metrics with target-point metrics before high-level planning."""
+
+        roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
+        centerline_points = tracked_state.centerline_points or detection_result.centerline_points
+        normal_target = self.target_selector.select(
+            centerline_points=centerline_points,
+            roi_width=roi_width,
+            roi_height=roi_height,
+            lane_confidence=tracked_state.confidence,
+            curvature=tracked_state.curvature,
+        )
+        self.last_detected_objects = self.object_detector.detect(preprocess_result.resized_frame)
+        gold_result = self.gold_target_planner.plan(
+            objects=self.last_detected_objects,
+            roi_rect=preprocess_result.roi_rect,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
+        self.last_gold_result = gold_result
+        objects = self._detect_objects_for_roi(
+            preprocess_result=preprocess_result,
+            detection_result=detection_result,
+            tracked_state=tracked_state,
+        )
+        blocking_result = self.blocking_analyzer.analyze(
+            objects=objects,
+            centerline_points=centerline_points,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
+        avoidance_result = self.avoidance_planner.plan(
+            centerline_points=centerline_points,
+            normal_target=normal_target,
+            blocking_result=blocking_result,
+            roi_width=roi_width,
+            roi_height=roi_height,
+            lane_confidence=tracked_state.confidence,
+            curvature=tracked_state.curvature,
+        )
+
+        if blocking_result.need_avoid or blocking_result.too_close:
+            self.last_target_result = normal_target
+            self.last_blocking_result = blocking_result
+            self.last_avoidance_result = avoidance_result
+            return replace(
+                tracked_state,
+                centerline_points=[
+                    (int(round(x)), int(round(y)))
+                    for x, y in avoidance_result.shifted_centerline_points
+                ],
+                lateral_error_px=avoidance_result.final_lateral_error_px,
+                heading_error_deg=avoidance_result.final_heading_error_deg,
+                confidence=min(tracked_state.confidence, avoidance_result.confidence),
+            )
+
+        if gold_result.active:
+            self.last_target_result = normal_target
+            self.last_blocking_result = blocking_result
+            self.last_avoidance_result = AvoidanceTargetResult(
+                mode="gold_target",
+                shifted_centerline_points=[
+                    (float(x), float(y))
+                    for x, y in centerline_points
+                ],
+                target_point_roi=gold_result.target_point_roi,
+                avoid_bias_px=0.0,
+                final_lateral_error_px=gold_result.final_lateral_error_px,
+                final_heading_error_deg=gold_result.final_heading_error_deg,
+                confidence=gold_result.confidence,
+                reason=gold_result.reason,
+            )
+            return replace(
+                tracked_state,
+                lateral_error_px=gold_result.final_lateral_error_px,
+                heading_error_deg=gold_result.final_heading_error_deg,
+                confidence=max(tracked_state.confidence, min(1.0, gold_result.confidence)),
+                is_lane_lost=False,
+            )
+
+        self.last_target_result = normal_target
+        self.last_blocking_result = blocking_result
+        self.last_avoidance_result = avoidance_result
+
+        return replace(
+            tracked_state,
+            centerline_points=[
+                (int(round(x)), int(round(y)))
+                for x, y in avoidance_result.shifted_centerline_points
+            ],
+            lateral_error_px=avoidance_result.final_lateral_error_px,
+            heading_error_deg=avoidance_result.final_heading_error_deg,
+            confidence=min(tracked_state.confidence, avoidance_result.confidence),
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

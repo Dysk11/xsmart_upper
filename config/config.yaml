@@ -8,15 +8,15 @@ camera:
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
-  video_path: ""
+  video_path: cbf977c5bd5978922b972f4f0285c0bd.mp4
   # 网络流模式下的 http/rtsp 视频地址流。
   stream_url: ""
   # 视频是否循环播放。
   loop_video: false
   # 采集或回放后希望使用的图像尺寸。
-  width: 1280
-  height: 720
-  fps: 30
+  width: 800
+  height: 600
+  fps: 60
   # 是否镜像翻转，部分摄像头安装方向反了时很有用。
   mirror: false
   reconnect_interval_sec: 0.5
@@ -25,12 +25,12 @@ camera:
 preprocess:
   resize:
     # 是否先统一缩放，方便后续参数固定。
-    enable: true
-    width: 1280
-    height: 720
+    enable: false
+    width: 800
+    height: 600
   roi:
     # ROI 用比例表示，减少分辨率变化带来的重复调参。
-    top_ratio: 0.61
+    top_ratio: 0.65
     bottom_ratio: 1.0
     left_ratio: 0.05
     right_ratio: 0.95
@@ -56,8 +56,8 @@ detector:
   color_space: hsv
   hsv:
     # 蓝色航道的 HSV 阈值。
-    lower: [89, 90, 62]
-    upper: [110, 255, 255]
+    lower: [94, 90, 62]
+    upper: [128, 255, 255]
   lab:
     # 蓝色航道的 Lab 阈值。
     lower: [20, 120, 80]
@@ -65,7 +65,7 @@ detector:
   morphology:
     # 开闭运算参数，用于去噪和补洞。
     open_kernel: 1
-    close_kernel: 5
+    close_kernel: 2
     erode_iterations: 0
     dilate_iterations: 1
   connected_components:
@@ -118,6 +118,62 @@ tracker:
   min_prediction_confidence: 0.10
   centerline_alpha: 0.25
   max_centerline_point_shift_px: 80
+
+target_selector:
+  base_lookahead_px: 120
+  min_lookahead_px: 70
+  max_lookahead_px: 180
+  curvature_gain: 80
+  low_confidence_lookahead_px: 80
+  low_confidence_threshold: 0.45
+
+rknn_object_detector:
+  # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
+  enable: true
+  model_path: rknn_lt.rknn
+  input_size: [640, 640]
+  input_layout: nhwc
+  input_color: rgb
+  input_dtype: uint8
+  score_threshold: 0.20
+  nms_threshold: 0.45
+  max_detections: 30
+  # 模型有 3 个类别输出；如果训练时类别顺序不同，只需要调整这里的顺序。
+  class_names: [Gold, Car, Human]
+  core_mask: NPU_CORE_0_1_2
+
+gold_target:
+  enabled: true
+  class_names: [Gold]
+  min_confidence: 0.20
+  hold_frames: 4
+  approach_speed_limit: 0.85
+  close_speed_limit: 0.45
+  close_y_ratio: 0.82
+  max_above_roi_ratio: 0.8
+  aim_at: bottom_center
+
+blocking_analyzer:
+  enabled: true
+  corridor_half_width_px: 90
+  confidence_threshold: 0.45
+  min_box_area: 600
+  near_y_ratio: 0.42
+  too_close_y_ratio: 0.82
+  blocking_score_threshold: 0.25
+  side_deadband_px: 25
+
+avoidance_target_planner:
+  enabled: true
+  max_avoid_bias_px: 110
+  bias_alpha: 0.25
+  return_decay: 0.85
+  clear_frames: 8
+  front_margin_px: 45
+  rear_margin_px: 35
+  target_front_margin_px: 35
+  min_lane_confidence_to_start_avoid: 0.45
+  max_target_jump_px: 50
 
 planner:
   # 这些参数只用于上位机高层策略，不是底层 PID。
@@ -174,7 +230,7 @@ logger:
 extensions:
   # 下面这些是后续扩展模块的预留开关，当前版本还未启用。
   target_detector:
-    enable: false
+    enable: true
   ocr:
     enable: false
   traffic_light:

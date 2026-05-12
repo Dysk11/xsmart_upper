@@ -9,11 +9,15 @@ from typing import Any
 import cv2
 import numpy as np
 
+from core.avoidance_target_planner import AvoidanceTargetResult
+from core.blocking_analyzer import BlockingAnalysisResult, DetectedObject
+from core.gold_target_planner import GoldTargetResult
 from core.lane_detector import LaneDetectionResult
 from core.lane_tracker import TrackedLaneState
 from core.planner import ControlCommand
 from core.preprocess import PreprocessResult
-from utils.image_utils import draw_centerline, draw_text_lines, ensure_bgr, overlay_mask, stack_images
+from core.target_selector import TargetPointResult
+from utils.image_utils import draw_centerline, draw_text_lines, ensure_bgr, stack_images
 
 
 class Visualizer:
@@ -51,6 +55,11 @@ class Visualizer:
         tracked_state: TrackedLaneState,
         control_command: ControlCommand,
         fps_value: float,
+        target_result: TargetPointResult | None = None,
+        blocking_result: BlockingAnalysisResult | None = None,
+        avoidance_result: AvoidanceTargetResult | None = None,
+        detected_objects: list[DetectedObject] | None = None,
+        gold_result: GoldTargetResult | None = None,
     ) -> bool:
         """生成一帧调试画面，并根据配置显示或保存。
 
@@ -71,6 +80,11 @@ class Visualizer:
             tracked_state=tracked_state,
             control_command=control_command,
             fps_value=fps_value,
+            target_result=target_result,
+            blocking_result=blocking_result,
+            avoidance_result=avoidance_result,
+            detected_objects=detected_objects,
+            gold_result=gold_result,
         )
 
         if self.save_video:
@@ -109,6 +123,11 @@ class Visualizer:
         tracked_state: TrackedLaneState,
         control_command: ControlCommand,
         fps_value: float,
+        target_result: TargetPointResult | None = None,
+        blocking_result: BlockingAnalysisResult | None = None,
+        avoidance_result: AvoidanceTargetResult | None = None,
+        detected_objects: list[DetectedObject] | None = None,
+        gold_result: GoldTargetResult | None = None,
     ) -> np.ndarray:
         """将原图、ROI、掩膜和状态文字合成为一张调试大图。
 
@@ -136,9 +155,55 @@ class Visualizer:
             1,
         )
         original_panel = draw_centerline(original_panel, centerline_points, color=(0, 255, 0), offset=(x1, y1))
+        if avoidance_result is not None:
+            original_panel = draw_centerline(
+                original_panel,
+                avoidance_result.shifted_centerline_points,
+                color=(255, 255, 0),
+                offset=(x1, y1),
+            )
+        if target_result is not None:
+            self._draw_target_point(
+                original_panel,
+                target_result.target_point_roi,
+                offset=(x1, y1),
+                color=(0, 180, 255),
+                label="N",
+            )
+        if avoidance_result is not None:
+            self._draw_target_point(
+                original_panel,
+                avoidance_result.target_point_roi,
+                offset=(x1, y1),
+                color=(0, 255, 255),
+                label="A",
+            )
+        if detected_objects:
+            self._draw_detected_objects(original_panel, detected_objects)
+        if gold_result is not None and gold_result.active:
+            self._draw_target_point(
+                original_panel,
+                gold_result.target_point_roi,
+                offset=(x1, y1),
+                color=(0, 215, 255),
+                label="G",
+            )
+        if blocking_result is not None and blocking_result.blocking_object is not None:
+            self._draw_blocking_debug(
+                original_panel,
+                blocking_result,
+                roi_offset=(x1, y1),
+                roi_height=preprocess_result.roi_frame.shape[0],
+            )
         original_panel = draw_text_lines(
             original_panel,
-            [
+            self._build_original_panel_lines(
+                avoidance_result=avoidance_result,
+                blocking_result=blocking_result,
+                control_command=control_command,
+                fps_value=fps_value,
+                gold_result=gold_result,
+            ) or [
                 "窗口1：原始画面",
                 "黄色框 = ROI范围  红线 = 车身中心参考线  绿线 = 航道中心线",
             ],
@@ -146,68 +211,97 @@ class Visualizer:
             font_size=self.font_size,
         )
 
-        # 这里改为显示“稳定蓝色候选掩膜”，也就是调参工具里看到的那种整体蓝色区域。
-        # 主航道筛选掩膜会随着组件链长度变化而闪烁，不适合作为调试主窗口的蓝色显示层。
-        roi_panel = overlay_mask(preprocess_result.roi_raw_frame, detection_result.mask, color=(255, 0, 0), alpha=0.35)
-        roi_panel = draw_centerline(roi_panel, centerline_points, color=(0, 255, 0))
-        cv2.line(
-            roi_panel,
-            (preprocess_result.roi_raw_frame.shape[1] // 2, 0),
-            (preprocess_result.roi_raw_frame.shape[1] // 2, preprocess_result.roi_raw_frame.shape[0] - 1),
-            (60, 60, 255),
-            1,
-        )
-        roi_panel = draw_text_lines(
-            roi_panel,
-            [
-                "窗口2：ROI区域与稳定蓝色候选区",
-                "这里显示调参同款蓝色掩膜，不再因为主链条筛选而忽隐忽现",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
+        return original_panel
 
-        mask_panel = ensure_bgr(detection_result.mask)
-        mask_panel = draw_centerline(mask_panel, detection_result.centerline_points, color=(0, 255, 255))
-        mask_panel = draw_text_lines(
-            mask_panel,
-            [
-                "窗口3：稳定蓝色掩膜与中心线",
-                "白色区域 = 当前阈值识别到的蓝色航道，黄线 = 实际控制中心线",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
+    def _draw_target_point(
+        self,
+        image: np.ndarray,
+        point: tuple[float, float],
+        offset: tuple[int, int],
+        color: tuple[int, int, int],
+        label: str,
+    ) -> None:
+        x = int(round(point[0] + offset[0]))
+        y = int(round(point[1] + offset[1]))
+        cv2.circle(image, (x, y), 8, color, -1)
+        cv2.circle(image, (x, y), 12, (0, 0, 0), 2)
+        cv2.putText(image, label, (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
-        info_panel = overlay_mask(preprocess_result.roi_frame, detection_result.mask, color=(255, 0, 0), alpha=0.20)
-        info_panel = overlay_mask(info_panel, detection_result.filtered_mask, color=(0, 255, 255), alpha=0.16)
-        info_panel = draw_centerline(info_panel, centerline_points, color=(0, 255, 0))
-        info_panel = draw_text_lines(
-            info_panel,
-            [
-                "窗口4：调试信息总览",
-                f"FPS: {fps_value:.1f}",
-                f"检测置信度: {tracked_state.confidence:.2f}  丢线计数: {tracked_state.lane_lost_count}",
-                f"原始行点数: {detection_result.valid_row_count}  拟合点数: {detection_result.fit_point_count}",
-                f"横向误差(px): {tracked_state.lateral_error_px:.2f}",
-                f"航向误差(deg): {tracked_state.heading_error_deg:.2f}",
-                f"曲率: {tracked_state.curvature:.6f}",
-                f"目标速度: {control_command.target_speed:.3f}",
-                f"目标转向: {control_command.steer_deg:.3f}",
-                f"蓝色像素: {cv2.countNonZero(detection_result.mask)}  主链像素: {cv2.countNonZero(detection_result.filtered_mask)}",
-                f"当前模式: {control_command.mode}  是否预测补偿: {'是' if tracked_state.used_prediction else '否'}",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
+    def _draw_detected_objects(
+        self,
+        image: np.ndarray,
+        objects: list[DetectedObject],
+    ) -> None:
+        for obj in objects:
+            x1, y1, x2, y2 = obj.bbox_frame
+            is_gold = obj.class_name.casefold() == "gold"
+            color = (0, 215, 255) if is_gold else (0, 165, 255)
+            cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+            label = f"{obj.class_name} {obj.confidence:.2f}"
+            label_y = max(18, int(y1) - 6)
+            cv2.putText(
+                image,
+                label,
+                (int(x1), label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
 
-        cell_width = max(320, preprocess_result.resized_frame.shape[1] // 2)
-        cell_height = max(180, preprocess_result.resized_frame.shape[0] // 2)
-        return stack_images(
-            [original_panel, roi_panel, mask_panel, info_panel],
-            cols=2,
-            cell_size=(cell_width, cell_height),
+    def _draw_blocking_debug(
+        self,
+        image: np.ndarray,
+        blocking_result: BlockingAnalysisResult,
+        roi_offset: tuple[int, int],
+        roi_height: int,
+    ) -> None:
+        obj = blocking_result.blocking_object
+        if obj is None:
+            return
+        frame_x1, frame_y1, frame_x2, frame_y2 = obj.bbox_frame
+        roi_x1, roi_y1, roi_x2, roi_y2 = obj.bbox_roi or (0, 0, 0, 0)
+        ox, oy = roi_offset
+        cv2.rectangle(
+            image,
+            (int(frame_x1), int(frame_y1)),
+            (int(frame_x2), int(frame_y2)),
+            (0, 165, 255),
+            2,
         )
+        lane_x = int(round(blocking_result.lane_center_x_at_obstacle + ox))
+        y_bottom = int(round(roi_y2 + oy))
+        cv2.circle(image, (lane_x, y_bottom), 6, (255, 0, 255), -1)
+        cv2.line(image, (lane_x, oy), (lane_x, oy + roi_height - 1), (255, 0, 255), 1)
+        danger_left = int(round(blocking_result.danger_left + ox))
+        danger_right = int(round(blocking_result.danger_right + ox))
+        cv2.line(image, (danger_left, oy), (danger_left, oy + roi_height - 1), (0, 255, 255), 1)
+        cv2.line(image, (danger_right, oy), (danger_right, oy + roi_height - 1), (0, 255, 255), 1)
+        _ = roi_x1
+        _ = roi_y1
+
+    def _build_original_panel_lines(
+        self,
+        avoidance_result: AvoidanceTargetResult | None,
+        blocking_result: BlockingAnalysisResult | None,
+        control_command: ControlCommand,
+        fps_value: float,
+        gold_result: GoldTargetResult | None = None,
+    ) -> list[str]:
+        if avoidance_result is None:
+            return []
+        blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
+        gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no Gold"
+        return [
+            "窗口1：原始画面",
+            "绿线=原中心线 青线=避障/Gold中心线 N=普通目标 A=最终目标 G=Gold",
+            f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
+            f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
+            f"steer_deg: {control_command.steer_deg:.2f}",
+            f"{gold_reason}",
+            f"{blocking_reason}",
+        ]
 
     def _write_video(self, canvas: np.ndarray) -> None:
         """将调试画面写入视频文件。
