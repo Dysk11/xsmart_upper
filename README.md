@@ -145,36 +145,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
-如果想强制使用串口桥接：
-
-```bash
-python main.py --bridge serial
-```
-
-如果现场只想看串口文本打印，不发送真实串口：
-
-```bash
-python main.py --bridge mock
-```
-
 ## 如何运行视频回放模式
 
 方法一：直接使用主程序切换到视频模式
 
 ```bash
 python main.py --mode video --video /path/to/demo.mp4 --bridge mock
-```
-
-方法二：使用专门的视频测试脚本
-
-```bash
-python tests/demo_video_test.py --video /path/to/demo.mp4
-```
-
-如果没有显示器或不想弹窗：
-
-```bash
-python tests/demo_video_test.py --video /path/to/demo.mp4 --no-gui --save-video
 ```
 
 ## HSV 实时调参工具
@@ -187,122 +163,115 @@ python tests/demo_video_test.py --video /path/to/demo.mp4 --no-gui --save-video
 python tools/hsv_tuner.py
 ```
 
-如果想指定摄像头设备号：
-
-```bash
-python tools/hsv_tuner.py --device-id 1
-```
-
-如果想对视频离线调参：
-
-```bash
-python tools/hsv_tuner.py --mode video --video /path/to/demo.mp4
-```
-
-窗口说明：
-
-- 左上：原始画面 + ROI 范围
-- 右上：ROI 区域 + 原始 HSV 掩膜
-- 左下：筛选后的主航道掩膜
-- 右下：当前参数和快捷键说明
-
-滑块建议优先调这些：
-
-- `ROI_top(%)`：先把 ROI 压到只看地面，减少桌面和背景干扰
-- `H_low/H_high`：先决定蓝色大致色相范围
-- `S_low`：提高后可减少灰蓝、暗蓝误检
-- `V_low`：提高后可减少阴影和黑色区域误检
-- `MinArea/MinHeight`：去掉零碎小蓝块
-
 快捷键：
 
 - `Q` / `Esc`：退出
 - `P`：把当前推荐 YAML 片段打印到终端
 - `S`：把当前参数快照保存到 `outputs/hsv_tuner_last_snippet.yaml`
 
-## 调试画面说明
+---
 
-调试窗口默认包含 4 个区域：
+# RKNN 目标识别、避障、吃 Gold 功能
 
-- 原图 + ROI 框 + 中心线；
-- ROI + 蓝色掩膜 + 中心线；
-- 主航道二值掩膜；
-- 误差、曲率、置信度、FPS、速度/转向指令等文字信息。
+本章节说明当前工程里和 `rknn_lt.rknn` 模型、测试视频、`Car/Human` 避障、`Gold` 目标追踪相关的实现细节。
 
-按键说明：
+## 1. 当前已接入的内容
 
-- `q` / `Esc`: 退出程序
-- `s`: 保存当前截图
+当前工程已经完成以下接入：
+
+- 模型文件：`rknn_lt.rknn`
+- 测试视频：`cbf977c5bd5978922b972f4f0285c0bd.mp4`
+- RKNN 推理模块：`core/rknn_object_detector.py`
+- Gold 目标规划模块：`core/gold_target_planner.py`
+- 避障判断模块：`core/blocking_analyzer.py`
+- 避障目标规划模块：`core/avoidance_target_planner.py`
+- 主流程入口：`main.py`
+- 主要配置文件：`config/config.yaml`
+
+默认配置已经把图像源设置成视频模式：
+
+```yaml
+camera:
+  mode: video
+  video_path: cbf977c5bd5978922b972f4f0285c0bd.mp4
+```
+
+模型配置如下：
+
+```yaml
+rknn_object_detector:
+  enable: true
+  model_path: rknn_lt.rknn
+  class_names: [Gold, Car, Human]
+```
+
+## 2. 类别顺序
+
+模型实际输出的是类别编号。当前配置：
+
+- `0 = Gold`
+- `1 = Car`
+- `2 = Human`
+
+如果训练模型时的类别顺序不同，必须在 `config/config.yaml` 中修改 `class_names`。
+
+## 3. 控制优先级
+
+当前主逻辑优先级是：
+
+```text
+Car/Human 避障 > 吃 Gold > 普通巡线
+```
+
+注意：避障模块会在巡线中心线上加一个平滑偏移，生成新的目标点。最终仍然只发送一组 `lateral_error_px` 和 `steer_deg` 给下位机。
+
+## 4. Gold 目标逻辑
+
+- `class_names: [Gold]`：只有识别类别名为 `Gold` 的目标才触发吃金币逻辑。
+- `approach_speed_limit: 0.85`：朝 Gold 走时限制速度。
+- `aim_at: bottom_center`：目标点取 Gold 框的底部中心。
+
+当且仅当没有障碍物阻挡时，`GOLD` 模式生效。
+
+## 5. Car/Human 避障逻辑
+
+1. `core/blocking_analyzer.py` 判断识别框是否挡住当前航道危险走廊（`corridor_half_width_px`）。
+2. `core/avoidance_target_planner.py` 根据阻挡位置生成偏移后的目标路线。
+
+避障只对 `Car` 和 `Human` 生效，`Gold` 不会被当作障碍物。
+
+## 6. 主流程顺序
+
+1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 避障判断 -> 6. 决策规划（避障 > 金币 > 巡线） -> 7. 生成协议帧发送。
+
+## 7. 如何确认功能正常
+
+1. 终端出现 `RKNN detector loaded`；
+2. 调试画面中出现 `Gold/Car/Human` 目标框；
+3. 画面上 `G` 为 Gold 目标点，`A` 为最终控制目标点；
+4. 阻挡时模式显示 `avoid_left/right` 或 `too_close`，吃金币时显示 `GOLD`。
+
+---
 
 ## 默认协议说明
 
 默认协议位于 `core/protocol.py`，使用一行文本形式，便于调试与抓串口日志。
 
-字段包括：
-
-- `ts_ms`
-- `mode`
-- `target_speed`
-- `steer_deg`
-- `lateral_error_px`
-- `heading_error_deg`
-- `curvature`
-- `confidence`
-- `is_lane_lost`
-
-示例：
-
-```text
-ts_ms=1711111111111,mode=NORMAL,target_speed=1.200,steer_deg=-3.500,lateral_error_px=12.300,heading_error_deg=-1.200,curvature=0.004500,confidence=0.860,is_lane_lost=0
-```
+字段包括：`ts_ms`, `mode`, `target_speed`, `steer_deg`, `lateral_error_px`, `heading_error_deg`, `curvature`, `confidence`, `is_lane_lost`。
 
 ## 如何对接 TC264
 
-后续与 TC264 联调时，请明确以下边界：
-
-- TC264 已经实现底层速度环、位置环等闭环；
-- 本项目只输出高层目标控制量；
-- 不要在上位机重复实现底层 PID；
-- 真正协议请集中修改 `core/protocol.py` 和 `core/bridge.py`。
-
-推荐对接步骤：
-
-1. 先保持 `planner.py` 输出 `target_speed` 与 `steer_deg` 不变；
-2. 在 `core/protocol.py` 中把文本协议改为 TC264 真正需要的定长帧或二进制帧；
-3. 在 `core/bridge.py` 中保留 `BaseVehicleBridge` 接口，重写 `SerialBridge.send()` 的发送细节；
-4. 下位机根据接收到的高层目标量执行自身闭环控制。
-
-如果后续要插入额外高层模块，推荐这样接：
-
-1. 在 `main.py` 的 `_collect_future_module_hints()` 中汇总 OCR、红绿灯、金币规划等输出；
-2. 将这些输出统一整理为 `ModuleHints`；
-3. 交给 `planner.py` 做最终高层速度/转向融合；
-4. 保持下位机仍只接收高层目标量，不破坏现有闭环边界。
+1. TC264 已经实现底层闭环，本项目只输出高层目标量；
+2. 若需修改协议，请集中修改 `core/protocol.py` 和 `core/bridge.py`；
+3. 扩展模块输出建议统一整理为 `ModuleHints` 交给 `planner.py`。
 
 ## 巡线算法设计说明
 
-第一版方案完全采用传统视觉，便于在 RK3588S 上稳定部署：
-
-- 颜色空间阈值分割：支持 HSV / Lab；
-- 形态学开闭运算：去掉蓝色噪点、填补小孔洞；
-- 连通域筛选：抑制误检小蓝块；
-- 分层扫描：逐行提取蓝色主航道中心；
-- 单侧边界推断：当局部只看到一侧边界时，借助上一帧宽度估计中心；
-- 二次曲线拟合：得到更平滑的中心线；
-- EMA 时序平滑：减小抖动，并在短时丢线时提供预测补偿；
-- 高层速度策略：直道提速、弯道减速、低置信度降速、丢线保守模式。
+- 颜色空间（HSV/Lab）阈值分割 + 形态学处理；
+- 连通域筛选 + 分层扫描提取中心；
+- 单侧边界推断 + 二次曲线拟合；
+- EMA 时序平滑 + 高层速度策略。
 
 ## 输出日志
 
-CSV 日志默认保存在 `outputs/logs/`，字段包括：
-
-- 时间戳
-- 横向误差
-- 航向误差
-- 曲率
-- 置信度
-- 目标速度
-- 目标转向
-- 丢线计数
-
-这些数据适合赛后离线分析与调参。
+CSV 日志保存在 `outputs/logs/`，包含误差、曲率、置信度、目标速度/转向等，适合离线分析。
