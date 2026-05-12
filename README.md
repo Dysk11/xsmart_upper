@@ -180,7 +180,7 @@ python tools/hsv_tuner.py
 当前工程已经完成以下接入：
 
 - 模型文件：`rknn_lt.rknn`
-- 测试视频：`cbf977c5bd5978922b972f4f0285c0bd.mp4`
+- 测试视频：`outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4`
 - RKNN 推理模块：`core/rknn_object_detector.py`
 - Gold 目标规划模块：`core/gold_target_planner.py`
 - 避障判断模块：`core/blocking_analyzer.py`
@@ -193,7 +193,7 @@ python tools/hsv_tuner.py
 ```yaml
 camera:
   mode: video
-  video_path: cbf977c5bd5978922b972f4f0285c0bd.mp4
+  video_path: outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4
 ```
 
 模型配置如下：
@@ -201,7 +201,7 @@ camera:
 ```yaml
 rknn_object_detector:
   enable: true
-  model_path: rknn_lt.rknn
+  model_path: models/rknn_lt.rknn
   class_names: [Gold, Car, Human]
 ```
 
@@ -258,6 +258,30 @@ Car/Human 避障 > 吃 Gold > 普通巡线
 默认协议位于 `core/protocol.py`，使用一行文本形式，便于调试与抓串口日志。
 
 字段包括：`ts_ms`, `mode`, `target_speed`, `steer_deg`, `lateral_error_px`, `heading_error_deg`, `curvature`, `confidence`, `is_lane_lost`。
+
+## UART 通信协议说明
+
+本项目通过 CH340 串口 USB 转 TTL 模块将树莓派/RK3588 与下位机（如 Arduino 或 TC264）连接。
+
+- **配置**: 115200 8N1 (115200 波特率, 8 数据位, 无校验位, 1 停止位)
+- **帧结构**: 2 字节帧头 + 2 字节误差 (Int16) + 2 字节转向角度 (Int16)
+
+| 字节偏移 | 长度 | 定义 | 说明 |
+| :--- | :--- | :--- | :--- |
+| 0 | 1 | 帧头 1 | 固定为 `0xAA` |
+| 1 | 1 | 帧头 2 | 固定为 `0x55` |
+| 2 | 2 | 横向误差 | `lateral_error_px` 转为 Int16 (大端序) |
+| 4 | 2 | 转向角度 | `steer_deg` 转为 Int16 (大端序) |
+
+示例代码：
+```python
+data = bytearray([
+    0xAA, 0x55,
+    (error >> 8) & 0xFF, error & 0xFF,
+    (angle >> 8) & 0xFF, angle & 0xFF
+])
+ser.write(data)
+```
 
 ## 如何对接 TC264
 

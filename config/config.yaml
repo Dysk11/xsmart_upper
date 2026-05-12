@@ -4,11 +4,11 @@ app:
 
 camera:
   # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，stream 表示网络流。
-  mode: camera
+  mode: video
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
-  video_path: cbf977c5bd5978922b972f4f0285c0bd.mp4
+  video_path: outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4
   # 网络流模式下的 http/rtsp 视频地址流。
   stream_url: "http://192.168.3.223:8080/ar_feed"
   # 视频是否循环播放。
