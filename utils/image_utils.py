@@ -176,23 +176,6 @@ def draw_text_lines(
     return output
 
 
-def translate_points(
-    points: Sequence[Tuple[int, int]],
-    offset: Tuple[int, int],
-) -> List[Tuple[int, int]]:
-    """对点集统一添加平移偏移量。
-
-    输入:
-        points: 原始点集。
-        offset: 坐标偏移，格式为 (dx, dy)。
-
-    输出:
-        返回平移后的点集。
-    """
-
-    return [(int(x + offset[0]), int(y + offset[1])) for x, y in points]
-
-
 def stack_images(
     images: Sequence[np.ndarray],
     cols: int = 2,

@@ -44,7 +44,7 @@ def test_bbox_outside_roi() -> None:
 def test_bbox_blocks_curved_lane_centerline() -> None:
     centerline = [(170, 230), (190, 190), (220, 150), (260, 110), (300, 70)]
     objects = attach_roi_bboxes(
-        [DetectedObject("vehicle", 0.9, bbox_frame=(260, 210, 360, 290))],
+        [DetectedObject("Car", 0.9, bbox_frame=(260, 210, 360, 290))],
         ROI_RECT,
         ROI_WIDTH,
         ROI_HEIGHT,
@@ -64,7 +64,7 @@ def test_bbox_blocks_curved_lane_centerline() -> None:
 def test_frame_center_bbox_does_not_block_lane_if_not_on_lane_corridor() -> None:
     centerline = [(80, 230), (90, 190), (100, 150), (120, 110), (140, 70)]
     objects = attach_roi_bboxes(
-        [DetectedObject("person", 0.9, bbox_frame=(270, 190, 330, 270))],
+        [DetectedObject("Human", 0.9, bbox_frame=(270, 190, 330, 270))],
         ROI_RECT,
         ROI_WIDTH,
         ROI_HEIGHT,
@@ -78,7 +78,7 @@ def test_avoidance_final_error_is_packet_error_source() -> None:
     target_selector = TargetSelector({})
     normal_target = target_selector.select(centerline, ROI_WIDTH, ROI_HEIGHT, 0.85, 0.001)
     objects = attach_roi_bboxes(
-        [DetectedObject("vehicle", 0.9, bbox_frame=(260, 190, 360, 260))],
+        [DetectedObject("Car", 0.9, bbox_frame=(260, 190, 360, 260))],
         ROI_RECT,
         ROI_WIDTH,
         ROI_HEIGHT,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import multiprocessing as mp
+import queue
 import sys
 import traceback
 from dataclasses import replace
@@ -20,6 +22,7 @@ from core.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.camera import CameraReader
 from core.avoidance_target_planner import AvoidanceTargetPlanner, AvoidanceTargetResult
 from core.blocking_analyzer import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
+from core.fork_route_planner import ForkRoutePlanner, ForkRouteResult
 from core.gold_target_planner import GoldTargetPlanner, GoldTargetResult
 from core.lane_detector import LaneDetectionResult, LaneDetector
 from core.lane_tracker import LaneTracker, TrackedLaneState
@@ -30,6 +33,95 @@ from core.rknn_object_detector import RknnObjectDetector
 from core.target_selector import TargetPointResult, TargetSelector
 from core.visualizer import Visualizer
 from utils.fps import FPSCounter
+
+
+def _put_latest(work_queue: Any, item: Any) -> None:
+    """Put an item into a size-limited multiprocessing queue, dropping stale data."""
+
+    try:
+        work_queue.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+
+    try:
+        work_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        work_queue.put_nowait(item)
+    except queue.Full:
+        pass
+
+
+def _drain_latest(work_queue: Any) -> Any | None:
+    """Return the newest available queue item without blocking."""
+
+    latest = None
+    while True:
+        try:
+            latest = work_queue.get_nowait()
+        except queue.Empty:
+            return latest
+
+
+def _ai_inference_worker(
+    detector_config: Dict[str, Any],
+    input_queue: Any,
+    output_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Run RKNN object detection in an independent process."""
+
+    detector = RknnObjectDetector(detector_config)
+    try:
+        while not stop_event.is_set():
+            try:
+                item = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+
+            frame_id, frame = item
+            try:
+                detections = detector.detect(frame)
+                _put_latest(output_queue, (frame_id, detections))
+            except Exception:
+                traceback.print_exc()
+                _put_latest(output_queue, (frame_id, []))
+    finally:
+        detector.close()
+
+
+def _ui_worker(
+    visualizer_config: Dict[str, Any],
+    input_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Render OpenCV UI and video output in an independent process."""
+
+    visualizer = Visualizer(visualizer_config)
+    try:
+        while not stop_event.is_set():
+            try:
+                packet = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if packet is None:
+                break
+
+            try:
+                should_continue = visualizer.render(**packet)
+            except Exception:
+                traceback.print_exc()
+                should_continue = False
+            if not should_continue:
+                stop_event.set()
+                break
+    finally:
+        visualizer.close()
 
 
 def load_config(config_path: Path) -> Dict[str, Any]:
@@ -145,16 +237,20 @@ class UpperMachineApp:
         self.detector = LaneDetector(config.get("detector", {}))
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
-        self.object_detector = RknnObjectDetector(config.get("rknn_object_detector", {}))
+        self.fork_route_planner = ForkRoutePlanner(config.get("fork_route", {}))
         self.gold_target_planner = GoldTargetPlanner(config.get("gold_target", {}))
-        self.blocking_analyzer = BlockingAnalyzer(config.get("blocking_analyzer", {}))
+        self.blocking_config = config.get("blocking_analyzer", {})
+        self.blocking_class_names = {
+            str(name).casefold()
+            for name in self.blocking_config.get("allowed_class_names", ["Car", "Human"])
+        }
+        self.blocking_analyzer = BlockingAnalyzer(self.blocking_config)
         self.avoidance_planner = AvoidanceTargetPlanner(
             config.get("avoidance_target_planner", {}),
             target_selector=self.target_selector,
         )
         self.planner = HighLevelPlanner(config.get("planner", {}))
         self.bridge: BaseVehicleBridge = build_vehicle_bridge(config.get("bridge", {}))
-        self.visualizer = Visualizer(config.get("visualizer", {}))
         self.csv_logger = CsvLogger(config.get("logger", {}))
         self.fps_counter = FPSCounter(config.get("app", {}).get("fps_smoothing_alpha", 0.2))
         self.last_target_result: TargetPointResult | None = None
@@ -162,6 +258,33 @@ class UpperMachineApp:
         self.last_avoidance_result: AvoidanceTargetResult | None = None
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
+        self.last_fork_result: ForkRouteResult | None = None
+        self.frame_id = 0
+
+        self.mp_context = mp.get_context("spawn")
+        self.stop_event = self.mp_context.Event()
+        self.ai_input_queue = self.mp_context.Queue(maxsize=1)
+        self.ai_output_queue = self.mp_context.Queue(maxsize=1)
+        self.ui_queue = self.mp_context.Queue(maxsize=1)
+        self.ai_process = self.mp_context.Process(
+            target=_ai_inference_worker,
+            args=(
+                config.get("rknn_object_detector", {}),
+                self.ai_input_queue,
+                self.ai_output_queue,
+                self.stop_event,
+            ),
+            name="xsmart-ai-inference",
+        )
+        self.ui_process = self.mp_context.Process(
+            target=_ui_worker,
+            args=(
+                config.get("visualizer", {}),
+                self.ui_queue,
+                self.stop_event,
+            ),
+            name="xsmart-ui",
+        )
 
     def run(self) -> None:
         """执行上位机主循环。
@@ -176,8 +299,10 @@ class UpperMachineApp:
         self.camera.open()
         self.bridge.connect()
         self.csv_logger.open()
+        self.ai_process.start()
+        self.ui_process.start()
 
-        while True:
+        while not self.stop_event.is_set():
             success, frame = self.camera.read()
             if not success or frame is None:
                 if self.camera.mode == "video" and not self.camera.loop_video:
@@ -186,12 +311,31 @@ class UpperMachineApp:
                 print("图像读取失败，等待下一次重试。")
                 continue
 
-            # 第 1 步：把原始图像裁成适合巡线的 ROI，并做基础增强。
+            # 第 1 步：先预处理，再用 YOLO 读取 Gold、障碍物和岔路标志。
             preprocess_result = self.preprocessor.process(frame)
-            # 第 2 步：在 ROI 中找蓝色航道，输出中心线和误差等信息。
-            detection_result = self.detector.detect(preprocess_result.roi_frame)
-            # 第 3 步：把当前帧结果和历史结果融合，减少抖动。
-            tracked_state = self.tracker.update(detection_result)
+            self.frame_id += 1
+            _put_latest(self.ai_input_queue, (self.frame_id, preprocess_result.resized_frame))
+            latest_ai_result = _drain_latest(self.ai_output_queue)
+            if latest_ai_result is not None:
+                _frame_id, detected_objects = latest_ai_result
+                self.last_detected_objects = detected_objects
+            self.last_fork_result = self.fork_route_planner.update(self.last_detected_objects)
+
+            # 第 2 步：在 ROI 中找蓝色航道，并根据已锁定的岔路方向选左/右分支。
+            detection_result = self.detector.detect(
+                preprocess_result.roi_frame,
+                route_direction=self.last_fork_result.requested_direction,
+            )
+            self.last_fork_result = self.fork_route_planner.update(
+                self.last_detected_objects,
+                fork_detected=detection_result.fork_result.fork_detected,
+            )
+
+            # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
+            tracked_state = self.tracker.update(
+                detection_result,
+                prefer_current=detection_result.fork_result.selected_direction is not None,
+            )
             planning_state = self._build_planning_state(
                 preprocess_result=preprocess_result,
                 detection_result=detection_result,
@@ -226,20 +370,22 @@ class UpperMachineApp:
             )
 
             # 第 8 步：显示调试画面，看掩膜、中心线、误差和控制量是否正常。
-            should_continue = self.visualizer.render(
-                preprocess_result=preprocess_result,
-                detection_result=detection_result,
-                tracked_state=planning_state,
-                control_command=control_command,
-                fps_value=fps_value,
-                target_result=self.last_target_result,
-                blocking_result=self.last_blocking_result,
-                avoidance_result=self.last_avoidance_result,
-                detected_objects=self.last_detected_objects,
-                gold_result=self.last_gold_result,
+            _put_latest(
+                self.ui_queue,
+                {
+                    "preprocess_result": preprocess_result,
+                    "detection_result": detection_result,
+                    "tracked_state": planning_state,
+                    "control_command": control_command,
+                    "fps_value": fps_value,
+                    "target_result": self.last_target_result,
+                    "blocking_result": self.last_blocking_result,
+                    "avoidance_result": self.last_avoidance_result,
+                    "detected_objects": self.last_detected_objects,
+                    "gold_result": self.last_gold_result,
+                    "fork_route_result": self.last_fork_result,
+                },
             )
-            if not should_continue:
-                break
 
     def close(self) -> None:
         """释放主程序中创建的所有资源。
@@ -253,8 +399,16 @@ class UpperMachineApp:
 
         self.camera.release()
         self.bridge.close()
-        self.object_detector.close()
-        self.visualizer.close()
+        self.stop_event.set()
+        _put_latest(self.ai_input_queue, None)
+        _put_latest(self.ui_queue, None)
+        for process in (self.ai_process, self.ui_process):
+            if process.pid is None:
+                continue
+            process.join(timeout=2.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
         self.csv_logger.close()
 
     def _build_payload(
@@ -336,7 +490,7 @@ class UpperMachineApp:
         _ = tracked_state
         objects_from_detector = [
             obj for obj in self.last_detected_objects
-            if obj.class_name.casefold() not in self.gold_target_planner.class_names
+            if obj.class_name.casefold() in self.blocking_class_names
         ]
         roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
         return attach_roi_bboxes(
@@ -363,13 +517,24 @@ class UpperMachineApp:
             lane_confidence=tracked_state.confidence,
             curvature=tracked_state.curvature,
         )
-        self.last_detected_objects = self.object_detector.detect(preprocess_result.resized_frame)
-        gold_result = self.gold_target_planner.plan(
-            objects=self.last_detected_objects,
-            roi_rect=preprocess_result.roi_rect,
-            roi_width=roi_width,
-            roi_height=roi_height,
-        )
+        if self.last_fork_result is not None and self.last_fork_result.active:
+            gold_result = GoldTargetResult(
+                active=False,
+                target_object=None,
+                target_point_roi=(float(roi_width) * 0.5, float(max(0, roi_height - 1))),
+                final_lateral_error_px=0.0,
+                final_heading_error_deg=0.0,
+                confidence=0.0,
+                speed_limit=None,
+                reason=f"fork route active: {self.last_fork_result.requested_direction}",
+            )
+        else:
+            gold_result = self.gold_target_planner.plan(
+                objects=self.last_detected_objects,
+                roi_rect=preprocess_result.roi_rect,
+                roi_width=roi_width,
+                roi_height=roi_height,
+            )
         self.last_gold_result = gold_result
         objects = self._detect_objects_for_roi(
             preprocess_result=preprocess_result,

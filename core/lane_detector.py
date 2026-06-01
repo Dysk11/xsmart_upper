@@ -20,6 +20,18 @@ from utils.math_utils import (
 
 
 @dataclass
+class ForkLaneResult:
+    """Debug information for fork branch selection."""
+
+    fork_detected: bool
+    requested_direction: str | None
+    selected_direction: str | None
+    left_points: List[Tuple[int, int]]
+    right_points: List[Tuple[int, int]]
+    reason: str
+
+
+@dataclass
 class LaneDetectionResult:
     """保存单帧巡线检测结果。"""
 
@@ -35,6 +47,7 @@ class LaneDetectionResult:
     lane_width_px: float
     valid_row_count: int
     fit_point_count: int
+    fork_result: ForkLaneResult
 
 
 @dataclass(frozen=True)
@@ -61,6 +74,14 @@ class LaneComponent:
     bottom_y: int
     touches_side: bool
     anchor_samples: Tuple[LaneAnchorSample, ...]
+
+
+@dataclass
+class RouteComponentSelection:
+    """Selected component chain and fork debug result."""
+
+    selected_components: List[LaneComponent]
+    fork_result: ForkLaneResult
 
 
 class LaneDetector:
@@ -145,7 +166,6 @@ class LaneDetector:
         self.environment_side_penalty = float(
             self.component_config.get("environment_side_penalty", 28.0)
         )
-
         self.lost_threshold = float(self.confidence_config.get("lost_threshold", 0.28))
         self.expected_area_ratio = float(self.confidence_config.get("expected_area_ratio", 0.08))
         self.residual_tolerance_px = float(self.confidence_config.get("residual_tolerance_px", 18.0))
@@ -154,7 +174,7 @@ class LaneDetector:
         self.last_lane_width_px = self.default_lane_width_px
         self.last_centerline_points: List[Tuple[int, int]] = []
 
-    def detect(self, roi_frame: np.ndarray) -> LaneDetectionResult:
+    def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
 
         输入:
@@ -171,7 +191,12 @@ class LaneDetector:
         mask = self._segment_lane(roi_frame)
         # 先提取所有可用蓝色连通域，再从中选出“沿地面连续前进”的主链条。
         labels, candidate_components = self._extract_candidate_components(mask)
-        selected_components = self._select_main_lane_components(candidate_components, mask.shape)
+        branch_result = self._select_components_for_route(
+            components=candidate_components,
+            shape=mask.shape,
+            route_direction=route_direction,
+        )
+        selected_components = branch_result.selected_components
         selected_mask = self._build_mask_from_components(labels, selected_components)
         # 当主链条太短时，不要让调试窗口里整片蓝箭头忽隐忽现，先显示全部候选区域。
         filtered_mask = selected_mask if len(selected_components) >= 2 else mask
@@ -226,6 +251,7 @@ class LaneDetector:
             lane_width_px=lane_width_px,
             valid_row_count=len(selected_components),
             fit_point_count=len(centerline_points),
+            fork_result=branch_result.fork_result,
         )
 
     def _segment_lane(self, roi_frame: np.ndarray) -> np.ndarray:
@@ -640,6 +666,212 @@ class LaneDetector:
                 break
 
         return chain
+
+    def _select_components_for_route(
+        self,
+        components: Sequence[LaneComponent],
+        shape: Tuple[int, int],
+        route_direction: str | None,
+    ) -> RouteComponentSelection:
+        base_chain = self._select_main_lane_components(components, shape)
+        left_chain: List[LaneComponent] = list(base_chain)
+        right_chain: List[LaneComponent] = []
+        if base_chain:
+            left_chain, right_chain = self._build_fork_branch_chains(
+                components=components,
+                base_chain=base_chain,
+                shape=shape,
+            )
+
+        left_points = (
+            self._build_support_points_from_components(left_chain, shape)
+            if right_chain
+            else []
+        )
+        right_points = self._build_support_points_from_components(right_chain, shape)
+        fork_detected = bool(right_chain)
+        requested = self._normalize_route_direction(route_direction)
+        selected_direction: str | None = None
+        selected_chain = base_chain
+        reason = "no fork candidate"
+
+        if fork_detected:
+            reason = "right fork candidate ready"
+            if requested == "left" and left_chain:
+                selected_chain = left_chain
+                selected_direction = "left"
+                reason = "selected current branch"
+            elif requested == "right" and right_chain:
+                selected_chain = right_chain
+                selected_direction = "right"
+                reason = "selected right branch"
+            elif requested is not None:
+                reason = f"requested {requested} but branch missing"
+        elif requested == "right":
+            reason = "waiting right branch"
+        elif requested == "left" and left_chain:
+            selected_direction = "left"
+            reason = "selected current branch"
+
+        return RouteComponentSelection(
+            selected_components=selected_chain,
+            fork_result=ForkLaneResult(
+                fork_detected=fork_detected,
+                requested_direction=requested,
+                selected_direction=selected_direction,
+                left_points=left_points,
+                right_points=right_points,
+                reason=reason,
+            ),
+        )
+
+    def _build_fork_branch_chains(
+        self,
+        components: Sequence[LaneComponent],
+        base_chain: Sequence[LaneComponent],
+        shape: Tuple[int, int],
+    ) -> tuple[List[LaneComponent], List[LaneComponent]]:
+        if not base_chain:
+            return [], []
+
+        _, width = shape[:2]
+        image_center = width * 0.5
+        base_labels = {component.label for component in base_chain}
+        base_points = self._component_chain_points(base_chain, image_center)
+        trunk = self._fork_trunk_components(base_chain)
+        trunk_points = self._component_chain_points(trunk, image_center)
+        current_x, current_y = trunk_points[-1]
+        base_tip = base_chain[-1]
+        base_tip_anchor = self._choose_component_anchor(base_tip, current_x)
+        base_tip_side: str | None = None
+        if base_tip.label not in {component.label for component in trunk}:
+            base_delta = base_tip_anchor.x - current_x
+            if abs(base_delta) >= max(18.0, self.last_lane_width_px * 0.35):
+                base_tip_side = "left" if base_delta < 0 else "right"
+
+        candidates: list[tuple[str, int, LaneComponent, LaneAnchorSample, float]] = []
+        for component in components:
+            if component.label in base_labels:
+                continue
+            best_component_candidate = self._best_component_branch_candidate(
+                component=component,
+                base_chain=base_chain,
+                base_points=base_points,
+                image_center=image_center,
+                shape=shape,
+                base_tip_anchor=base_tip_anchor,
+            )
+            if best_component_candidate is not None:
+                candidates.append(best_component_candidate)
+
+        right = self._best_branch_candidate(candidates, "right")
+        right_chain: List[LaneComponent] = []
+        if base_tip_side == "right":
+            right_chain = list(base_chain)
+        elif right is not None:
+            split_index, right_component = right
+            right_chain = list(base_chain[: split_index + 1]) + [right_component]
+
+        left_chain = list(base_chain)
+        return left_chain, right_chain
+
+    def _best_component_branch_candidate(
+        self,
+        component: LaneComponent,
+        base_chain: Sequence[LaneComponent],
+        base_points: Sequence[Tuple[float, float]],
+        image_center: float,
+        shape: Tuple[int, int],
+        base_tip_anchor: LaneAnchorSample,
+    ) -> tuple[str, int, LaneComponent, LaneAnchorSample, float] | None:
+        best: tuple[str, int, LaneComponent, LaneAnchorSample, float] | None = None
+        target_y = component.anchor_samples[len(component.anchor_samples) // 2].y
+
+        for split_index, (current_x, current_y) in enumerate(base_points):
+            trunk_points = base_points[: split_index + 1]
+            predicted_x = self._predict_chain_x(trunk_points, float(target_y), image_center)
+            anchor = self._choose_component_anchor(component, predicted_x)
+            delta_y = current_y - anchor.y
+            if delta_y < -self.short_gap_y_threshold or delta_y > self.max_component_gap_px:
+                continue
+
+            delta_from_current = anchor.x - current_x
+            min_branch_dx = max(14.0, self.last_lane_width_px * 0.25)
+            if abs(delta_from_current) < min_branch_dx:
+                continue
+
+            side = "left" if delta_from_current < 0 else "right"
+            delta_from_prediction = abs(anchor.x - predicted_x)
+            max_allowed_dx = self.max_component_dx_px + max(0.0, delta_y - 80.0) * 0.45
+            if side == "right":
+                max_allowed_dx *= 1.45
+            if delta_from_prediction > max_allowed_dx:
+                continue
+            if (
+                side != "right"
+                and delta_y < self.short_gap_y_threshold
+                and delta_from_prediction > self.short_gap_max_dx_px
+            ):
+                continue
+            if (
+                anchor.y <= int(shape[0] * self.width_growth_guard_top_ratio)
+                and anchor.width > base_tip_anchor.width * self.max_far_width_growth_ratio
+            ):
+                continue
+
+            score = 220.0
+            score -= delta_from_prediction * (0.42 if side == "right" else 0.65)
+            score -= abs(delta_y - 72.0) * 0.10
+            score += min(component.area, 4000) * 0.01
+            score -= anchor.width * 0.02
+            score += split_index * 4.0
+            if side == "right":
+                score += max(0.0, delta_from_current) * 0.06
+
+            candidate = (side, split_index, component, anchor, score)
+            if best is None or score > best[4]:
+                best = candidate
+
+        return best
+
+    def _fork_trunk_components(self, base_chain: Sequence[LaneComponent]) -> List[LaneComponent]:
+        if len(base_chain) <= 1:
+            return list(base_chain)
+        return list(base_chain[:-1])
+
+    def _component_chain_points(
+        self,
+        components: Sequence[LaneComponent],
+        image_center: float,
+    ) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for component in components:
+            target_y = component.anchor_samples[len(component.anchor_samples) // 2].y
+            predicted_x = self._predict_chain_x(points, float(target_y), image_center)
+            anchor = self._choose_component_anchor(component, predicted_x)
+            points.append((anchor.x, float(anchor.y)))
+        return points or [(image_center, 0.0)]
+
+    def _best_branch_candidate(
+        self,
+        candidates: Sequence[tuple[str, int, LaneComponent, LaneAnchorSample, float]],
+        side: str,
+    ) -> tuple[int, LaneComponent] | None:
+        best: tuple[float, int, LaneComponent] | None = None
+        for candidate_side, split_index, component, _anchor, score in candidates:
+            if candidate_side != side:
+                continue
+            if best is None or score > best[0]:
+                best = (score, split_index, component)
+        return (best[1], best[2]) if best is not None else None
+
+    def _normalize_route_direction(self, route_direction: str | None) -> str | None:
+        if route_direction is None:
+            return None
+        direction = str(route_direction).casefold()
+        if direction in ("left", "right"):
+            return direction
+        return None
 
     def _predict_chain_x(
         self,
@@ -1221,4 +1453,12 @@ class LaneDetector:
             lane_width_px=self.last_lane_width_px,
             valid_row_count=0,
             fit_point_count=0,
+            fork_result=ForkLaneResult(
+                fork_detected=False,
+                requested_direction=None,
+                selected_direction=None,
+                left_points=[],
+                right_points=[],
+                reason="empty input",
+            ),
         )

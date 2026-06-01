@@ -11,13 +11,14 @@ import numpy as np
 
 from core.avoidance_target_planner import AvoidanceTargetResult
 from core.blocking_analyzer import BlockingAnalysisResult, DetectedObject
+from core.fork_route_planner import ForkRouteResult
 from core.gold_target_planner import GoldTargetResult
 from core.lane_detector import LaneDetectionResult
 from core.lane_tracker import TrackedLaneState
 from core.planner import ControlCommand
 from core.preprocess import PreprocessResult
 from core.target_selector import TargetPointResult
-from utils.image_utils import draw_centerline, draw_text_lines, ensure_bgr, stack_images
+from utils.image_utils import draw_centerline, draw_text_lines
 
 
 class Visualizer:
@@ -60,6 +61,7 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        fork_route_result: ForkRouteResult | None = None,
     ) -> bool:
         """生成一帧调试画面，并根据配置显示或保存。
 
@@ -85,6 +87,7 @@ class Visualizer:
             avoidance_result=avoidance_result,
             detected_objects=detected_objects,
             gold_result=gold_result,
+            fork_route_result=fork_route_result,
         )
 
         if self.save_video:
@@ -128,6 +131,7 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        fork_route_result: ForkRouteResult | None = None,
     ) -> np.ndarray:
         """将原图、ROI、掩膜和状态文字合成为一张调试大图。
 
@@ -155,6 +159,25 @@ class Visualizer:
             1,
         )
         original_panel = draw_centerline(original_panel, centerline_points, color=(0, 255, 0), offset=(x1, y1))
+        fork_lane = detection_result.fork_result
+        if fork_lane.left_points:
+            original_panel = draw_centerline(
+                original_panel,
+                fork_lane.left_points,
+                color=(255, 0, 255),
+                radius=2,
+                thickness=1,
+                offset=(x1, y1),
+            )
+        if fork_lane.right_points:
+            original_panel = draw_centerline(
+                original_panel,
+                fork_lane.right_points,
+                color=(255, 128, 0),
+                radius=2,
+                thickness=1,
+                offset=(x1, y1),
+            )
         if avoidance_result is not None:
             original_panel = draw_centerline(
                 original_panel,
@@ -203,6 +226,8 @@ class Visualizer:
                 control_command=control_command,
                 fps_value=fps_value,
                 gold_result=gold_result,
+                fork_route_result=fork_route_result,
+                detection_result=detection_result,
             ) or [
                 "窗口1：原始画面",
                 "黄色框 = ROI范围  红线 = 车身中心参考线  绿线 = 航道中心线",
@@ -288,17 +313,31 @@ class Visualizer:
         control_command: ControlCommand,
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
+        fork_route_result: ForkRouteResult | None = None,
+        detection_result: LaneDetectionResult | None = None,
     ) -> list[str]:
         if avoidance_result is None:
             return []
         blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no Gold"
+        fork_reason = "fork: none"
+        if detection_result is not None:
+            fork_lane = detection_result.fork_result
+            requested = fork_lane.requested_direction or "none"
+            selected = fork_lane.selected_direction or "none"
+            hold = fork_route_result.hold_frames_left if fork_route_result is not None else 0
+            active = fork_route_result.active if fork_route_result is not None else False
+            fork_reason = (
+                f"fork: req={requested} sel={selected} active={active} "
+                f"hold={hold} {fork_lane.reason}"
+            )
         return [
             "窗口1：原始画面",
             "绿线=原中心线 青线=避障/Gold中心线 N=普通目标 A=最终目标 G=Gold",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
             f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
             f"steer_deg: {control_command.steer_deg:.2f}",
+            f"{fork_reason}",
             f"{gold_reason}",
             f"{blocking_reason}",
         ]

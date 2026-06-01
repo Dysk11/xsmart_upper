@@ -60,7 +60,7 @@ class LaneTracker:
         self.has_measurement = False
         self.last_valid_centerline: List[Tuple[int, int]] = []
 
-    def update(self, detection_result: LaneDetectionResult) -> TrackedLaneState:
+    def update(self, detection_result: LaneDetectionResult, prefer_current: bool = False) -> TrackedLaneState:
         """输入当前帧检测结果并输出时序平滑状态。
 
         输入:
@@ -72,8 +72,12 @@ class LaneTracker:
 
         if not detection_result.is_lane_lost and detection_result.confidence >= self.confidence_gate:
             # 当前帧足够可靠，正常用 EMA 做平滑。
-            alpha = self.recovery_alpha if self.state.lane_lost_count > 0 else self.ema_alpha
-            self.state = self._update_with_measurement(detection_result, alpha)
+            alpha = 1.0 if prefer_current else self.recovery_alpha if self.state.lane_lost_count > 0 else self.ema_alpha
+            self.state = self._update_with_measurement(
+                detection_result,
+                alpha,
+                prefer_current=prefer_current,
+            )
             self.state.lane_lost_count = 0
             self.state.is_lane_lost = False
             self.state.used_prediction = False
@@ -83,8 +87,12 @@ class LaneTracker:
 
         if not detection_result.is_lane_lost and detection_result.confidence > 0.0:
             # 当前帧能用但不太稳，降低它的权重，避免坏帧把状态拉飞。
-            alpha = max(0.1, self.ema_alpha * detection_result.confidence / max(self.confidence_gate, 1e-6))
-            self.state = self._update_with_measurement(detection_result, alpha)
+            alpha = 1.0 if prefer_current else max(0.1, self.ema_alpha * detection_result.confidence / max(self.confidence_gate, 1e-6))
+            self.state = self._update_with_measurement(
+                detection_result,
+                alpha,
+                prefer_current=prefer_current,
+            )
             self.state.lane_lost_count = 0
             self.state.is_lane_lost = False
             self.state.used_prediction = False
@@ -141,6 +149,7 @@ class LaneTracker:
         self,
         detection_result: LaneDetectionResult,
         alpha: float,
+        prefer_current: bool = False,
     ) -> TrackedLaneState:
         """使用当前帧检测量更新平滑状态。
 
@@ -164,10 +173,13 @@ class LaneTracker:
                 used_prediction=False,
             )
 
-        smoothed_centerline = self._smooth_centerline_points(
-            previous_points=self.state.centerline_points,
-            current_points=detection_result.centerline_points,
-        )
+        if prefer_current:
+            smoothed_centerline = list(detection_result.centerline_points)
+        else:
+            smoothed_centerline = self._smooth_centerline_points(
+                previous_points=self.state.centerline_points,
+                current_points=detection_result.centerline_points,
+            )
 
         return TrackedLaneState(
             centerline_points=smoothed_centerline,

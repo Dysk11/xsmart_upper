@@ -42,6 +42,10 @@ class BlockingAnalyzer:
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.enabled = bool(config.get("enabled", True))
+        self.allowed_class_names = {
+            str(name).casefold()
+            for name in config.get("allowed_class_names", ["Car", "Human"])
+        }
         self.corridor_half_width_px = float(config.get("corridor_half_width_px", 90.0))
         self.confidence_threshold = float(config.get("confidence_threshold", 0.45))
         self.min_box_area = float(config.get("min_box_area", 600.0))
@@ -66,6 +70,11 @@ class BlockingAnalyzer:
 
         best: tuple[float, float, BlockingAnalysisResult] | None = None
         for detected_object in objects:
+            if (
+                self.allowed_class_names
+                and detected_object.class_name.casefold() not in self.allowed_class_names
+            ):
+                continue
             if detected_object.bbox_roi is None:
                 continue
             result = self._analyze_object(

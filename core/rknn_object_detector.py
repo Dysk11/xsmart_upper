@@ -36,7 +36,10 @@ class RknnObjectDetector:
         self.score_threshold = float(config.get("score_threshold", 0.35))
         self.nms_threshold = float(config.get("nms_threshold", 0.45))
         self.max_detections = int(config.get("max_detections", 50))
-        self.class_names = [str(name) for name in config.get("class_names", ["Gold"])]
+        self.class_names = [
+            str(name)
+            for name in config.get("class_names", ["Gold", "Car", "Human", "Left", "Right"])
+        ]
         self.class_agnostic_nms = bool(config.get("class_agnostic_nms", False))
         self.core_mask_name = str(config.get("core_mask", "NPU_CORE_0_1_2"))
 

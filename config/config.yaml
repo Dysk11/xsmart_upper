@@ -30,7 +30,7 @@ preprocess:
     height: 600
   roi:
     # ROI 用比例表示，减少分辨率变化带来的重复调参。
-    top_ratio: 0.65
+    top_ratio: 0.585
     bottom_ratio: 1.0
     left_ratio: 0.05
     right_ratio: 0.95
@@ -139,8 +139,17 @@ rknn_object_detector:
   nms_threshold: 0.45
   max_detections: 30
   # 模型有 3 个类别输出；如果训练时类别顺序不同，只需要调整这里的顺序。
-  class_names: [Gold, Car, Human]
+  class_names: [Gold, Car, Human, Left, Right]
   core_mask: NPU_CORE_0_1_2
+
+fork_route:
+  enabled: true
+  left_class_name: Left
+  right_class_name: Right
+  min_confidence: 0.45
+  sign_hold_frames: 90
+  clear_after_no_fork_frames: 8
+  invert_direction: false
 
 gold_target:
   enabled: true
@@ -155,6 +164,7 @@ gold_target:
 
 blocking_analyzer:
   enabled: true
+  allowed_class_names: [Car, Human]
   corridor_half_width_px: 90
   confidence_threshold: 0.45
   min_box_area: 600
