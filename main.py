@@ -254,6 +254,15 @@ class UpperMachineApp:
         self.bridge: BaseVehicleBridge = build_vehicle_bridge(config.get("bridge", {}))
         self.csv_logger = CsvLogger(config.get("logger", {}))
         self.fps_counter = FPSCounter(config.get("app", {}).get("fps_smoothing_alpha", 0.2))
+        timing_config = config.get("app", {}).get("lane_timing", {})
+        self.lane_timing_enabled = bool(timing_config.get("enable", True))
+        self.lane_timing_interval = max(1, int(timing_config.get("print_interval_frames", 30)))
+        self.lane_timing_count = 0
+        self.lane_timing_total_ms = 0.0
+        self.lane_timing_preprocess_ms = 0.0
+        self.lane_timing_detect_ms = 0.0
+        self.lane_timing_track_ms = 0.0
+        self.lane_timing_max_ms = 0.0
         self.last_target_result: TargetPointResult | None = None
         self.last_blocking_result: BlockingAnalysisResult | None = None
         self.last_avoidance_result: AvoidanceTargetResult | None = None
@@ -315,6 +324,7 @@ class UpperMachineApp:
             # 第 1 步：先预处理，再用 YOLO 读取 Gold、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
             preprocess_result = self.preprocessor.process(frame)
+            lane_preprocess_time = time.perf_counter()
             self.frame_id += 1
             _put_latest(self.ai_input_queue, (self.frame_id, preprocess_result.resized_frame))
             latest_ai_result = _drain_latest(self.ai_output_queue)
@@ -328,6 +338,7 @@ class UpperMachineApp:
                 preprocess_result.roi_frame,
                 route_direction=self.last_fork_result.requested_direction,
             )
+            lane_detect_time = time.perf_counter()
             self.last_fork_result = self.fork_route_planner.update(
                 self.last_detected_objects,
                 fork_detected=detection_result.fork_result.fork_detected,
@@ -338,8 +349,13 @@ class UpperMachineApp:
                 detection_result,
                 prefer_current=detection_result.fork_result.selected_direction is not None,
             )
-            lane_elapsed_ms = (time.perf_counter() - lane_start_time) * 1000.0
-            print(f"巡线耗时: {lane_elapsed_ms:.2f} ms")
+            lane_track_time = time.perf_counter()
+            self._record_lane_timing(
+                total_ms=(lane_track_time - lane_start_time) * 1000.0,
+                preprocess_ms=(lane_preprocess_time - lane_start_time) * 1000.0,
+                detect_ms=(lane_detect_time - lane_preprocess_time) * 1000.0,
+                track_ms=(lane_track_time - lane_detect_time) * 1000.0,
+            )
             planning_state = self._build_planning_state(
                 preprocess_result=preprocess_result,
                 detection_result=detection_result,
@@ -390,6 +406,45 @@ class UpperMachineApp:
                     "fork_route_result": self.last_fork_result,
                 },
             )
+
+    def _record_lane_timing(
+        self,
+        total_ms: float,
+        preprocess_ms: float,
+        detect_ms: float,
+        track_ms: float,
+    ) -> None:
+        """Collect lane timing stats and print a low-frequency summary."""
+
+        if not self.lane_timing_enabled:
+            return
+
+        self.lane_timing_count += 1
+        self.lane_timing_total_ms += total_ms
+        self.lane_timing_preprocess_ms += preprocess_ms
+        self.lane_timing_detect_ms += detect_ms
+        self.lane_timing_track_ms += track_ms
+        self.lane_timing_max_ms = max(self.lane_timing_max_ms, total_ms)
+
+        if self.lane_timing_count < self.lane_timing_interval:
+            return
+
+        count = float(self.lane_timing_count)
+        print(
+            "巡线耗时: "
+            f"avg={self.lane_timing_total_ms / count:.2f} ms, "
+            f"max={self.lane_timing_max_ms:.2f} ms, "
+            f"pre={self.lane_timing_preprocess_ms / count:.2f} ms, "
+            f"detect={self.lane_timing_detect_ms / count:.2f} ms, "
+            f"track={self.lane_timing_track_ms / count:.2f} ms"
+        )
+
+        self.lane_timing_count = 0
+        self.lane_timing_total_ms = 0.0
+        self.lane_timing_preprocess_ms = 0.0
+        self.lane_timing_detect_ms = 0.0
+        self.lane_timing_track_ms = 0.0
+        self.lane_timing_max_ms = 0.0
 
     def close(self) -> None:
         """释放主程序中创建的所有资源。
