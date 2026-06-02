@@ -7,6 +7,7 @@ import copy
 import multiprocessing as mp
 import queue
 import sys
+import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
@@ -312,6 +313,7 @@ class UpperMachineApp:
                 continue
 
             # 第 1 步：先预处理，再用 YOLO 读取 Gold、障碍物和岔路标志。
+            lane_start_time = time.perf_counter()
             preprocess_result = self.preprocessor.process(frame)
             self.frame_id += 1
             _put_latest(self.ai_input_queue, (self.frame_id, preprocess_result.resized_frame))
@@ -336,6 +338,8 @@ class UpperMachineApp:
                 detection_result,
                 prefer_current=detection_result.fork_result.selected_direction is not None,
             )
+            lane_elapsed_ms = (time.perf_counter() - lane_start_time) * 1000.0
+            print(f"巡线耗时: {lane_elapsed_ms:.2f} ms")
             planning_state = self._build_planning_state(
                 preprocess_result=preprocess_result,
                 detection_result=detection_result,
