@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -36,6 +37,11 @@ class CameraReader:
         self.reconnect_interval_sec = float(config.get("reconnect_interval_sec", 0.5))
         self.max_reconnect_attempts = int(config.get("max_reconnect_attempts", 5))
         self.capture: Optional[cv2.VideoCapture] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[np.ndarray] = None
+        self._reader_failed = False
 
     def open(self) -> None:
         """打开摄像头或视频文件，并设置基础属性。
@@ -54,6 +60,8 @@ class CameraReader:
             raise RuntimeError(f"无法打开图像源: {source}")
 
         self._apply_capture_properties()
+        if self._uses_latest_frame_worker():
+            self._start_latest_frame_worker()
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         """读取一帧图像，并在失败时自动尝试重连。
@@ -66,6 +74,9 @@ class CameraReader:
             当 success 为 True 时，frame 为一帧 BGR 图像；
             当 success 为 False 时，frame 为 None。
         """
+
+        if self._uses_latest_frame_worker():
+            return self._read_latest_frame()
 
         if self.capture is None or not self.capture.isOpened():
             if not self._attempt_reconnect():
@@ -109,9 +120,13 @@ class CameraReader:
             无返回值，若设备已打开则安全关闭。
         """
 
+        self._stop_latest_frame_worker()
         if self.capture is not None:
             self.capture.release()
             self.capture = None
+        with self._frame_lock:
+            self._latest_frame = None
+            self._reader_failed = False
 
     def _build_source(self) -> Any:
         """根据模式构建 OpenCV VideoCapture 的输入源。
@@ -152,6 +167,82 @@ class CameraReader:
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.capture.set(cv2.CAP_PROP_FPS, self.fps)
+
+    def _uses_latest_frame_worker(self) -> bool:
+        """Return True for realtime sources that should drop stale frames."""
+
+        return self.mode in ("camera", "stream", "http")
+
+    def _start_latest_frame_worker(self) -> None:
+        """Continuously read realtime sources so callers receive the newest frame."""
+
+        self._stop_latest_frame_worker()
+        with self._frame_lock:
+            self._latest_frame = None
+            self._reader_failed = False
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._latest_frame_worker,
+            name="xsmart-camera-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def _stop_latest_frame_worker(self) -> None:
+        """Stop the realtime capture worker if it is running."""
+
+        if self._reader_thread is None:
+            return
+        self._reader_stop.set()
+        self._reader_thread.join(timeout=1.0)
+        self._reader_thread = None
+
+    def _latest_frame_worker(self) -> None:
+        """Keep draining OpenCV capture and cache only the newest frame."""
+
+        while not self._reader_stop.is_set():
+            capture = self.capture
+            if capture is None or not capture.isOpened():
+                with self._frame_lock:
+                    self._reader_failed = True
+                break
+
+            success, frame = capture.read()
+            if not success or frame is None:
+                with self._frame_lock:
+                    self._reader_failed = True
+                break
+            if self._reader_stop.is_set() or capture is not self.capture:
+                break
+
+            if self.mirror:
+                frame = cv2.flip(frame, 1)
+
+            with self._frame_lock:
+                self._latest_frame = frame
+
+    def _read_latest_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Return the latest cached realtime frame, reconnecting if capture failed."""
+
+        if self.capture is None or not self.capture.isOpened():
+            if not self._attempt_reconnect():
+                return False, None
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            with self._frame_lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+                reader_failed = self._reader_failed
+
+            if reader_failed:
+                if not self._attempt_reconnect():
+                    return False, None
+                continue
+            if frame is not None:
+                return True, frame
+            time.sleep(0.01)
+
+        return False, None
 
     def _attempt_reconnect(self) -> bool:
         """在读取失败后尝试重新连接图像源。

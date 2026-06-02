@@ -8,7 +8,7 @@ camera:
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
-  video_path: outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4
+  video_path: outputs/video/record_20260512_135628.mp4
   # 网络流模式下的 http/rtsp 视频地址流。
   stream_url: "http://192.168.3.223:8080/ar_feed"
   # 视频是否循环播放。
@@ -25,7 +25,7 @@ camera:
 preprocess:
   resize:
     # 是否先统一缩放，方便后续参数固定。
-    enable: false
+    enable: true
     width: 800
     height: 600
   roi:
@@ -130,7 +130,7 @@ target_selector:
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
   enable: true
-  model_path: rknn_lt.rknn
+  model_path: models/rknn_lt.rknn
   input_size: [640, 640]
   input_layout: nhwc
   input_color: rgb
@@ -139,7 +139,7 @@ rknn_object_detector:
   nms_threshold: 0.45
   max_detections: 30
   # 模型有 3 个类别输出；如果训练时类别顺序不同，只需要调整这里的顺序。
-  class_names: [Gold, Car, Human, Left, Right]
+  class_names: [Gold, Car, Human] #, Left, Right]
   core_mask: NPU_CORE_0_1_2
 
 fork_route:
