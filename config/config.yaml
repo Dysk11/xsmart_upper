@@ -4,7 +4,7 @@ app:
 
 camera:
   # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，stream 表示网络流。
-  mode: video
+  mode: camera
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
@@ -25,7 +25,7 @@ camera:
 preprocess:
   resize:
     # 是否先统一缩放，方便后续参数固定。
-    enable: true
+    enable: false
     width: 800
     height: 600
   roi:
@@ -129,7 +129,7 @@ target_selector:
 
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
-  enable: true
+  enable: false
   model_path: models/rknn_lt.rknn
   input_size: [640, 640]
   input_layout: nhwc
@@ -190,7 +190,7 @@ planner:
   lateral_gain: 0.065
   heading_gain: 0.85
   curvature_gain: 140.0
-  max_steer_deg: 28.0
+  max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2
   min_speed: 0.45
@@ -226,9 +226,9 @@ visualizer:
   font_path: "C:/Windows/Fonts/msyh.ttc"
   font_size: 22
   save_video: false
-  save_screenshot: true
+  save_screenshot: false
   save_dir: outputs/visual
-  video_name: debug.mp4
+  video_name: xsmart.mp4
   video_fourcc: mp4v
   video_fps: 25
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import copy
 import multiprocessing as mp
+from multiprocessing import resource_tracker
+from multiprocessing import shared_memory
 import queue
 import sys
 import time
@@ -13,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -36,7 +39,231 @@ from core.visualizer import Visualizer
 from utils.fps import FPSCounter
 
 
-def _put_latest(work_queue: Any, item: Any) -> None:
+SHARED_ARRAY_MARKER = "__xsmart_shared_array__"
+SHARED_PREPROCESS_MARKER = "__xsmart_shared_preprocess__"
+
+
+def _unregister_shared_memory(shm: shared_memory.SharedMemory) -> None:
+    """Prevent a temporary opener from owning shared-memory cleanup."""
+
+    try:
+        resource_tracker.unregister(shm._name, "shared_memory")
+    except Exception:
+        pass
+
+
+class SharedArrayPool:
+    """A small ring of shared-memory ndarray slots owned by the main process."""
+
+    def __init__(self, pool_id: str, ack_queue: Any, slot_count: int = 3) -> None:
+        self.pool_id = pool_id
+        self.ack_queue = ack_queue
+        self.slot_count = max(2, int(slot_count))
+        self.slots: list[shared_memory.SharedMemory] = []
+        self.shape: tuple[int, ...] | None = None
+        self.dtype: np.dtype | None = None
+        self.pending_slots: set[int] = set()
+
+    def write(self, array: np.ndarray) -> Dict[str, Any] | None:
+        """Copy an ndarray into a free slot and return its queue-safe descriptor."""
+
+        contiguous = np.ascontiguousarray(array)
+        dtype = contiguous.dtype
+        shape = tuple(contiguous.shape)
+        self._drain_acks()
+
+        if not self.slots:
+            self._allocate_slots(shape, dtype, contiguous.nbytes)
+        elif shape != self.shape or dtype != self.dtype:
+            if self.pending_slots:
+                return None
+            self.close()
+            self._allocate_slots(shape, dtype, contiguous.nbytes)
+
+        slot_index = self._next_free_slot()
+        if slot_index is None:
+            return None
+
+        shm = self.slots[slot_index]
+        shared_view = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+        shared_view[...] = contiguous
+        self.pending_slots.add(slot_index)
+        return {
+            SHARED_ARRAY_MARKER: True,
+            "pool_id": self.pool_id,
+            "slot": slot_index,
+            "name": shm.name,
+            "shape": shape,
+            "dtype": dtype.str,
+        }
+
+    def release_descriptor(self, descriptor: Dict[str, Any]) -> None:
+        """Mark a queued-but-dropped slot as available again."""
+
+        if descriptor.get("pool_id") != self.pool_id:
+            return
+        self.pending_slots.discard(int(descriptor["slot"]))
+
+    def close(self) -> None:
+        """Release all shared-memory slots owned by this pool."""
+
+        for shm in self.slots:
+            try:
+                shm.close()
+            finally:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+        self.slots = []
+        self.shape = None
+        self.dtype = None
+        self.pending_slots.clear()
+
+    def _allocate_slots(self, shape: tuple[int, ...], dtype: np.dtype, nbytes: int) -> None:
+        self.shape = shape
+        self.dtype = dtype
+        self.slots = [
+            shared_memory.SharedMemory(create=True, size=nbytes)
+            for _ in range(self.slot_count)
+        ]
+
+    def _drain_acks(self) -> None:
+        while True:
+            try:
+                slot_index = self.ack_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.pending_slots.discard(int(slot_index))
+
+    def _next_free_slot(self) -> int | None:
+        for slot_index in range(len(self.slots)):
+            if slot_index not in self.pending_slots:
+                return slot_index
+        return None
+
+
+def _is_shared_array_descriptor(value: Any) -> bool:
+    return isinstance(value, dict) and bool(value.get(SHARED_ARRAY_MARKER))
+
+
+def _ack_shared_descriptor(descriptor: Dict[str, Any], ack_queues: Dict[str, Any]) -> None:
+    try:
+        ack_queues[str(descriptor["pool_id"])].put_nowait(int(descriptor["slot"]))
+    except Exception:
+        pass
+
+
+def _ack_shared_payload(value: Any, ack_queues: Dict[str, Any]) -> None:
+    if _is_shared_array_descriptor(value):
+        _ack_shared_descriptor(value, ack_queues)
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _ack_shared_payload(nested, ack_queues)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _ack_shared_payload(nested, ack_queues)
+
+
+def _take_shared_ndarray(descriptor: Dict[str, Any], ack_queues: Dict[str, Any]) -> np.ndarray:
+    """Copy a pooled shared-memory ndarray locally and acknowledge its slot."""
+
+    try:
+        shm = shared_memory.SharedMemory(name=str(descriptor["name"]))
+    except FileNotFoundError:
+        _ack_shared_descriptor(descriptor, ack_queues)
+        raise
+    _unregister_shared_memory(shm)
+    try:
+        array = np.ndarray(
+            tuple(descriptor["shape"]),
+            dtype=np.dtype(str(descriptor["dtype"])),
+            buffer=shm.buf,
+        ).copy()
+    finally:
+        shm.close()
+        _ack_shared_descriptor(descriptor, ack_queues)
+    return array
+
+
+def _release_shared_payload(value: Any, pools: Dict[str, SharedArrayPool] | None = None) -> None:
+    """Recursively release shared-memory slots held by a dropped queue item."""
+
+    if _is_shared_array_descriptor(value):
+        if pools is not None:
+            pool = pools.get(str(value.get("pool_id")))
+            if pool is not None:
+                pool.release_descriptor(value)
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _release_shared_payload(nested, pools)
+        return
+    if isinstance(value, (list, tuple)):
+        for nested in value:
+            _release_shared_payload(nested, pools)
+
+
+def _share_preprocess_result(
+    preprocess_result: PreprocessResult,
+    resized_pool: SharedArrayPool,
+    roi_pool: SharedArrayPool,
+) -> Dict[str, Any] | None:
+    """Move PreprocessResult images into shared memory while preserving metadata."""
+
+    descriptor: Dict[str, Any] = {
+        SHARED_PREPROCESS_MARKER: True,
+        "roi_rect": preprocess_result.roi_rect,
+    }
+    try:
+        descriptor["resized_frame"] = resized_pool.write(preprocess_result.resized_frame)
+        descriptor["roi_frame"] = roi_pool.write(preprocess_result.roi_frame)
+        if descriptor["resized_frame"] is None or descriptor["roi_frame"] is None:
+            _release_shared_payload(
+                descriptor,
+                {
+                    resized_pool.pool_id: resized_pool,
+                    roi_pool.pool_id: roi_pool,
+                },
+            )
+            return None
+        return descriptor
+    except Exception:
+        _release_shared_payload(
+            descriptor,
+            {
+                resized_pool.pool_id: resized_pool,
+                roi_pool.pool_id: roi_pool,
+            },
+        )
+        raise
+
+
+def _take_shared_preprocess_result(
+    descriptor: Dict[str, Any],
+    ack_queues: Dict[str, Any],
+) -> PreprocessResult:
+    """Rebuild a local PreprocessResult from shared-memory image descriptors."""
+
+    remaining = dict(descriptor)
+    try:
+        resized_frame = _take_shared_ndarray(remaining.pop("resized_frame"), ack_queues)
+        roi_frame = _take_shared_ndarray(remaining.pop("roi_frame"), ack_queues)
+        return PreprocessResult(
+            original_frame=resized_frame,
+            resized_frame=resized_frame,
+            roi_raw_frame=roi_frame,
+            roi_frame=roi_frame,
+            roi_rect=tuple(descriptor["roi_rect"]),
+        )
+    except Exception:
+        _ack_shared_payload(remaining, ack_queues)
+        raise
+
+
+def _put_latest(work_queue: Any, item: Any, release_func: Any = _release_shared_payload) -> None:
     """Put an item into a size-limited multiprocessing queue, dropping stale data."""
 
     try:
@@ -46,36 +273,42 @@ def _put_latest(work_queue: Any, item: Any) -> None:
         pass
 
     try:
-        work_queue.get_nowait()
+        dropped_item = work_queue.get_nowait()
     except queue.Empty:
-        pass
+        dropped_item = None
+    release_func(dropped_item)
 
     try:
         work_queue.put_nowait(item)
     except queue.Full:
-        pass
+        release_func(item)
 
 
-def _drain_latest(work_queue: Any) -> Any | None:
+def _drain_latest(work_queue: Any, release_func: Any = _release_shared_payload) -> Any | None:
     """Return the newest available queue item without blocking."""
 
     latest = None
     while True:
         try:
-            latest = work_queue.get_nowait()
+            item = work_queue.get_nowait()
         except queue.Empty:
             return latest
+        if latest is not None:
+            release_func(latest)
+        latest = item
 
 
 def _ai_inference_worker(
     detector_config: Dict[str, Any],
     input_queue: Any,
     output_queue: Any,
+    ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Run RKNN object detection in an independent process."""
 
     detector = RknnObjectDetector(detector_config)
+    ack_queues = {"ai_frame": ack_queue}
     try:
         while not stop_event.is_set():
             try:
@@ -85,8 +318,13 @@ def _ai_inference_worker(
             if item is None:
                 break
 
-            frame_id, frame = item
+            frame_id, frame_payload = item
             try:
+                frame = (
+                    _take_shared_ndarray(frame_payload, ack_queues)
+                    if _is_shared_array_descriptor(frame_payload)
+                    else frame_payload
+                )
                 detections = detector.detect(frame)
                 _put_latest(output_queue, (frame_id, detections))
             except Exception:
@@ -99,11 +337,17 @@ def _ai_inference_worker(
 def _ui_worker(
     visualizer_config: Dict[str, Any],
     input_queue: Any,
+    resized_ack_queue: Any,
+    roi_ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Render OpenCV UI and video output in an independent process."""
 
     visualizer = Visualizer(visualizer_config)
+    ack_queues = {
+        "ui_resized": resized_ack_queue,
+        "ui_roi": roi_ack_queue,
+    }
     try:
         while not stop_event.is_set():
             try:
@@ -114,6 +358,10 @@ def _ui_worker(
                 break
 
             try:
+                packet = dict(packet)
+                preprocess_payload = packet.get("preprocess_result")
+                if isinstance(preprocess_payload, dict) and preprocess_payload.get(SHARED_PREPROCESS_MARKER):
+                    packet["preprocess_result"] = _take_shared_preprocess_result(preprocess_payload, ack_queues)
                 should_continue = visualizer.render(**packet)
             except Exception:
                 traceback.print_exc()
@@ -276,12 +524,24 @@ class UpperMachineApp:
         self.ai_input_queue = self.mp_context.Queue(maxsize=1)
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
+        self.ai_ack_queue = self.mp_context.Queue()
+        self.ui_resized_ack_queue = self.mp_context.Queue()
+        self.ui_roi_ack_queue = self.mp_context.Queue()
+        self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
+        self.ui_resized_pool = SharedArrayPool("ui_resized", self.ui_resized_ack_queue)
+        self.ui_roi_pool = SharedArrayPool("ui_roi", self.ui_roi_ack_queue)
+        self.shared_pools = {
+            self.ai_frame_pool.pool_id: self.ai_frame_pool,
+            self.ui_resized_pool.pool_id: self.ui_resized_pool,
+            self.ui_roi_pool.pool_id: self.ui_roi_pool,
+        }
         self.ai_process = self.mp_context.Process(
             target=_ai_inference_worker,
             args=(
                 config.get("rknn_object_detector", {}),
                 self.ai_input_queue,
                 self.ai_output_queue,
+                self.ai_ack_queue,
                 self.stop_event,
             ),
             name="xsmart-ai-inference",
@@ -291,6 +551,8 @@ class UpperMachineApp:
             args=(
                 config.get("visualizer", {}),
                 self.ui_queue,
+                self.ui_resized_ack_queue,
+                self.ui_roi_ack_queue,
                 self.stop_event,
             ),
             name="xsmart-ui",
@@ -326,7 +588,13 @@ class UpperMachineApp:
             preprocess_result = self.preprocessor.process(frame)
             lane_preprocess_time = time.perf_counter()
             self.frame_id += 1
-            _put_latest(self.ai_input_queue, (self.frame_id, preprocess_result.resized_frame))
+            ai_frame_payload = self.ai_frame_pool.write(preprocess_result.resized_frame)
+            if ai_frame_payload is not None:
+                _put_latest(
+                    self.ai_input_queue,
+                    (self.frame_id, ai_frame_payload),
+                    release_func=self._release_owned_shared_payload,
+                )
             latest_ai_result = _drain_latest(self.ai_output_queue)
             if latest_ai_result is not None:
                 _frame_id, detected_objects = latest_ai_result
@@ -390,22 +658,34 @@ class UpperMachineApp:
             )
 
             # 第 8 步：显示调试画面，看掩膜、中心线、误差和控制量是否正常。
-            _put_latest(
-                self.ui_queue,
-                {
-                    "preprocess_result": preprocess_result,
-                    "detection_result": detection_result,
-                    "tracked_state": planning_state,
-                    "control_command": control_command,
-                    "fps_value": fps_value,
-                    "target_result": self.last_target_result,
-                    "blocking_result": self.last_blocking_result,
-                    "avoidance_result": self.last_avoidance_result,
-                    "detected_objects": self.last_detected_objects,
-                    "gold_result": self.last_gold_result,
-                    "fork_route_result": self.last_fork_result,
-                },
+            ui_preprocess_payload = _share_preprocess_result(
+                preprocess_result,
+                resized_pool=self.ui_resized_pool,
+                roi_pool=self.ui_roi_pool,
             )
+            if ui_preprocess_payload is not None:
+                _put_latest(
+                    self.ui_queue,
+                    {
+                        "preprocess_result": ui_preprocess_payload,
+                        "detection_result": detection_result,
+                        "tracked_state": planning_state,
+                        "control_command": control_command,
+                        "fps_value": fps_value,
+                        "target_result": self.last_target_result,
+                        "blocking_result": self.last_blocking_result,
+                        "avoidance_result": self.last_avoidance_result,
+                        "detected_objects": self.last_detected_objects,
+                        "gold_result": self.last_gold_result,
+                        "fork_route_result": self.last_fork_result,
+                    },
+                    release_func=self._release_owned_shared_payload,
+                )
+
+    def _release_owned_shared_payload(self, value: Any) -> None:
+        """Release queued shared-memory slots owned by this app instance."""
+
+        _release_shared_payload(value, self.shared_pools)
 
     def _record_lane_timing(
         self,
@@ -459,8 +739,8 @@ class UpperMachineApp:
         self.camera.release()
         self.bridge.close()
         self.stop_event.set()
-        _put_latest(self.ai_input_queue, None)
-        _put_latest(self.ui_queue, None)
+        _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
+        _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
         for process in (self.ai_process, self.ui_process):
             if process.pid is None:
                 continue
@@ -468,6 +748,8 @@ class UpperMachineApp:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=1.0)
+        for pool in self.shared_pools.values():
+            pool.close()
         self.csv_logger.close()
 
     def _build_payload(

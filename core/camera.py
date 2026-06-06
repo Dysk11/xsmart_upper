@@ -41,6 +41,8 @@ class CameraReader:
         self._reader_stop = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
+        self._latest_frame_id = 0
+        self._last_returned_frame_id = 0
         self._reader_failed = False
 
     def open(self) -> None:
@@ -126,6 +128,8 @@ class CameraReader:
             self.capture = None
         with self._frame_lock:
             self._latest_frame = None
+            self._latest_frame_id = 0
+            self._last_returned_frame_id = 0
             self._reader_failed = False
 
     def _build_source(self) -> Any:
@@ -179,6 +183,8 @@ class CameraReader:
         self._stop_latest_frame_worker()
         with self._frame_lock:
             self._latest_frame = None
+            self._latest_frame_id = 0
+            self._last_returned_frame_id = 0
             self._reader_failed = False
         self._reader_stop.clear()
         self._reader_thread = threading.Thread(
@@ -220,9 +226,10 @@ class CameraReader:
 
             with self._frame_lock:
                 self._latest_frame = frame
+                self._latest_frame_id += 1
 
     def _read_latest_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Return the latest cached realtime frame, reconnecting if capture failed."""
+        """Return the next new cached realtime frame, reconnecting if capture failed."""
 
         if self.capture is None or not self.capture.isOpened():
             if not self._attempt_reconnect():
@@ -231,7 +238,15 @@ class CameraReader:
         deadline = time.monotonic() + 1.0
         while time.monotonic() < deadline:
             with self._frame_lock:
-                frame = None if self._latest_frame is None else self._latest_frame.copy()
+                has_new_frame = (
+                    self._latest_frame is not None
+                    and self._latest_frame_id > self._last_returned_frame_id
+                )
+                if has_new_frame:
+                    frame = self._latest_frame.copy()
+                    self._last_returned_frame_id = self._latest_frame_id
+                else:
+                    frame = None
                 reader_failed = self._reader_failed
 
             if reader_failed:
@@ -240,7 +255,7 @@ class CameraReader:
                 continue
             if frame is not None:
                 return True, frame
-            time.sleep(0.01)
+            time.sleep(0.001)
 
         return False, None
 
