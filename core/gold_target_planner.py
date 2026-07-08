@@ -1,4 +1,4 @@
-"""Gold target selection and approach planning."""
+"""Coin target selection and approach planning."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ Point = Tuple[float, float]
 
 @dataclass
 class GoldTargetResult:
-    """Control target derived from a Gold detection."""
+    """Control target derived from a coin/Gold detection."""
 
     active: bool
     target_object: DetectedObject | None
@@ -29,13 +29,13 @@ class GoldTargetResult:
 
 
 class GoldTargetPlanner:
-    """Turns Gold detections into a temporary target point before lane following."""
+    """Turns coin detections into a temporary target point before lane following."""
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.enabled = bool(config.get("enabled", True))
         self.class_names = {
             str(name).casefold()
-            for name in config.get("class_names", ["Gold"])
+            for name in config.get("class_names", ["coin", "Gold"])
         }
         self.min_confidence = float(config.get("min_confidence", 0.35))
         self.hold_frames = int(config.get("hold_frames", 4))
@@ -71,12 +71,12 @@ class GoldTargetPlanner:
                     final_heading_error_deg=held.final_heading_error_deg,
                     confidence=max(0.0, held.confidence * (0.75 ** self._miss_frames)),
                     speed_limit=held.speed_limit,
-                    reason=f"hold Gold target, miss_frames={self._miss_frames}",
+                    reason=f"hold coin target, miss_frames={self._miss_frames}",
                     using_hold=True,
                 )
             self._last_active = None
             self._miss_frames = 0
-            return self._empty(roi_width, roi_height, "no Gold")
+            return self._empty(roi_width, roi_height, "no coin")
 
         self._miss_frames = 0
         result = self._build_result(gold, roi_rect, roi_width, roi_height)
@@ -135,7 +135,7 @@ class GoldTargetPlanner:
             confidence=float(gold.confidence),
             speed_limit=speed_limit,
             reason=(
-                f"Gold target at roi=({target_x_roi:.1f},{target_y_roi:.1f}), "
+                f"coin target at roi=({target_x_roi:.1f},{target_y_roi:.1f}), "
                 f"conf={gold.confidence:.2f}"
             ),
         )

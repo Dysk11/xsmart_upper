@@ -4,7 +4,7 @@ app:
 
 camera:
   # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，stream 表示网络流。
-  mode: camera
+  mode: video
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
@@ -130,7 +130,7 @@ target_selector:
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
   enable: false
-  model_path: models/rknn_lt.rknn
+  model_path: models/rknn_9classes.rknn
   input_size: [640, 640]
   input_layout: nhwc
   input_color: rgb
@@ -138,8 +138,8 @@ rknn_object_detector:
   score_threshold: 0.20
   nms_threshold: 0.45
   max_detections: 30
-  # 模型有 3 个类别输出；如果训练时类别顺序不同，只需要调整这里的顺序。
-  class_names: [Gold, Car, Human] #, Left, Right]
+  # 模型有 9 个类别输出；顺序必须与训练时 label_list.txt 保持一致。
+  class_names: [light, speed_sign, dir_sign, human, car, coin, Stop, Go, arch]
   core_mask: NPU_CORE_0_1_2
 
 fork_route:
@@ -153,7 +153,7 @@ fork_route:
 
 gold_target:
   enabled: true
-  class_names: [Gold]
+  class_names: [coin]
   min_confidence: 0.20
   hold_frames: 4
   approach_speed_limit: 0.85
@@ -164,7 +164,7 @@ gold_target:
 
 blocking_analyzer:
   enabled: true
-  allowed_class_names: [Car, Human]
+  allowed_class_names: [car, human]
   corridor_half_width_px: 90
   confidence_threshold: 0.45
   min_box_area: 600

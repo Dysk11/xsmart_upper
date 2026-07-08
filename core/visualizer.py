@@ -259,7 +259,7 @@ class Visualizer:
     ) -> None:
         for obj in objects:
             x1, y1, x2, y2 = obj.bbox_frame
-            is_gold = obj.class_name.casefold() == "gold"
+            is_gold = obj.class_name.casefold() in {"gold", "coin"}
             color = (0, 215, 255) if is_gold else (0, 165, 255)
             cv2.rectangle(image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
             label = f"{obj.class_name} {obj.confidence:.2f}"
@@ -319,7 +319,7 @@ class Visualizer:
         if avoidance_result is None:
             return []
         blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
-        gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no Gold"
+        gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
         fork_reason = "fork: none"
         if detection_result is not None:
             fork_lane = detection_result.fork_result
@@ -333,7 +333,7 @@ class Visualizer:
             )
         return [
             "窗口1：原始画面",
-            "绿线=原中心线 青线=避障/Gold中心线 N=普通目标 A=最终目标 G=Gold",
+            "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
             f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
             f"steer_deg: {control_command.steer_deg:.2f}",

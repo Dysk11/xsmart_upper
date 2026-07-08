@@ -113,7 +113,7 @@ def test_gold_target_overrides_to_gold_center() -> None:
     planner = GoldTargetPlanner({"min_confidence": 0.2})
     result = planner.plan(
         objects=[
-            DetectedObject("Gold", 0.91, bbox_frame=(260, 160, 340, 240)),
+            DetectedObject("coin", 0.91, bbox_frame=(260, 160, 340, 240)),
         ],
         roi_rect=ROI_RECT,
         roi_width=ROI_WIDTH,
@@ -121,7 +121,7 @@ def test_gold_target_overrides_to_gold_center() -> None:
     )
     assert result.active
     assert result.target_object is not None
-    assert result.target_object.class_name == "Gold"
+    assert result.target_object.class_name == "coin"
     assert result.target_point_roi[0] == 200.0
     assert result.final_lateral_error_px == 0.0
 
@@ -129,7 +129,7 @@ def test_gold_target_overrides_to_gold_center() -> None:
 def test_gold_target_holds_briefly_then_releases() -> None:
     planner = GoldTargetPlanner({"min_confidence": 0.2, "hold_frames": 1})
     first = planner.plan(
-        objects=[DetectedObject("Gold", 0.8, bbox_frame=(300, 180, 360, 250))],
+        objects=[DetectedObject("coin", 0.8, bbox_frame=(300, 180, 360, 250))],
         roi_rect=ROI_RECT,
         roi_width=ROI_WIDTH,
         roi_height=ROI_HEIGHT,

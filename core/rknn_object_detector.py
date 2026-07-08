@@ -38,7 +38,10 @@ class RknnObjectDetector:
         self.max_detections = int(config.get("max_detections", 50))
         self.class_names = [
             str(name)
-            for name in config.get("class_names", ["Gold", "Car", "Human", "Left", "Right"])
+            for name in config.get(
+                "class_names",
+                ["light", "speed_sign", "dir_sign", "human", "car", "coin", "Stop", "Go", "arch"],
+            )
         ]
         self.class_agnostic_nms = bool(config.get("class_agnostic_nms", False))
         self.core_mask_name = str(config.get("core_mask", "NPU_CORE_0_1_2"))
@@ -48,6 +51,7 @@ class RknnObjectDetector:
         self._runtime_ready = False
         self._warned_unavailable = False
         self._warned_postprocess = False
+        self._warned_class_count = False
 
     def detect(self, frame_bgr: np.ndarray) -> list[DetectedObject]:
         if not self.enabled:
@@ -182,6 +186,9 @@ class RknnObjectDetector:
             cls = self._to_chw(outputs[index + 1], expected_channels=len(self.class_names))
             obj = self._to_chw(outputs[index + 2], expected_channels=1)
             if reg.ndim != 3 or cls.ndim != 3 or obj.ndim != 3:
+                continue
+            if cls.shape[0] != len(self.class_names):
+                self._warn_class_count(cls.shape[0])
                 continue
 
             channels, grid_h, grid_w = reg.shape
@@ -382,3 +389,12 @@ class RknnObjectDetector:
         if 0 <= class_id < len(self.class_names):
             return self.class_names[class_id]
         return f"class_{class_id}"
+
+    def _warn_class_count(self, output_count: int) -> None:
+        if self._warned_class_count:
+            return
+        print(
+            "[RknnObjectDetector] Class output count "
+            f"{output_count} does not match configured class_names count {len(self.class_names)}"
+        )
+        self._warned_class_count = True

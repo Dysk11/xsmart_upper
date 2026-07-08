@@ -171,18 +171,18 @@ python tools/hsv_tuner.py
 
 ---
 
-# RKNN 目标识别、避障、吃 Gold 功能
+# RKNN 目标识别、避障、吃 coin 功能
 
-本章节说明当前工程里和 `rknn_lt.rknn` 模型、测试视频、`Car/Human` 避障、`Gold` 目标追踪相关的实现细节。
+本章节说明当前工程里和 `rknn_9classes.rknn` 模型、测试视频、`car/human` 避障、`coin` 目标追踪相关的实现细节。
 
 ## 1. 当前已接入的内容
 
 当前工程已经完成以下接入：
 
-- 模型文件：`rknn_lt.rknn`
+- 模型文件：`rknn_9classes.rknn`
 - 测试视频：`outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4`
 - RKNN 推理模块：`core/rknn_object_detector.py`
-- Gold 目标规划模块：`core/gold_target_planner.py`
+- coin 目标规划模块：`core/gold_target_planner.py`
 - 避障判断模块：`core/blocking_analyzer.py`
 - 避障目标规划模块：`core/avoidance_target_planner.py`
 - 主流程入口：`main.py`
@@ -201,17 +201,23 @@ camera:
 ```yaml
 rknn_object_detector:
   enable: true
-  model_path: models/rknn_lt.rknn
-  class_names: [Gold, Car, Human]
+  model_path: models/rknn_9classes.rknn
+  class_names: [light, speed_sign, dir_sign, human, car, coin, Stop, Go, arch]
 ```
 
 ## 2. 类别顺序
 
 模型实际输出的是类别编号。当前配置：
 
-- `0 = Gold`
-- `1 = Car`
-- `2 = Human`
+- `0 = light`
+- `1 = speed_sign`
+- `2 = dir_sign`
+- `3 = human`
+- `4 = car`
+- `5 = coin`
+- `6 = Stop`
+- `7 = Go`
+- `8 = arch`
 
 如果训练模型时的类别顺序不同，必须在 `config/config.yaml` 中修改 `class_names`。
 
@@ -220,25 +226,25 @@ rknn_object_detector:
 当前主逻辑优先级是：
 
 ```text
-Car/Human 避障 > 吃 Gold > 普通巡线
+car/human 避障 > 吃 coin > 普通巡线
 ```
 
 注意：避障模块会在巡线中心线上加一个平滑偏移，生成新的目标点。最终仍然只发送一组 `lateral_error_px` 和 `steer_deg` 给下位机。
 
-## 4. Gold 目标逻辑
+## 4. coin 目标逻辑
 
-- `class_names: [Gold]`：只有识别类别名为 `Gold` 的目标才触发吃金币逻辑。
-- `approach_speed_limit: 0.85`：朝 Gold 走时限制速度。
-- `aim_at: bottom_center`：目标点取 Gold 框的底部中心。
+- `class_names: [coin]`：只有识别类别名为 `coin` 的目标才触发吃金币逻辑。
+- `approach_speed_limit: 0.85`：朝 coin 走时限制速度。
+- `aim_at: bottom_center`：目标点取 coin 框的底部中心。
 
 当且仅当没有障碍物阻挡时，`GOLD` 模式生效。
 
-## 5. Car/Human 避障逻辑
+## 5. car/human 避障逻辑
 
 1. `core/blocking_analyzer.py` 判断识别框是否挡住当前航道危险走廊（`corridor_half_width_px`）。
 2. `core/avoidance_target_planner.py` 根据阻挡位置生成偏移后的目标路线。
 
-避障只对 `Car` 和 `Human` 生效，`Gold` 不会被当作障碍物。
+避障只对 `car` 和 `human` 生效，`coin` 不会被当作障碍物。
 
 ## 6. 主流程顺序
 
@@ -247,8 +253,8 @@ Car/Human 避障 > 吃 Gold > 普通巡线
 ## 7. 如何确认功能正常
 
 1. 终端出现 `RKNN detector loaded`；
-2. 调试画面中出现 `Gold/Car/Human` 目标框；
-3. 画面上 `G` 为 Gold 目标点，`A` 为最终控制目标点；
+2. 调试画面中出现 `coin/car/human` 目标框；
+3. 画面上 `G` 为 coin 目标点，`A` 为最终控制目标点；
 4. 阻挡时模式显示 `avoid_left/right` 或 `too_close`，吃金币时显示 `GOLD`。
 
 ---

@@ -44,7 +44,7 @@ class BlockingAnalyzer:
         self.enabled = bool(config.get("enabled", True))
         self.allowed_class_names = {
             str(name).casefold()
-            for name in config.get("allowed_class_names", ["Car", "Human"])
+            for name in config.get("allowed_class_names", ["car", "human"])
         }
         self.corridor_half_width_px = float(config.get("corridor_half_width_px", 90.0))
         self.confidence_threshold = float(config.get("confidence_threshold", 0.45))

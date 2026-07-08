@@ -491,7 +491,7 @@ class UpperMachineApp:
         self.blocking_config = config.get("blocking_analyzer", {})
         self.blocking_class_names = {
             str(name).casefold()
-            for name in self.blocking_config.get("allowed_class_names", ["Car", "Human"])
+            for name in self.blocking_config.get("allowed_class_names", ["car", "human"])
         }
         self.blocking_analyzer = BlockingAnalyzer(self.blocking_config)
         self.avoidance_planner = AvoidanceTargetPlanner(
@@ -583,7 +583,7 @@ class UpperMachineApp:
                 print("图像读取失败，等待下一次重试。")
                 continue
 
-            # 第 1 步：先预处理，再用 YOLO 读取 Gold、障碍物和岔路标志。
+            # 第 1 步：先预处理，再用 YOLO 读取 coin、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
             preprocess_result = self.preprocessor.process(frame)
             lane_preprocess_time = time.perf_counter()
