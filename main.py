@@ -34,6 +34,7 @@ from core.logger import CsvLogger
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
 from core.preprocess import ImagePreprocessor, PreprocessResult
 from core.rknn_object_detector import RknnObjectDetector
+from core.rknn_lane_segmenter import RknnLaneSegmenter
 from core.target_selector import TargetPointResult, TargetSelector
 from core.visualizer import Visualizer
 from utils.fps import FPSCounter
@@ -434,6 +435,12 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
             resolve_project_path(project_root, str(rknn_detector_config["model_path"]))
         )
 
+    rknn_segmenter_config = runtime_config.setdefault("rknn_lane_segmenter", {})
+    if rknn_segmenter_config.get("model_path"):
+        rknn_segmenter_config["model_path"] = str(
+            resolve_project_path(project_root, str(rknn_segmenter_config["model_path"]))
+        )
+
     return runtime_config
 
 
@@ -484,6 +491,7 @@ class UpperMachineApp:
         self.camera = CameraReader(config.get("camera", {}))
         self.preprocessor = ImagePreprocessor(config.get("preprocess", {}))
         self.detector = LaneDetector(config.get("detector", {}))
+        self.lane_segmenter = RknnLaneSegmenter(config.get("rknn_lane_segmenter", {}))
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
         self.fork_route_planner = ForkRoutePlanner(config.get("fork_route", {}))
@@ -602,9 +610,14 @@ class UpperMachineApp:
             self.last_fork_result = self.fork_route_planner.update(self.last_detected_objects)
 
             # 第 2 步：在 ROI 中找蓝色航道，并根据已锁定的岔路方向选左/右分支。
-            detection_result = self.detector.detect(
-                preprocess_result.roi_frame,
+            segmentation_result = self.lane_segmenter.segment(preprocess_result.resized_frame)
+            roi_x1, roi_y1, roi_x2, roi_y2 = preprocess_result.roi_rect
+            roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
+            detection_result = self.detector.detect_from_mask(
+                roi_mask,
                 route_direction=self.last_fork_result.requested_direction,
+                segmentation_confidence=segmentation_result.confidence,
+                segmentation_status=segmentation_result.status,
             )
             lane_detect_time = time.perf_counter()
             self.last_fork_result = self.fork_route_planner.update(
@@ -737,6 +750,7 @@ class UpperMachineApp:
         """
 
         self.camera.release()
+        self.lane_segmenter.close()
         self.bridge.close()
         self.stop_event.set()
         _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)

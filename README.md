@@ -291,6 +291,25 @@ data = bytearray([
 ser.write(data)
 ```
 
+## RKNN 航道分割部署
+
+当前主巡线链路在 RK3588 上使用单类 `track` 的 YOLOv5n-seg INT8 模型替代 HSV/Lab 初始分割，模型输出 mask 仍交给原有连通域、中心线、分叉、跟踪和控制模块处理。
+
+- 模型：`models/yolov5n_seg_track_480x640_int8_rk3588.rknn`
+- SHA-256：`0ffd0f431505fa362b4d1f4a94ae69321b2c77a4081c6a919f758f28712b1dce`
+- 输入：RGB uint8 NHWC `[1, 480, 640, 3]`；模型内部完成 `/255` 归一化。
+- 输出：三组 box/class、三组 32 维 mask coefficient 和一个 `[1, 32, 120, 160]` prototype。
+- 类别：`0 = track`；默认置信度阈值 `0.25`、NMS IoU `0.45`、mask 阈值 `0.5`。
+- 转换环境：RKNN-Toolkit2 `2.3.2`，目标平台 `rk3588`，W8A8 per-channel INT8。
+
+板端应安装与 Toolkit2 2.3.2 兼容的 RKNN Toolkit Lite2 和 RKNPU2 Runtime。准备好依赖后运行：
+
+```bash
+python3 main.py --mode camera --bridge serial
+```
+
+正常启动时终端会输出 `RKNN lane segmenter loaded`。调试窗口在 ROI 内半透明显示 `track` mask，并显示 `track: ok conf=...`。加载或推理失败不会静默回退到 HSV，而会输出一次明确告警并按丢线处理。默认不会保存视频或截图。
+
 ## 如何对接 TC264
 
 1. TC264 已经实现底层闭环，本项目只输出高层目标量；

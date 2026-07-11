@@ -44,6 +44,8 @@ class Visualizer:
         self.video_fps = float(config.get("video_fps", 25.0))
         self.font_path = str(config.get("font_path", ""))
         self.font_size = int(config.get("font_size", 22))
+        self.mask_alpha = float(config.get("mask_alpha", 0.35))
+        self.mask_color = tuple(int(value) for value in config.get("mask_color", [0, 180, 255]))
 
         self.video_writer: cv2.VideoWriter | None = None
         if self.save_video or self.save_screenshot:
@@ -150,6 +152,7 @@ class Visualizer:
         centerline_points = tracked_state.centerline_points or detection_result.centerline_points
 
         original_panel = preprocess_result.resized_frame.copy()
+        self._overlay_roi_mask(original_panel, detection_result.filtered_mask, (x1, y1, x2, y2))
         cv2.rectangle(original_panel, (x1, y1), (x2, y2), (0, 255, 255), 2)
         cv2.line(
             original_panel,
@@ -237,6 +240,29 @@ class Visualizer:
         )
 
         return original_panel
+
+    def _overlay_roi_mask(
+        self,
+        image: np.ndarray,
+        roi_mask: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """Blend a binary mask into the ROI without modifying pixels outside it."""
+
+        x1, y1, x2, y2 = roi_rect
+        if roi_mask.shape[:2] != (y2 - y1, x2 - x1):
+            roi_mask = cv2.resize(roi_mask, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST)
+        active = roi_mask > 0
+        if np.any(active):
+            roi_panel = image[y1:y2, x1:x2]
+            color = np.asarray(self.mask_color, dtype=np.float32)
+            roi_panel[active] = np.clip(
+                roi_panel[active].astype(np.float32) * (1.0 - self.mask_alpha)
+                + color * self.mask_alpha,
+                0,
+                255,
+            ).astype(np.uint8)
+        return image
 
     def _draw_target_point(
         self,
@@ -335,6 +361,7 @@ class Visualizer:
             "窗口1：原始画面",
             "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
+            f"track: {detection_result.segmentation_status} conf={detection_result.segmentation_confidence:.2f}",
             f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
             f"steer_deg: {control_command.steer_deg:.2f}",
             f"{fork_reason}",

@@ -48,6 +48,8 @@ class LaneDetectionResult:
     valid_row_count: int
     fit_point_count: int
     fork_result: ForkLaneResult
+    segmentation_confidence: float = 0.0
+    segmentation_status: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -189,6 +191,24 @@ class LaneDetector:
 
         # 先做蓝色阈值分割，得到“哪里像蓝色航道”的初始掩膜。
         mask = self._segment_lane(roi_frame)
+        return self.detect_from_mask(mask, route_direction=route_direction)
+
+    def detect_from_mask(
+        self,
+        roi_mask: np.ndarray,
+        route_direction: str | None = None,
+        segmentation_confidence: float = 0.0,
+        segmentation_status: str = "ok",
+    ) -> LaneDetectionResult:
+        """Extract lane geometry from an externally produced binary ROI mask."""
+
+        if roi_mask.size == 0:
+            result = self._empty_result((1, 1))
+            result.segmentation_status = segmentation_status
+            return result
+        if roi_mask.ndim == 3:
+            roi_mask = cv2.cvtColor(roi_mask, cv2.COLOR_BGR2GRAY)
+        mask = np.where(roi_mask > 0, 255, 0).astype(np.uint8)
         # 先提取所有可用蓝色连通域，再从中选出“沿地面连续前进”的主链条。
         labels, candidate_components = self._extract_candidate_components(mask)
         branch_result = self._select_components_for_route(
@@ -252,6 +272,8 @@ class LaneDetector:
             valid_row_count=len(selected_components),
             fit_point_count=len(centerline_points),
             fork_result=branch_result.fork_result,
+            segmentation_confidence=segmentation_confidence,
+            segmentation_status=segmentation_status,
         )
 
     def _segment_lane(self, roi_frame: np.ndarray) -> np.ndarray:

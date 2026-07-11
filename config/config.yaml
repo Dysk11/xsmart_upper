@@ -127,6 +127,18 @@ target_selector:
   low_confidence_lookahead_px: 80
   low_confidence_threshold: 0.45
 
+rknn_lane_segmenter:
+  # RK3588 上通过 RKNNLite2 执行单类 track 实例分割，并替换 HSV/Lab 初始分割。
+  enable: true
+  model_path: models/yolov5n_seg_track_480x640_int8_rk3588.rknn
+  # 按 [width, height] 配置；模型固定输入为 RGB uint8 NHWC 640x480。
+  input_size: [640, 480]
+  score_threshold: 0.25
+  nms_threshold: 0.45
+  mask_threshold: 0.5
+  max_instances: 20
+  core_mask: NPU_CORE_0
+
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
   enable: false
@@ -142,7 +154,7 @@ rknn_object_detector:
   # 模型有 7 个类别输出；顺序必须与训练时 label_list.txt 保持一致。
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
   # 单核运行入口；可选值：NPU_CORE_0、NPU_CORE_1、NPU_CORE_2。
-  core_mask: NPU_CORE_0
+  core_mask: NPU_CORE_1
 
 fork_route:
   enabled: true
@@ -227,6 +239,9 @@ visualizer:
   # Linux 常见示例：/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc
   font_path: "C:/Windows/Fonts/msyh.ttc"
   font_size: 22
+  # track mask 在 ROI 内以 BGR 颜色半透明叠加。
+  mask_alpha: 0.35
+  mask_color: [0, 180, 255]
   save_video: false
   save_screenshot: false
   save_dir: outputs/visual
