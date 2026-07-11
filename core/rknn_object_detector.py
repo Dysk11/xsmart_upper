@@ -166,6 +166,8 @@ class RknnObjectDetector:
         arrays = [np.asarray(output) for output in outputs]
         if len(arrays) == 9:
             return self._postprocess_yolo_dfl(arrays, letterbox, frame_shape)
+        if len(arrays) == 2:
+            return self._postprocess_ppyoloe(arrays, letterbox, frame_shape)
         if len(arrays) == 1:
             return self._postprocess_flat_output(arrays[0], letterbox, frame_shape)
 
@@ -173,6 +175,44 @@ class RknnObjectDetector:
             print(f"[RknnObjectDetector] Unsupported RKNN output count: {len(arrays)}")
             self._warned_postprocess = True
         return []
+
+    def _postprocess_ppyoloe(
+        self,
+        outputs: Sequence[np.ndarray],
+        letterbox: LetterboxInfo,
+        frame_shape: tuple[int, int],
+    ) -> list[DetectedObject]:
+        """Decode PP-YOLOE boxes [1,N,4] and class scores [1,C,N]."""
+        boxes = np.squeeze(np.asarray(outputs[0], dtype=np.float32))
+        class_scores = np.squeeze(np.asarray(outputs[1], dtype=np.float32))
+        if boxes.ndim != 2 or class_scores.ndim != 2:
+            return []
+        if boxes.shape[1] != 4 and boxes.shape[0] == 4:
+            boxes = boxes.transpose(1, 0)
+        if boxes.shape[1] != 4:
+            return []
+
+        if class_scores.shape[0] == len(self.class_names):
+            class_scores = class_scores.transpose(1, 0)
+        elif class_scores.shape[1] != len(self.class_names):
+            self._warn_class_count(min(class_scores.shape))
+            return []
+        if class_scores.shape[0] != boxes.shape[0]:
+            return []
+
+        class_scores = self._ensure_probability(class_scores)
+        class_ids = np.argmax(class_scores, axis=1)
+        confidences = class_scores[np.arange(class_scores.shape[0]), class_ids]
+        selected = np.flatnonzero(confidences >= self.score_threshold)
+        candidates = [
+            (
+                float(confidences[index]),
+                int(class_ids[index]),
+                tuple(float(value) for value in boxes[index]),
+            )
+            for index in selected.tolist()
+        ]
+        return self._build_detections(candidates, letterbox, frame_shape)
 
     def _postprocess_yolo_dfl(
         self,
