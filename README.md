@@ -202,6 +202,8 @@ camera:
 rknn_object_detector:
   enable: true
   model_path: models/rknn_7classes.rknn
+  # 按 [width, height] 配置，与 RKNN 固定输入 640x480 一致
+  input_size: [640, 480]
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
   # 单核运行入口，可选 NPU_CORE_0、NPU_CORE_1、NPU_CORE_2
   core_mask: NPU_CORE_0

@@ -131,7 +131,8 @@ rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
   enable: false
   model_path: models/rknn_7classes.rknn
-  input_size: [640, 640]
+  # 输入尺寸按 [width, height] 配置；当前模型固定为 640x480。
+  input_size: [640, 480]
   input_layout: nhwc
   input_color: rgb
   input_dtype: uint8
