@@ -173,13 +173,13 @@ python tools/hsv_tuner.py
 
 # RKNN 目标识别、避障、吃 coin 功能
 
-本章节说明当前工程里和 `rknn_9classes.rknn` 模型、测试视频、`car/human` 避障、`coin` 目标追踪相关的实现细节。
+本章节说明当前工程里和 `rknn_7classes.rknn` 模型、测试视频、`car/human` 避障、`coin` 目标追踪相关的实现细节。
 
 ## 1. 当前已接入的内容
 
 当前工程已经完成以下接入：
 
-- 模型文件：`rknn_9classes.rknn`
+- 模型文件：`rknn_7classes.rknn`
 - 测试视频：`outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4`
 - RKNN 推理模块：`core/rknn_object_detector.py`
 - coin 目标规划模块：`core/gold_target_planner.py`
@@ -201,23 +201,23 @@ camera:
 ```yaml
 rknn_object_detector:
   enable: true
-  model_path: models/rknn_9classes.rknn
-  class_names: [light, speed_sign, dir_sign, human, car, coin, Stop, Go, arch]
+  model_path: models/rknn_7classes.rknn
+  class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
+  # 单核运行入口，可选 NPU_CORE_0、NPU_CORE_1、NPU_CORE_2
+  core_mask: NPU_CORE_0
 ```
 
 ## 2. 类别顺序
 
 模型实际输出的是类别编号。当前配置：
 
-- `0 = light`
-- `1 = speed_sign`
-- `2 = dir_sign`
+- `0 = car`
+- `1 = coin`
+- `2 = Go`
 - `3 = human`
-- `4 = car`
-- `5 = coin`
+- `4 = road_sign`
+- `5 = speed_limit`
 - `6 = Stop`
-- `7 = Go`
-- `8 = arch`
 
 如果训练模型时的类别顺序不同，必须在 `config/config.yaml` 中修改 `class_names`。
 
