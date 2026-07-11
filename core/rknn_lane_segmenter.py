@@ -178,14 +178,15 @@ class RknnLaneSegmenter:
         selected = self._nms(boxes, scores)[: self.max_instances]
         union_input = np.zeros((self.input_height, self.input_width), dtype=np.uint8)
         proto = prototypes[0].reshape(32, -1)
+        threshold = min(max(self.mask_threshold, 1e-6), 1.0 - 1e-6)
+        logit_threshold = float(np.log(threshold / (1.0 - threshold)))
         instances: list[SegmentationInstance] = []
         for index in selected:
             box = boxes[index]
             logits = candidates[index, 6:] @ proto
-            probability = 1.0 / (1.0 + np.exp(-np.clip(logits, -30.0, 30.0)))
-            probability = probability.reshape(prototypes.shape[2], prototypes.shape[3])
-            probability = cv2.resize(probability, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
-            instance_mask = probability >= self.mask_threshold
+            logits = logits.reshape(prototypes.shape[2], prototypes.shape[3])
+            logits = cv2.resize(logits, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
+            instance_mask = logits >= logit_threshold
             x1, y1, x2, y2 = self._clip_box(box)
             cropped = np.zeros_like(instance_mask)
             if x2 > x1 and y2 > y1:

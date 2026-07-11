@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# RK3588 上小矩阵 mask 后处理让 BLAS 自动开满 8 核反而更慢。必须在导入
+# NumPy/OpenCV 前设置，spawn 出来的推理进程也会继承这些限制。
+for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_thread_env, "1")
+
 import argparse
 import copy
 import multiprocessing as mp
@@ -34,7 +41,7 @@ from core.logger import CsvLogger
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
 from core.preprocess import ImagePreprocessor, PreprocessResult
 from core.rknn_object_detector import RknnObjectDetector
-from core.rknn_lane_segmenter import RknnLaneSegmenter
+from core.rknn_lane_segmenter import RknnLaneSegmenter, SegmentationResult
 from core.target_selector import TargetPointResult, TargetSelector
 from core.visualizer import Visualizer
 from utils.fps import FPSCounter
@@ -335,6 +342,52 @@ def _ai_inference_worker(
         detector.close()
 
 
+def _lane_inference_worker(
+    worker_index: int,
+    segmenter_config: Dict[str, Any],
+    input_queue: Any,
+    output_queue: Any,
+    ack_queue: Any,
+    pool_id: str,
+    stop_event: Any,
+) -> None:
+    """Run one lane-segmentation runtime on its configured NPU core."""
+
+    segmenter = RknnLaneSegmenter(segmenter_config)
+    ack_queues = {pool_id: ack_queue}
+    try:
+        while not stop_event.is_set():
+            try:
+                item = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+
+            frame_id, frame_payload = item
+            try:
+                frame = _take_shared_ndarray(frame_payload, ack_queues)
+                result = segmenter.segment(frame)
+            except Exception:
+                traceback.print_exc()
+                shape = tuple(frame.shape[:2]) if "frame" in locals() else (1, 1)
+                result = SegmentationResult(np.zeros(shape, dtype=np.uint8), [], 0.0, "worker_error")
+            packed_mask = np.packbits(result.mask.reshape(-1), bitorder="little")
+            output_queue.put(
+                (
+                    frame_id,
+                    worker_index,
+                    tuple(result.mask.shape),
+                    packed_mask,
+                    result.instances,
+                    result.confidence,
+                    result.status,
+                )
+            )
+    finally:
+        segmenter.close()
+
+
 def _ui_worker(
     visualizer_config: Dict[str, Any],
     input_queue: Any,
@@ -491,7 +544,10 @@ class UpperMachineApp:
         self.camera = CameraReader(config.get("camera", {}))
         self.preprocessor = ImagePreprocessor(config.get("preprocess", {}))
         self.detector = LaneDetector(config.get("detector", {}))
-        self.lane_segmenter = RknnLaneSegmenter(config.get("rknn_lane_segmenter", {}))
+        lane_config = config.get("rknn_lane_segmenter", {})
+        worker_core_masks = list(lane_config.get("worker_core_masks", []))
+        self.lane_parallel_enabled = bool(lane_config.get("parallel", False) and worker_core_masks)
+        self.lane_segmenter = None if self.lane_parallel_enabled else RknnLaneSegmenter(lane_config)
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
         self.fork_route_planner = ForkRoutePlanner(config.get("fork_route", {}))
@@ -533,6 +589,14 @@ class UpperMachineApp:
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
         self.ai_ack_queue = self.mp_context.Queue()
+        self.lane_output_queue = self.mp_context.Queue(maxsize=max(2, len(worker_core_masks) * 2))
+        self.lane_input_queues: list[Any] = []
+        self.lane_ack_queues: list[Any] = []
+        self.lane_frame_pools: list[SharedArrayPool] = []
+        self.lane_processes: list[Any] = []
+        self.lane_worker_busy: list[bool] = []
+        self.last_segmentation_result: SegmentationResult | None = None
+        self.last_segmentation_frame_id = -1
         self.ui_resized_ack_queue = self.mp_context.Queue()
         self.ui_roi_ack_queue = self.mp_context.Queue()
         self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
@@ -543,6 +607,25 @@ class UpperMachineApp:
             self.ui_resized_pool.pool_id: self.ui_resized_pool,
             self.ui_roi_pool.pool_id: self.ui_roi_pool,
         }
+        if self.lane_parallel_enabled:
+            for worker_index, core_mask in enumerate(worker_core_masks):
+                input_queue = self.mp_context.Queue(maxsize=1)
+                ack_queue = self.mp_context.Queue()
+                pool_id = f"lane_frame_{worker_index}"
+                frame_pool = SharedArrayPool(pool_id, ack_queue, slot_count=2)
+                worker_config = copy.deepcopy(lane_config)
+                worker_config["core_mask"] = str(core_mask)
+                process = self.mp_context.Process(
+                    target=_lane_inference_worker,
+                    args=(worker_index, worker_config, input_queue, self.lane_output_queue, ack_queue, pool_id, self.stop_event),
+                    name=f"xsmart-lane-inference-{worker_index}",
+                )
+                self.lane_input_queues.append(input_queue)
+                self.lane_ack_queues.append(ack_queue)
+                self.lane_frame_pools.append(frame_pool)
+                self.lane_processes.append(process)
+                self.lane_worker_busy.append(False)
+                self.shared_pools[pool_id] = frame_pool
         self.ai_process = self.mp_context.Process(
             target=_ai_inference_worker,
             args=(
@@ -565,6 +648,13 @@ class UpperMachineApp:
             ),
             name="xsmart-ui",
         )
+        visualizer_config = config.get("visualizer", {})
+        self.ui_active = bool(
+            visualizer_config.get("show_window", True)
+            or visualizer_config.get("save_video", False)
+            or visualizer_config.get("save_screenshot", False)
+        )
+        self.ui_frame_stride = max(1, int(visualizer_config.get("frame_stride", 3)))
 
     def run(self) -> None:
         """执行上位机主循环。
@@ -580,7 +670,10 @@ class UpperMachineApp:
         self.bridge.connect()
         self.csv_logger.open()
         self.ai_process.start()
-        self.ui_process.start()
+        for process in self.lane_processes:
+            process.start()
+        if self.ui_active:
+            self.ui_process.start()
 
         while not self.stop_event.is_set():
             success, frame = self.camera.read()
@@ -610,7 +703,7 @@ class UpperMachineApp:
             self.last_fork_result = self.fork_route_planner.update(self.last_detected_objects)
 
             # 第 2 步：在 ROI 中找蓝色航道，并根据已锁定的岔路方向选左/右分支。
-            segmentation_result = self.lane_segmenter.segment(preprocess_result.resized_frame)
+            segmentation_result = self._segment_lane(preprocess_result.resized_frame)
             roi_x1, roi_y1, roi_x2, roi_y2 = preprocess_result.roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             detection_result = self.detector.detect_from_mask(
@@ -671,12 +764,15 @@ class UpperMachineApp:
             )
 
             # 第 8 步：显示调试画面，看掩膜、中心线、误差和控制量是否正常。
-            ui_preprocess_payload = _share_preprocess_result(
-                preprocess_result,
-                resized_pool=self.ui_resized_pool,
-                roi_pool=self.ui_roi_pool,
-            )
-            if ui_preprocess_payload is not None:
+            ui_preprocess_payload = None
+            should_render_ui = self.ui_active and self.frame_id % self.ui_frame_stride == 0
+            if should_render_ui:
+                ui_preprocess_payload = _share_preprocess_result(
+                    preprocess_result,
+                    resized_pool=self.ui_resized_pool,
+                    roi_pool=self.ui_roi_pool,
+                )
+            if should_render_ui and ui_preprocess_payload is not None:
                 _put_latest(
                     self.ui_queue,
                     {
@@ -694,6 +790,46 @@ class UpperMachineApp:
                     },
                     release_func=self._release_owned_shared_payload,
                 )
+
+    def _segment_lane(self, frame: np.ndarray) -> SegmentationResult:
+        """Segment synchronously or through the two-core pipelined worker pool."""
+
+        if not self.lane_parallel_enabled:
+            assert self.lane_segmenter is not None
+            return self.lane_segmenter.segment(frame)
+
+        free_worker = next((i for i, busy in enumerate(self.lane_worker_busy) if not busy), None)
+        if free_worker is None:
+            self._receive_lane_result(block=True)
+            free_worker = next(i for i, busy in enumerate(self.lane_worker_busy) if not busy)
+
+        descriptor = self.lane_frame_pools[free_worker].write(frame)
+        if descriptor is not None:
+            self.lane_input_queues[free_worker].put((self.frame_id, descriptor))
+            self.lane_worker_busy[free_worker] = True
+
+        while self._receive_lane_result(block=False):
+            pass
+        if self.last_segmentation_result is None:
+            self._receive_lane_result(block=True)
+        assert self.last_segmentation_result is not None
+        return self.last_segmentation_result
+
+    def _receive_lane_result(self, block: bool) -> bool:
+        try:
+            item = self.lane_output_queue.get(timeout=2.0) if block else self.lane_output_queue.get_nowait()
+        except queue.Empty:
+            return False
+        frame_id, worker_index, mask_shape, packed_mask, instances, confidence, status = item
+        self.lane_worker_busy[int(worker_index)] = False
+        if int(frame_id) > self.last_segmentation_frame_id:
+            mask_size = int(mask_shape[0]) * int(mask_shape[1])
+            mask = np.unpackbits(packed_mask, count=mask_size, bitorder="little").reshape(mask_shape)
+            mask = mask.astype(np.uint8, copy=False) * np.uint8(255)
+            result = SegmentationResult(mask, instances, confidence, status)
+            self.last_segmentation_frame_id = int(frame_id)
+            self.last_segmentation_result = result
+        return True
 
     def _release_owned_shared_payload(self, value: Any) -> None:
         """Release queued shared-memory slots owned by this app instance."""
@@ -750,12 +886,19 @@ class UpperMachineApp:
         """
 
         self.camera.release()
-        self.lane_segmenter.close()
+        if self.lane_segmenter is not None:
+            self.lane_segmenter.close()
         self.bridge.close()
         self.stop_event.set()
         _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
-        _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
-        for process in (self.ai_process, self.ui_process):
+        if self.ui_active:
+            _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
+        for lane_queue in self.lane_input_queues:
+            _put_latest(lane_queue, None, release_func=self._release_owned_shared_payload)
+        processes = [self.ai_process, *self.lane_processes]
+        if self.ui_active:
+            processes.append(self.ui_process)
+        for process in processes:
             if process.pid is None:
                 continue
             process.join(timeout=2.0)

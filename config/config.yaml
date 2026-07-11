@@ -10,12 +10,12 @@ camera:
   # 视频模式下使用的视频路径。
   video_path: outputs/video/record_20260708_135111.mp4
   # 网络流模式下的 http/rtsp 视频地址流。
-  stream_url: "http://192.168.3.223:8080/ar_feed"
+  stream_url: "http://192.168.32.84:8080/ar_feed"
   # 视频是否循环播放。
   loop_video: false
   # 采集或回放后希望使用的图像尺寸。
-  width: 800
-  height: 600
+  width: 640
+  height: 480
   fps: 60
   # 是否镜像翻转，部分摄像头安装方向反了时很有用。
   mirror: false
@@ -136,12 +136,15 @@ rknn_lane_segmenter:
   score_threshold: 0.25
   nms_threshold: 0.45
   mask_threshold: 0.5
-  max_instances: 20
+  max_instances: 1
   core_mask: NPU_CORE_0
 
+  parallel: true
+  worker_core_masks: [NPU_CORE_0, NPU_CORE_2]
+  
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
-  enable: false
+  enable: true
   model_path: models/rknn_7classes.rknn
   # 输入尺寸按 [width, height] 配置；当前模型固定为 640x480。
   input_size: [640, 480]
@@ -249,6 +252,7 @@ visualizer:
   video_fourcc: mp4v
   video_fps: 25
 
+  frame_stride: 3
 logger:
   # CSV 日志方便赛后分析误差和调速效果。
   enable: false
