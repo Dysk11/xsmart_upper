@@ -187,6 +187,28 @@ class Visualizer:
                 thickness=1,
                 offset=(x1, y1),
             )
+        for corner, color, label in (
+            (fork_lane.left_corner, (255, 0, 255), "LF"),
+            (fork_lane.right_corner, (0, 128, 255), "RF"),
+        ):
+            if corner is not None:
+                point = (int(corner[0] + x1), int(corner[1] + y1))
+                cv2.rectangle(
+                    original_panel,
+                    (point[0] - 6, point[1] - 6),
+                    (point[0] + 6, point[1] + 6),
+                    color,
+                    2,
+                )
+                cv2.putText(
+                    original_panel,
+                    label,
+                    (point[0] + 8, point[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                )
         if avoidance_result is not None:
             original_panel = draw_centerline(
                 original_panel,
@@ -357,14 +379,6 @@ class Visualizer:
                 f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
                 f"confirm={fork_lane.confirm_frames}"
             )
-        for corner, color, label in (
-            (fork_lane.left_corner, (255, 0, 255), "LF"),
-            (fork_lane.right_corner, (0, 128, 255), "RF"),
-        ):
-            if corner is not None:
-                point = (int(corner[0] + x1), int(corner[1] + y1))
-                cv2.rectangle(original_panel, (point[0] - 6, point[1] - 6), (point[0] + 6, point[1] + 6), color, 2)
-                cv2.putText(original_panel, label, (point[0] + 8, point[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
         return [
             "窗口1：原始画面",
             "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",
