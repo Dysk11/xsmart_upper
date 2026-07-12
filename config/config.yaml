@@ -3,14 +3,14 @@ app:
   fps_smoothing_alpha: 0.2
 
 camera:
-  # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，stream 表示网络流。
+  # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，shared_memory 表示 AR 共享内存。
   mode: video
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
   video_path: outputs/video/record_20260708_135111.mp4
-  # 网络流模式下的 http/rtsp 视频地址流。
-  stream_url: "http://192.168.32.84:8080/ar_feed"
+  # AR 系统创建的 POSIX 共享内存名称；帧协议为 QII 头部加 RGB888 图像。
+  shared_memory_name: shm_ar_video
   # 视频是否循环播放。
   loop_video: false
   # 采集或回放后希望使用的图像尺寸。

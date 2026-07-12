@@ -42,9 +42,9 @@ def build_camera_config(args: argparse.Namespace) -> dict[str, Any]:
         camera_config["video_path"] = str(resolve_project_path(args.video))
     elif camera_config.get("video_path"):
         camera_config["video_path"] = str(resolve_project_path(str(camera_config["video_path"])))
-    if args.stream_url is not None:
-        camera_config["mode"] = "stream"
-        camera_config["stream_url"] = args.stream_url
+    if args.shared_memory_name is not None:
+        camera_config["mode"] = "shared_memory"
+        camera_config["shared_memory_name"] = args.shared_memory_name
     if args.width is not None:
         camera_config["width"] = args.width
     if args.height is not None:
@@ -99,10 +99,10 @@ def run(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Open a preview window and save screenshots with the s key.")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "config" / "config.yaml"), help="Config file path")
-    parser.add_argument("--mode", choices=["camera", "video", "stream", "http"], help="Image source mode")
+    parser.add_argument("--mode", choices=["camera", "video", "shared_memory"], help="Image source mode")
     parser.add_argument("--device-id", type=int, help="Camera device id")
     parser.add_argument("--video", help="Video file path; sets mode to video")
-    parser.add_argument("--stream-url", help="HTTP/RTSP stream URL; sets mode to stream")
+    parser.add_argument("--shared-memory-name", help="POSIX shared memory name; sets mode to shared_memory")
     parser.add_argument("--width", type=int, help="Capture width")
     parser.add_argument("--height", type=int, help="Capture height")
     parser.add_argument("--fps", type=int, help="Capture FPS")

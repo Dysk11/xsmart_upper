@@ -70,14 +70,28 @@ pip install -r requirements.txt
 
 ### 1. `camera`
 
-- `mode`: 图像源模式，`camera` 或 `video`
+- `mode`: 图像源模式，`camera`、`video` 或 `shared_memory`
 - `device_id`: 摄像头设备号
 - `video_path`: 视频文件路径
+- `shared_memory_name`: AR 系统发布 RGB888 帧的 POSIX 共享内存名称，默认 `shm_ar_video`
 - `loop_video`: 视频回放是否循环
 - `width` / `height` / `fps`: 采集分辨率与目标帧率
 - `mirror`: 是否镜像翻转
 - `reconnect_interval_sec`: 读取失败后的重连间隔
 - `max_reconnect_attempts`: 最大重连次数
+
+共享内存模式与 AR 系统运行在同一台 Linux 设备上，配置示例：
+
+```yaml
+camera:
+  mode: shared_memory
+  shared_memory_name: shm_ar_video
+  mirror: false
+  reconnect_interval_sec: 0.5
+  max_reconnect_attempts: 5
+```
+
+共享内存使用 16 字节原生 `QII` 头部（帧号、宽、高），后接连续 RGB888 图像。接收端会转换为项目下游统一使用的 BGR 图像。
 
 ### 2. `preprocess`
 

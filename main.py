@@ -1159,7 +1159,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(PROJECT_ROOT / "config" / "config.yaml"),
         help="配置文件路径",
     )
-    parser.add_argument("--mode", choices=["camera", "video"], help="图像源模式")
+    parser.add_argument("--mode", choices=["camera", "video", "shared_memory"], help="图像源模式")
     parser.add_argument("--video", help="视频文件路径，仅视频模式下有效")
     parser.add_argument("--bridge", choices=["mock", "serial"], help="桥接层类型")
     parser.add_argument("--no-gui", action="store_true", help="关闭图像显示窗口")
