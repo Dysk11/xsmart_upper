@@ -12,7 +12,6 @@ for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"
 import argparse
 import copy
 import multiprocessing as mp
-from multiprocessing import resource_tracker
 from multiprocessing import shared_memory
 import queue
 import sys
@@ -49,15 +48,6 @@ from utils.fps import FPSCounter
 
 SHARED_ARRAY_MARKER = "__xsmart_shared_array__"
 SHARED_PREPROCESS_MARKER = "__xsmart_shared_preprocess__"
-
-
-def _unregister_shared_memory(shm: shared_memory.SharedMemory) -> None:
-    """Prevent a temporary opener from owning shared-memory cleanup."""
-
-    try:
-        resource_tracker.unregister(shm._name, "shared_memory")
-    except Exception:
-        pass
 
 
 class SharedArrayPool:
@@ -183,7 +173,6 @@ def _take_shared_ndarray(descriptor: Dict[str, Any], ack_queues: Dict[str, Any])
     except FileNotFoundError:
         _ack_shared_descriptor(descriptor, ack_queues)
         raise
-    _unregister_shared_memory(shm)
     try:
         array = np.ndarray(
             tuple(descriptor["shape"]),
@@ -326,18 +315,22 @@ def _ai_inference_worker(
             if item is None:
                 break
 
-            frame_id, frame_payload = item
+            frame_id, captured_at, frame_payload = item
             try:
                 frame = (
                     _take_shared_ndarray(frame_payload, ack_queues)
                     if _is_shared_array_descriptor(frame_payload)
                     else frame_payload
                 )
+                ipc_finished = time.perf_counter()
                 detections = detector.detect(frame)
-                _put_latest(output_queue, (frame_id, detections))
+                _put_latest(
+                    output_queue,
+                    (frame_id, captured_at, time.perf_counter(), ipc_finished, detector.last_timing, detections),
+                )
             except Exception:
                 traceback.print_exc()
-                _put_latest(output_queue, (frame_id, []))
+                _put_latest(output_queue, (frame_id, captured_at, time.perf_counter(), time.perf_counter(), {}, []))
     finally:
         detector.close()
 
@@ -364,9 +357,10 @@ def _lane_inference_worker(
             if item is None:
                 break
 
-            frame_id, frame_payload = item
+            frame_id, captured_at, frame_payload = item
             try:
                 frame = _take_shared_ndarray(frame_payload, ack_queues)
+                ipc_finished = time.perf_counter()
                 result = segmenter.segment(frame)
             except Exception:
                 traceback.print_exc()
@@ -376,6 +370,10 @@ def _lane_inference_worker(
             output_queue.put(
                 (
                     frame_id,
+                    captured_at,
+                    time.perf_counter(),
+                    ipc_finished,
+                    segmenter.last_timing,
                     worker_index,
                     tuple(result.mask.shape),
                     packed_mask,
@@ -546,8 +544,16 @@ class UpperMachineApp:
         self.detector = LaneDetector(config.get("detector", {}))
         lane_config = config.get("rknn_lane_segmenter", {})
         worker_core_masks = list(lane_config.get("worker_core_masks", []))
+        configured_worker_count = int(lane_config.get("worker_count", len(worker_core_masks)))
+        worker_core_masks = worker_core_masks[: max(0, configured_worker_count)]
         self.lane_parallel_enabled = bool(lane_config.get("parallel", False) and worker_core_masks)
         self.lane_segmenter = None if self.lane_parallel_enabled else RknnLaneSegmenter(lane_config)
+        self.lane_max_result_age_frames = max(0, int(lane_config.get("max_result_age_frames", 2)))
+        self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
+        ai_config = config.get("rknn_object_detector", {})
+        self.ai_inference_stride = max(1, int(ai_config.get("inference_stride", 1)))
+        self.ai_max_result_age_frames = max(0, int(ai_config.get("max_result_age_frames", 12)))
+        self.drop_stale_ai_results = bool(ai_config.get("drop_stale_results", True))
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
         self.fork_route_planner = ForkRoutePlanner(config.get("fork_route", {}))
@@ -597,6 +603,8 @@ class UpperMachineApp:
         self.lane_worker_busy: list[bool] = []
         self.last_segmentation_result: SegmentationResult | None = None
         self.last_segmentation_frame_id = -1
+        self.last_segmentation_captured_at = 0.0
+        self.last_ai_frame_id = -1
         self.ui_resized_ack_queue = self.mp_context.Queue()
         self.ui_roi_ack_queue = self.mp_context.Queue()
         self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
@@ -686,24 +694,32 @@ class UpperMachineApp:
 
             # 第 1 步：先预处理，再用 YOLO 读取 coin、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
+            captured_at = lane_start_time
             preprocess_result = self.preprocessor.process(frame)
             lane_preprocess_time = time.perf_counter()
             self.frame_id += 1
-            ai_frame_payload = self.ai_frame_pool.write(preprocess_result.resized_frame)
+            ai_frame_payload = None
+            if self.frame_id % self.ai_inference_stride == 0:
+                ai_frame_payload = self.ai_frame_pool.write(preprocess_result.resized_frame)
             if ai_frame_payload is not None:
                 _put_latest(
                     self.ai_input_queue,
-                    (self.frame_id, ai_frame_payload),
+                    (self.frame_id, captured_at, ai_frame_payload),
                     release_func=self._release_owned_shared_payload,
                 )
             latest_ai_result = _drain_latest(self.ai_output_queue)
             if latest_ai_result is not None:
-                _frame_id, detected_objects = latest_ai_result
-                self.last_detected_objects = detected_objects
+                ai_frame_id, _captured_at, _completed_at, _ipc_finished, _timing, detected_objects = latest_ai_result
+                result_age = self.frame_id - int(ai_frame_id)
+                if int(ai_frame_id) > self.last_ai_frame_id and (
+                    not self.drop_stale_ai_results or result_age <= self.ai_max_result_age_frames
+                ):
+                    self.last_ai_frame_id = int(ai_frame_id)
+                    self.last_detected_objects = detected_objects
             self.last_fork_result = self.fork_route_planner.update(self.last_detected_objects)
 
             # 第 2 步：在 ROI 中找蓝色航道，并根据已锁定的岔路方向选左/右分支。
-            segmentation_result = self._segment_lane(preprocess_result.resized_frame)
+            segmentation_result = self._segment_lane(preprocess_result.resized_frame, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = preprocess_result.roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             detection_result = self.detector.detect_from_mask(
@@ -791,27 +807,31 @@ class UpperMachineApp:
                     release_func=self._release_owned_shared_payload,
                 )
 
-    def _segment_lane(self, frame: np.ndarray) -> SegmentationResult:
-        """Segment synchronously or through the two-core pipelined worker pool."""
+    def _segment_lane(self, frame: np.ndarray, captured_at: float | None = None) -> SegmentationResult:
+        """Segment synchronously or through the configured low-latency worker pool."""
 
         if not self.lane_parallel_enabled:
             assert self.lane_segmenter is not None
             return self.lane_segmenter.segment(frame)
 
-        free_worker = next((i for i, busy in enumerate(self.lane_worker_busy) if not busy), None)
-        if free_worker is None:
-            self._receive_lane_result(block=True)
-            free_worker = next(i for i, busy in enumerate(self.lane_worker_busy) if not busy)
-
-        descriptor = self.lane_frame_pools[free_worker].write(frame)
-        if descriptor is not None:
-            self.lane_input_queues[free_worker].put((self.frame_id, descriptor))
-            self.lane_worker_busy[free_worker] = True
-
         while self._receive_lane_result(block=False):
             pass
+        free_worker = next((i for i, busy in enumerate(self.lane_worker_busy) if not busy), None)
+
+        if free_worker is not None:
+            descriptor = self.lane_frame_pools[free_worker].write(frame)
+            if descriptor is not None:
+                self.lane_input_queues[free_worker].put((self.frame_id, captured_at or time.perf_counter(), descriptor))
+                self.lane_worker_busy[free_worker] = True
+
         if self.last_segmentation_result is None:
             self._receive_lane_result(block=True)
+        while (
+            self.drop_stale_lane_results
+            and self.frame_id - self.last_segmentation_frame_id > self.lane_max_result_age_frames
+        ):
+            if not self._receive_lane_result(block=True):
+                break
         assert self.last_segmentation_result is not None
         return self.last_segmentation_result
 
@@ -820,7 +840,19 @@ class UpperMachineApp:
             item = self.lane_output_queue.get(timeout=2.0) if block else self.lane_output_queue.get_nowait()
         except queue.Empty:
             return False
-        frame_id, worker_index, mask_shape, packed_mask, instances, confidence, status = item
+        (
+            frame_id,
+            captured_at,
+            _completed_at,
+            _ipc_finished,
+            _timing,
+            worker_index,
+            mask_shape,
+            packed_mask,
+            instances,
+            confidence,
+            status,
+        ) = item
         self.lane_worker_busy[int(worker_index)] = False
         if int(frame_id) > self.last_segmentation_frame_id:
             mask_size = int(mask_shape[0]) * int(mask_shape[1])
@@ -828,6 +860,7 @@ class UpperMachineApp:
             mask = mask.astype(np.uint8, copy=False) * np.uint8(255)
             result = SegmentationResult(mask, instances, confidence, status)
             self.last_segmentation_frame_id = int(frame_id)
+            self.last_segmentation_captured_at = float(captured_at)
             self.last_segmentation_result = result
         return True
 
@@ -1154,6 +1187,7 @@ def main() -> int:
     config = prepare_runtime_config(config, PROJECT_ROOT)
 
     app = UpperMachineApp(config, PROJECT_ROOT)
+    return_code = 0
     try:
         app.run()
     except KeyboardInterrupt:

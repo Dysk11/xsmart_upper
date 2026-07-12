@@ -36,17 +36,17 @@ preprocess:
     right_ratio: 0.95
   gaussian_blur:
     # 轻度模糊能压掉部分噪点，但太大可能让边界发糊。
-    enable: true
+    enable: false
     kernel_size: 5
     sigma_x: 0.0
   clahe:
     # CLAHE 用于缓解局部过曝或阴影导致的对比度问题。
-    enable: true
+    enable: false
     clip_limit: 2.0
     tile_grid_size: 8
   brightness_normalization:
     # 亮度归一化用于降低左右光照不均的影响。
-    enable: true
+    enable: false
     target_mean: 150.0
     min_gain: 0.7
     max_gain: 1.35
@@ -137,10 +137,14 @@ rknn_lane_segmenter:
   nms_threshold: 0.45
   mask_threshold: 0.5
   max_instances: 1
+  runtime_backend: lite2
   core_mask: NPU_CORE_0
 
   parallel: true
-  worker_core_masks: [NPU_CORE_0, NPU_CORE_2]
+  worker_count: 3
+  worker_core_masks: [NPU_CORE_0, NPU_CORE_1, NPU_CORE_2]
+  max_result_age_frames: 2
+  drop_stale_results: true
   
 rknn_object_detector:
   # Orange Pi / RK3588 上使用 rknnlite 加载本目录下的 RKNN 模型。
@@ -154,6 +158,10 @@ rknn_object_detector:
   score_threshold: 0.20
   nms_threshold: 0.45
   max_detections: 30
+  runtime_backend: lite2
+  inference_stride: 2
+  max_result_age_frames: 12
+  drop_stale_results: true
   # 模型有 7 个类别输出；顺序必须与训练时 label_list.txt 保持一致。
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
   # 单核运行入口；可选值：NPU_CORE_0、NPU_CORE_1、NPU_CORE_2。

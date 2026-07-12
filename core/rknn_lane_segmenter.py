@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any
 
 import cv2
@@ -68,10 +69,15 @@ class RknnLaneSegmenter:
         self.nms_threshold = float(config.get("nms_threshold", 0.45))
         self.mask_threshold = float(config.get("mask_threshold", 0.5))
         self.max_instances = int(config.get("max_instances", 20))
+        self.runtime_backend = str(config.get("runtime_backend", "lite2")).lower()
         self.core_mask_name = str(config.get("core_mask", "NPU_CORE_0"))
         self._rknn: Any = None
         self._runtime_ready = False
         self._warned: set[str] = set()
+        self.last_timing: dict[str, float] = {}
+        self._canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
+        self._rgb_canvas = np.empty_like(self._canvas)
+        self._grids: dict[tuple[int, int], np.ndarray] = {}
 
     def segment(self, frame_bgr: np.ndarray) -> SegmentationResult:
         shape = frame_bgr.shape[:2] if frame_bgr.ndim >= 2 else (1, 1)
@@ -82,12 +88,23 @@ class RknnLaneSegmenter:
         if not self._ensure_runtime():
             return self._empty(shape, "runtime_unavailable")
 
+        started = time.perf_counter()
         input_tensor, letterbox = self._preprocess(frame_bgr)
+        preprocessed = time.perf_counter()
         try:
             outputs = self._rknn.inference(inputs=[input_tensor])
+            inferred = time.perf_counter()
             if outputs is None:
                 raise RuntimeError("RKNN inference returned no outputs")
-            return self.postprocess(outputs, letterbox)
+            result = self.postprocess(outputs, letterbox)
+            finished = time.perf_counter()
+            self.last_timing = {
+                "preprocess_ms": (preprocessed - started) * 1000.0,
+                "inference_ms": (inferred - preprocessed) * 1000.0,
+                "postprocess_ms": (finished - inferred) * 1000.0,
+                "total_ms": (finished - started) * 1000.0,
+            }
+            return result
         except Exception as error:
             self._warn_once("inference", f"RKNN lane segmentation failed: {error}")
             return self._empty(shape, "inference_error")
@@ -104,6 +121,9 @@ class RknnLaneSegmenter:
     def _ensure_runtime(self) -> bool:
         if self._runtime_ready:
             return True
+        if self.runtime_backend != "lite2":
+            self._warn_once("backend", f"Unsupported RKNN runtime backend: {self.runtime_backend}")
+            return False
         try:
             from rknnlite.api import RKNNLite  # type: ignore
         except ImportError:
@@ -137,11 +157,12 @@ class RknnLaneSegmenter:
         resized_width = int(round(width * scale))
         resized_height = int(round(height * scale))
         resized = cv2.resize(frame_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
+        canvas = self._canvas
+        canvas.fill(114)
         pad_x = (self.input_width - resized_width) // 2
         pad_y = (self.input_height - resized_height) // 2
         canvas[pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB, dst=self._rgb_canvas)
         return rgb[None, ...], LetterboxInfo(
             scale, pad_x, pad_y, resized_width, resized_height, width, height
         )
@@ -157,8 +178,12 @@ class RknnLaneSegmenter:
             batch, _, height, width = box_cls.shape
             box_cls = box_cls.reshape(batch, 3, 6, height, width).transpose(0, 1, 3, 4, 2)
             coeff = coeff.reshape(batch, 3, 32, height, width).transpose(0, 1, 3, 4, 2)
-            gy, gx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
-            grid = np.stack((gx, gy), axis=-1)[None, None].astype(np.float32) - 0.5
+            grid_key = (height, width)
+            grid = self._grids.get(grid_key)
+            if grid is None:
+                gy, gx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+                grid = np.stack((gx, gy), axis=-1)[None, None].astype(np.float32) - 0.5
+                self._grids[grid_key] = grid
             xy = (box_cls[..., :2] * 2.0 + grid) * STRIDES[level]
             wh = (box_cls[..., 2:4] * 2.0) ** 2 * ANCHORS[level][None, :, None, None]
             values = np.concatenate((xy, wh, box_cls[..., 4:6], coeff), axis=-1)

@@ -310,6 +310,22 @@ python3 main.py --mode camera --bridge serial
 
 正常启动时终端会输出 `RKNN lane segmenter loaded`。调试窗口在 ROI 内半透明显示 `track` mask，并显示 `track: ok conf=...`。加载或推理失败不会静默回退到 HSV，而会输出一次明确告警并按丢线处理。默认不会保存视频或截图。
 
+### RKNN 性能测试与核分配
+
+RK3588 上不要假设固定核分配一定最优。项目提供独立 benchmark，可在不修改主配置的情况下比较单核、组合核、多实例和目标检测抽帧策略：
+
+```bash
+python3 tools/benchmark_rknn.py \
+  --video outputs/video/record_20260708_135111.mp4 \
+  --output outputs/benchmark/rknn_benchmark.json
+```
+
+快速筛选可增加 `--scout`，单模型核缩放测试可增加 `--single-models --scout`。正式测试默认预热 200 帧、每种策略运行 120 秒并重复 3 次，同时记录 FPS、P50/P95/P99 延迟、结果帧龄、NPU 负载、频率和温度。
+
+当前板端正式测试的最佳低延迟策略为三个车道分割实例分别绑定 `NPU_CORE_0/1/2`，目标检测绑定 `NPU_CORE_1` 并设置 `inference_stride: 2`。在固定测试视频上，未优化基线为 `72.558 FPS / 51.324 ms lane P95`，最佳方案为 `92.787 FPS / 45.083 ms lane P95`，吞吐提升约 `27.9%`。该结果应在模型、Runtime 或视频输入变化后重新测试。
+
+Windows 端可使用 `tools/run_orangepi_benchmark.ps1 -Scout` 通过专用 SSH 密钥启动板端测试并拉回 JSON/CSV。benchmark 不读取或修改板端 `config/config.yaml`。
+
 ## 如何对接 TC264
 
 1. TC264 已经实现底层闭环，本项目只输出高层目标量；

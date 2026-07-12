@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Any, Dict, Sequence
 
 import cv2
@@ -44,6 +45,7 @@ class RknnObjectDetector:
             )
         ]
         self.class_agnostic_nms = bool(config.get("class_agnostic_nms", False))
+        self.runtime_backend = str(config.get("runtime_backend", "lite2")).lower()
         self.core_mask_name = str(config.get("core_mask", "NPU_CORE_0_1_2"))
 
         self._rknn: Any = None
@@ -52,6 +54,9 @@ class RknnObjectDetector:
         self._warned_unavailable = False
         self._warned_postprocess = False
         self._warned_class_count = False
+        self.last_timing: dict[str, float] = {}
+        self._canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
+        self._rgb_canvas = np.empty_like(self._canvas)
 
     def detect(self, frame_bgr: np.ndarray) -> list[DetectedObject]:
         if not self.enabled:
@@ -61,12 +66,22 @@ class RknnObjectDetector:
         if not self._ensure_runtime():
             return []
 
+        started = time.perf_counter()
         input_tensor, letterbox = self._preprocess(frame_bgr)
+        preprocessed = time.perf_counter()
         outputs = self._rknn.inference(inputs=[input_tensor])
+        inferred = time.perf_counter()
         if outputs is None:
             return []
 
         detections = self._postprocess(outputs, letterbox, frame_bgr.shape[:2])
+        finished = time.perf_counter()
+        self.last_timing = {
+            "preprocess_ms": (preprocessed - started) * 1000.0,
+            "inference_ms": (inferred - preprocessed) * 1000.0,
+            "postprocess_ms": (finished - inferred) * 1000.0,
+            "total_ms": (finished - started) * 1000.0,
+        }
         if len(detections) > self.max_detections:
             detections = detections[: self.max_detections]
         return detections
@@ -84,6 +99,9 @@ class RknnObjectDetector:
         if self._runtime_ready:
             return True
 
+        if self.runtime_backend != "lite2":
+            self._warn_once(f"Unsupported RKNN runtime backend: {self.runtime_backend}")
+            return False
         try:
             from rknnlite.api import RKNNLite  # type: ignore
         except ImportError:
@@ -126,12 +144,12 @@ class RknnObjectDetector:
     def _preprocess(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
         resized, info = self._letterbox(frame_bgr)
         if self.input_color == "rgb":
-            resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB, dst=self._rgb_canvas)
 
         if self.input_dtype == "float32":
             tensor = resized.astype(np.float32) / 255.0
         else:
-            tensor = resized.astype(np.uint8)
+            tensor = resized if resized.dtype == np.uint8 else resized.astype(np.uint8)
 
         if self.input_layout == "nchw":
             tensor = np.transpose(tensor, (2, 0, 1))
@@ -145,7 +163,8 @@ class RknnObjectDetector:
         new_height = int(round(frame_height * scale))
         resized = cv2.resize(frame_bgr, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
 
-        canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
+        canvas = self._canvas
+        canvas.fill(114)
         pad_x = (self.input_width - new_width) // 2
         pad_y = (self.input_height - new_height) // 2
         canvas[pad_y : pad_y + new_height, pad_x : pad_x + new_width] = resized
