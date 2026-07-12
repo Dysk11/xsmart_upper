@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -29,6 +29,11 @@ class ForkLaneResult:
     left_points: List[Tuple[int, int]]
     right_points: List[Tuple[int, int]]
     reason: str
+    left_detected: bool = False
+    right_detected: bool = False
+    left_corner: Tuple[int, int] | None = None
+    right_corner: Tuple[int, int] | None = None
+    confirm_frames: int = 0
 
 
 @dataclass
@@ -48,6 +53,10 @@ class LaneDetectionResult:
     valid_row_count: int
     fit_point_count: int
     fork_result: ForkLaneResult
+    left_boundary_points: List[Tuple[int, int]] = field(default_factory=list)
+    right_boundary_points: List[Tuple[int, int]] = field(default_factory=list)
+    left_lost_rows: int = 0
+    right_lost_rows: int = 0
     segmentation_confidence: float = 0.0
     segmentation_status: str = "legacy"
 
@@ -84,6 +93,16 @@ class RouteComponentSelection:
 
     selected_components: List[LaneComponent]
     fork_result: ForkLaneResult
+
+
+ARTICLE_ROW_WEIGHTS = np.asarray(
+    [0] * 46
+    + [2] * 5 + [4] * 5 + [5] * 7 + [6] * 6 + [8] + [9] * 3
+    + [10] * 8 + [9] * 4 + [8] * 2 + [7] * 3
+    + [6, 7, 7, 7, 6, 6, 6, 6, 6, 5]
+    + [5, 5, 5, 5, 4, 4, 3, 3, 3, 3] + [0] * 10,
+    dtype=np.float32,
+)
 
 
 class LaneDetector:
@@ -175,6 +194,25 @@ class LaneDetector:
         self.last_fit_coeffs: Optional[np.ndarray] = None
         self.last_lane_width_px = self.default_lane_width_px
         self.last_centerline_points: List[Tuple[int, int]] = []
+        boundary_config = config.get("boundary", {})
+        fork_config = config.get("fork", {})
+        temporal_config = config.get("temporal_filter", {})
+        self.gradient_jump_ratio = float(boundary_config.get("gradient_jump_ratio", 0.05))
+        self.gradient_step_ratio = float(boundary_config.get("gradient_step_ratio", 0.025))
+        self.max_single_side_gap_rows = int(boundary_config.get("max_single_side_gap_rows", 12))
+        self.min_run_width_px = int(boundary_config.get("min_run_width_px", 6))
+        self.fork_corner_span_rows = int(fork_config.get("corner_span_rows", 10))
+        self.fork_outward_jump_ratio = float(fork_config.get("outward_jump_ratio", 0.08))
+        self.fork_min_lost_rows = int(fork_config.get("min_lost_rows", 3))
+        self.fork_confirm_frames = max(1, int(fork_config.get("confirm_frames", 2)))
+        self.fork_release_frames = max(1, int(fork_config.get("release_frames", 3)))
+        self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
+        if len(self.temporal_weights) != 3 or sum(self.temporal_weights) <= 0:
+            self.temporal_weights = (0.20, 0.50, 0.30)
+        self._weighted_center_history: List[float] = []
+        self._left_fork_hits = self._right_fork_hits = 0
+        self._left_fork_misses = self._right_fork_misses = 0
+        self._left_fork_active = self._right_fork_active = False
 
     def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
@@ -209,6 +247,13 @@ class LaneDetector:
         if roi_mask.ndim == 3:
             roi_mask = cv2.cvtColor(roi_mask, cv2.COLOR_BGR2GRAY)
         mask = np.where(roi_mask > 0, 255, 0).astype(np.uint8)
+        return self._detect_from_boundaries(
+            mask,
+            segmentation_confidence=segmentation_confidence,
+            segmentation_status=segmentation_status,
+        )
+
+        # Legacy connected-component implementation is intentionally unreachable.
         # 先提取所有可用蓝色连通域，再从中选出“沿地面连续前进”的主链条。
         labels, candidate_components = self._extract_candidate_components(mask)
         branch_result = self._select_components_for_route(
@@ -275,6 +320,242 @@ class LaneDetector:
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
         )
+
+    def _detect_from_boundaries(
+        self,
+        mask: np.ndarray,
+        segmentation_confidence: float,
+        segmentation_status: str,
+    ) -> LaneDetectionResult:
+        """Build the driving centerline directly from row-wise track boundaries."""
+
+        (
+            left_points,
+            right_points,
+            raw_centers,
+            left_lost,
+            right_lost,
+            selected_mask,
+            left_branch_rows,
+            right_branch_rows,
+        ) = self._extract_row_boundaries(mask)
+        centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
+        fit_coeffs = self._fit_centerline(centerline_points)
+        widths = [right[0] - left[0] for left, right in zip(left_points, right_points) if right[0] > left[0]]
+        lane_width_px = float(np.median(widths)) if widths else self.last_lane_width_px
+        lateral_error_px, heading_error_deg, curvature = self._article_metrics(
+            centerline_points, fit_coeffs, mask.shape
+        )
+        fork_result = self._geometric_fork_result(
+            left_points,
+            right_points,
+            left_lost,
+            right_lost,
+            left_branch_rows,
+            right_branch_rows,
+            mask.shape,
+        )
+        confidence = self._estimate_confidence(
+            selected_mask,
+            centerline_points,
+            fit_coeffs,
+            lane_width_px,
+        )
+        is_lane_lost = len(centerline_points) < max(2, self.min_valid_points // 2) or confidence < self.lost_threshold
+        if not is_lane_lost and centerline_points:
+            self.last_fit_coeffs = fit_coeffs
+            self.last_lane_width_px = lane_width_px
+            self.last_centerline_points = centerline_points
+
+        return LaneDetectionResult(
+            centerline_points=centerline_points,
+            lateral_error_px=lateral_error_px,
+            heading_error_deg=heading_error_deg,
+            curvature=curvature,
+            confidence=confidence,
+            is_lane_lost=is_lane_lost,
+            mask=mask,
+            filtered_mask=selected_mask,
+            fit_coeffs=fit_coeffs,
+            lane_width_px=lane_width_px,
+            valid_row_count=len(raw_centers),
+            fit_point_count=len(centerline_points),
+            fork_result=fork_result,
+            left_boundary_points=left_points,
+            right_boundary_points=right_points,
+            left_lost_rows=sum(left_lost),
+            right_lost_rows=sum(right_lost),
+            segmentation_confidence=segmentation_confidence,
+            segmentation_status=segmentation_status,
+        )
+
+    def _extract_row_boundaries(self, mask: np.ndarray):
+        """Follow the run nearest the previous center from the vehicle upward."""
+
+        height, width = mask.shape[:2]
+        selected_mask = np.zeros_like(mask)
+        prior_center = float(self.last_centerline_points[0][0]) if self.last_centerline_points else width * 0.5
+        prior_width = max(float(self.last_lane_width_px), float(self.min_run_width_px))
+        rows: list[tuple[int, int, int, bool, bool]] = []
+        left_branch_rows: list[tuple[int, int]] = []
+        right_branch_rows: list[tuple[int, int]] = []
+        single_side_gap = 0
+
+        for y in range(height - 1, -1, -1):
+            xs = np.flatnonzero(mask[y] > 0)
+            runs: list[tuple[int, int]] = []
+            if xs.size:
+                starts = np.r_[0, np.flatnonzero(np.diff(xs) > 1) + 1]
+                ends = np.r_[starts[1:] - 1, xs.size - 1]
+                runs = [(int(xs[s]), int(xs[e])) for s, e in zip(starts, ends) if xs[e] - xs[s] + 1 >= self.min_run_width_px]
+            if not runs:
+                single_side_gap += 1
+                if single_side_gap <= self.max_single_side_gap_rows and rows:
+                    last_left, last_right = rows[-1][1], rows[-1][2]
+                    rows.append((y, last_left, last_right, True, True))
+                continue
+
+            single_side_gap = 0
+            centers = [0.5 * (left + right) for left, right in runs]
+            chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
+            left, right = runs[chosen_index]
+            for index, (candidate_left, candidate_right) in enumerate(runs):
+                if index == chosen_index:
+                    continue
+                candidate_center = 0.5 * (candidate_left + candidate_right)
+                if candidate_center < prior_center:
+                    left_branch_rows.append((int(candidate_center), y))
+                else:
+                    right_branch_rows.append((int(candidate_center), y))
+
+            left_missing = left <= 1
+            right_missing = right >= width - 2
+            if left_missing and not right_missing:
+                left = max(0, int(round(right - prior_width)))
+            elif right_missing and not left_missing:
+                right = min(width - 1, int(round(left + prior_width)))
+            rows.append((y, left, right, left_missing, right_missing))
+            selected_mask[y, left : right + 1] = 255
+            prior_center = 0.65 * prior_center + 0.35 * (0.5 * (left + right))
+            prior_width = 0.8 * prior_width + 0.2 * max(1, right - left)
+
+        left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
+        right_points = [(right, y) for y, _left, right, _ll, _rl in rows]
+        centers = [(int(round((left + right) * 0.5)), y) for y, left, right, _ll, _rl in rows]
+        left_lost = [left_lost for _y, _left, _right, left_lost, _right_lost in rows]
+        right_lost = [right_lost for _y, _left, _right, _left_lost, right_lost in rows]
+        return left_points, right_points, centers, left_lost, right_lost, selected_mask, left_branch_rows, right_branch_rows
+
+    def _smooth_article_centerline(
+        self, raw_points: Sequence[Tuple[int, int]], width: int
+    ) -> List[Tuple[int, int]]:
+        if not raw_points:
+            return []
+        jump = max(1.0, width * self.gradient_jump_ratio)
+        step = max(1.0, width * self.gradient_step_ratio)
+        limited: list[tuple[float, int]] = []
+        previous_x = float(raw_points[0][0])
+        for x, y in raw_points:
+            current_x = float(x)
+            delta = current_x - previous_x
+            if abs(delta) > jump:
+                current_x = previous_x + math.copysign(step, delta)
+            limited.append((current_x, y))
+            previous_x = current_x
+        smoothed: list[tuple[int, int]] = []
+        for index, (_x, y) in enumerate(limited):
+            start = max(0, index - 2)
+            end = min(len(limited), index + 3)
+            mean_x = sum(item[0] for item in limited[start:end]) / float(end - start)
+            if index % max(1, self.scan_step) == 0:
+                smoothed.append((int(round(mean_x)), y))
+        return smoothed
+
+    def _article_metrics(self, centerline_points, fit_coeffs, shape):
+        height, width = shape[:2]
+        if not centerline_points:
+            return 0.0, 0.0, 0.0
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for x, y in centerline_points:
+            index = int(round((y / max(1, height - 1)) * (len(ARTICLE_ROW_WEIGHTS) - 1)))
+            weight = float(ARTICLE_ROW_WEIGHTS[index])
+            weighted_sum += float(x) * weight
+            weight_sum += weight
+        weighted_center = weighted_sum / weight_sum if weight_sum > 0 else float(centerline_points[0][0])
+        self._weighted_center_history.append(weighted_center)
+        self._weighted_center_history = self._weighted_center_history[-3:]
+        if len(self._weighted_center_history) == 3:
+            weights = self.temporal_weights
+            total = sum(weights)
+            weighted_center = sum(value * weight for value, weight in zip(self._weighted_center_history, weights)) / total
+        ordered = sorted(centerline_points, key=lambda point: point[1], reverse=True)
+        bottom_x, bottom_y = ordered[0]
+        lookahead_index = min(len(ordered) - 1, max(1, int(len(ordered) * self.lookahead_ratio)))
+        lookahead_x, lookahead_y = ordered[lookahead_index]
+        heading = math.degrees(math.atan2(lookahead_x - bottom_x, max(1, bottom_y - lookahead_y)))
+        return float(weighted_center - width * 0.5), float(heading), float(compute_curvature(fit_coeffs, bottom_y))
+
+    def _geometric_fork_result(
+        self, left_points, right_points, left_lost, right_lost,
+        left_branch_rows, right_branch_rows, shape,
+    ) -> ForkLaneResult:
+        height, width = shape[:2]
+        span = max(2, self.fork_corner_span_rows)
+        threshold = max(6.0, width * self.fork_outward_jump_ratio)
+
+        def outward_corner(points, side):
+            for index in range(span, len(points) - span):
+                x, y = points[index]
+                near_x = points[index - span][0]
+                far_x = points[index + span][0]
+                outward = (x < near_x - threshold and x <= far_x + threshold * 0.5) if side == "left" else (x > near_x + threshold and x >= far_x - threshold * 0.5)
+                if outward and y < int(height * 0.8):
+                    return (x, y)
+            return None
+
+        left_corner = outward_corner(left_points, "left")
+        right_corner = outward_corner(right_points, "right")
+        min_branch_rows = max(3, self.fork_min_lost_rows)
+        left_raw = len(left_branch_rows) >= min_branch_rows or (
+            left_corner is not None and sum(left_lost) >= self.fork_min_lost_rows
+        )
+        right_raw = len(right_branch_rows) >= min_branch_rows or (
+            right_corner is not None and sum(right_lost) >= self.fork_min_lost_rows
+        )
+        self._left_fork_active, self._left_fork_hits, self._left_fork_misses = self._debounce_fork(
+            left_raw, self._left_fork_active, self._left_fork_hits, self._left_fork_misses
+        )
+        self._right_fork_active, self._right_fork_hits, self._right_fork_misses = self._debounce_fork(
+            right_raw, self._right_fork_active, self._right_fork_hits, self._right_fork_misses
+        )
+        reason = f"geometry left={self._left_fork_active} right={self._right_fork_active}"
+        return ForkLaneResult(
+            fork_detected=self._left_fork_active or self._right_fork_active,
+            requested_direction=None,
+            selected_direction=None,
+            left_points=list(left_branch_rows),
+            right_points=list(right_branch_rows),
+            reason=reason,
+            left_detected=self._left_fork_active,
+            right_detected=self._right_fork_active,
+            left_corner=left_corner,
+            right_corner=right_corner,
+            confirm_frames=max(self._left_fork_hits, self._right_fork_hits),
+        )
+
+    def _debounce_fork(self, raw, active, hits, misses):
+        if raw:
+            hits += 1
+            misses = 0
+            if hits >= self.fork_confirm_frames:
+                active = True
+        else:
+            hits = 0
+            misses += 1
+            if misses >= self.fork_release_frames:
+                active = False
+        return active, hits, misses
 
     def _segment_lane(self, roi_frame: np.ndarray) -> np.ndarray:
         """根据颜色空间阈值提取蓝色航道候选区域。

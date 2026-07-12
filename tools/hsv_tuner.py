@@ -18,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.camera import CameraReader
-from core.preprocess import ImagePreprocessor, PreprocessResult
 from utils.image_utils import draw_text_lines, ensure_bgr, overlay_mask, stack_images
 
 
@@ -144,7 +143,7 @@ class HsvTunerApp:
         self.config = copy.deepcopy(config)
         self.config_path = config_path
         self.camera = CameraReader(self.config.get("camera", {}))
-        self.base_preprocess_config = copy.deepcopy(self.config.get("preprocess", {}))
+        self.base_roi_config = copy.deepcopy(self.config.get("lane_geometry", {}).get("roi", {}))
         self.visualizer_config = copy.deepcopy(self.config.get("visualizer", {}))
         self.font_path = str(self.visualizer_config.get("font_path", ""))
         self.font_size = int(self.visualizer_config.get("font_size", 22))
@@ -174,10 +173,9 @@ class HsvTunerApp:
                 continue
 
             state = self._read_trackbar_state()
-            preprocessor = self._build_preprocessor(state)
-            preprocess_result = preprocessor.process(frame)
-            raw_mask, filtered_mask = self._build_masks(preprocess_result.roi_frame, state)
-            canvas = self._build_canvas(preprocess_result, raw_mask, filtered_mask, state)
+            roi_frame, roi_rect = self._crop_roi(frame, state)
+            raw_mask, filtered_mask = self._build_masks(roi_frame, state)
+            canvas = self._build_canvas(frame, roi_rect, raw_mask, filtered_mask, state)
 
             cv2.imshow(PREVIEW_WINDOW_NAME, canvas)
             key = cv2.waitKey(1) & 0xFF
@@ -221,7 +219,7 @@ class HsvTunerApp:
         hsv_config = detector_config.get("hsv", {})
         morphology_config = detector_config.get("morphology", {})
         component_config = detector_config.get("connected_components", {})
-        roi_config = self.base_preprocess_config.get("roi", {})
+        roi_config = self.base_roi_config
 
         lower = hsv_config.get("lower", [85, 70, 40])
         upper = hsv_config.get("upper", [140, 255, 255])
@@ -322,19 +320,23 @@ class HsvTunerApp:
             min_height=min_height,
         )
 
-    def _build_preprocessor(self, state: TrackbarState) -> ImagePreprocessor:
+    def _crop_roi(self, frame: np.ndarray, state: TrackbarState):
         """基于当前滑块状态动态生成预处理器。
 
         输入:
             state: 当前滑块参数状态。
 
         输出:
-            返回一个新的 ImagePreprocessor，用于当前帧处理。
+            返回当前帧 ROI 和其矩形。
         """
 
-        preprocess_config = copy.deepcopy(self.base_preprocess_config)
-        preprocess_config.setdefault("roi", {})["top_ratio"] = state.roi_top_ratio
-        return ImagePreprocessor(preprocess_config)
+        height, width = frame.shape[:2]
+        config = self.base_roi_config
+        x1 = max(0, min(width - 1, int(width * float(config.get("left_ratio", 0.05)))))
+        x2 = max(x1 + 1, min(width, int(width * float(config.get("right_ratio", 0.95)))))
+        y1 = max(0, min(height - 1, int(height * state.roi_top_ratio)))
+        y2 = max(y1 + 1, min(height, int(height * float(config.get("bottom_ratio", 1.0)))))
+        return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
 
     def _build_masks(
         self,
@@ -397,7 +399,8 @@ class HsvTunerApp:
 
     def _build_canvas(
         self,
-        preprocess_result: PreprocessResult,
+        frame: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
         raw_mask: np.ndarray,
         filtered_mask: np.ndarray,
         state: TrackbarState,
@@ -405,7 +408,7 @@ class HsvTunerApp:
         """构建调参工具的双画面预览。
 
         输入:
-            preprocess_result: 当前帧预处理结果。
+            frame: 当前原始帧。
             raw_mask: 当前 HSV 阈值得到的原始掩膜。
             filtered_mask: 筛选后的主航道掩膜。
             state: 当前滑块参数状态。
@@ -414,8 +417,8 @@ class HsvTunerApp:
             返回拼接好的预览画面。
         """
 
-        x1, y1, x2, y2 = preprocess_result.roi_rect
-        original_panel = preprocess_result.resized_frame.copy()
+        x1, y1, x2, y2 = roi_rect
+        original_panel = frame.copy()
         cv2.rectangle(original_panel, (x1, y1), (x2, y2), (0, 255, 255), 2)
         original_panel = draw_text_lines(
             original_panel,
@@ -440,8 +443,8 @@ class HsvTunerApp:
             font_size=self.font_size,
         )
 
-        cell_width = max(360, preprocess_result.resized_frame.shape[1] // 2)
-        cell_height = max(220, preprocess_result.resized_frame.shape[0] // 2)
+        cell_width = max(360, frame.shape[1] // 2)
+        cell_height = max(220, frame.shape[0] // 2)
         return stack_images(
             [original_panel, filtered_panel],
             cols=2,
@@ -459,7 +462,7 @@ class HsvTunerApp:
         """
 
         snippet = {
-            "preprocess": {
+            "lane_geometry": {
                 "roi": {
                     "top_ratio": round(state.roi_top_ratio, 3),
                 }

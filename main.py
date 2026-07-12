@@ -32,13 +32,11 @@ from core.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.camera import CameraReader
 from core.avoidance_target_planner import AvoidanceTargetPlanner, AvoidanceTargetResult
 from core.blocking_analyzer import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
-from core.fork_route_planner import ForkRoutePlanner, ForkRouteResult
 from core.gold_target_planner import GoldTargetPlanner, GoldTargetResult
 from core.lane_detector import LaneDetectionResult, LaneDetector
 from core.lane_tracker import LaneTracker, TrackedLaneState
 from core.logger import CsvLogger
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
-from core.preprocess import ImagePreprocessor, PreprocessResult
 from core.rknn_object_detector import RknnObjectDetector
 from core.rknn_lane_segmenter import RknnLaneSegmenter, SegmentationResult
 from core.target_selector import TargetPointResult, TargetSelector
@@ -47,7 +45,7 @@ from utils.fps import FPSCounter
 
 
 SHARED_ARRAY_MARKER = "__xsmart_shared_array__"
-SHARED_PREPROCESS_MARKER = "__xsmart_shared_preprocess__"
+SHARED_FRAME_MARKER = "__xsmart_shared_frame__"
 
 
 class SharedArrayPool:
@@ -203,58 +201,38 @@ def _release_shared_payload(value: Any, pools: Dict[str, SharedArrayPool] | None
             _release_shared_payload(nested, pools)
 
 
-def _share_preprocess_result(
-    preprocess_result: PreprocessResult,
-    resized_pool: SharedArrayPool,
-    roi_pool: SharedArrayPool,
+def _share_ui_frame(
+    frame: np.ndarray,
+    roi_rect: tuple[int, int, int, int],
+    frame_pool: SharedArrayPool,
 ) -> Dict[str, Any] | None:
-    """Move PreprocessResult images into shared memory while preserving metadata."""
+    """Move the camera frame into shared memory with ROI metadata."""
 
     descriptor: Dict[str, Any] = {
-        SHARED_PREPROCESS_MARKER: True,
-        "roi_rect": preprocess_result.roi_rect,
+        SHARED_FRAME_MARKER: True,
+        "roi_rect": roi_rect,
     }
     try:
-        descriptor["resized_frame"] = resized_pool.write(preprocess_result.resized_frame)
-        descriptor["roi_frame"] = roi_pool.write(preprocess_result.roi_frame)
-        if descriptor["resized_frame"] is None or descriptor["roi_frame"] is None:
-            _release_shared_payload(
-                descriptor,
-                {
-                    resized_pool.pool_id: resized_pool,
-                    roi_pool.pool_id: roi_pool,
-                },
-            )
+        descriptor["frame"] = frame_pool.write(frame)
+        if descriptor["frame"] is None:
+            _release_shared_payload(descriptor, {frame_pool.pool_id: frame_pool})
             return None
         return descriptor
     except Exception:
-        _release_shared_payload(
-            descriptor,
-            {
-                resized_pool.pool_id: resized_pool,
-                roi_pool.pool_id: roi_pool,
-            },
-        )
+        _release_shared_payload(descriptor, {frame_pool.pool_id: frame_pool})
         raise
 
 
-def _take_shared_preprocess_result(
+def _take_shared_ui_frame(
     descriptor: Dict[str, Any],
     ack_queues: Dict[str, Any],
-) -> PreprocessResult:
-    """Rebuild a local PreprocessResult from shared-memory image descriptors."""
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Rebuild a camera frame and its ROI metadata."""
 
     remaining = dict(descriptor)
     try:
-        resized_frame = _take_shared_ndarray(remaining.pop("resized_frame"), ack_queues)
-        roi_frame = _take_shared_ndarray(remaining.pop("roi_frame"), ack_queues)
-        return PreprocessResult(
-            original_frame=resized_frame,
-            resized_frame=resized_frame,
-            roi_raw_frame=roi_frame,
-            roi_frame=roi_frame,
-            roi_rect=tuple(descriptor["roi_rect"]),
-        )
+        frame = _take_shared_ndarray(remaining.pop("frame"), ack_queues)
+        return frame, tuple(descriptor["roi_rect"])
     except Exception:
         _ack_shared_payload(remaining, ack_queues)
         raise
@@ -389,17 +367,13 @@ def _lane_inference_worker(
 def _ui_worker(
     visualizer_config: Dict[str, Any],
     input_queue: Any,
-    resized_ack_queue: Any,
-    roi_ack_queue: Any,
+    frame_ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Render OpenCV UI and video output in an independent process."""
 
     visualizer = Visualizer(visualizer_config)
-    ack_queues = {
-        "ui_resized": resized_ack_queue,
-        "ui_roi": roi_ack_queue,
-    }
+    ack_queues = {"ui_frame": frame_ack_queue}
     try:
         while not stop_event.is_set():
             try:
@@ -411,9 +385,9 @@ def _ui_worker(
 
             try:
                 packet = dict(packet)
-                preprocess_payload = packet.get("preprocess_result")
-                if isinstance(preprocess_payload, dict) and preprocess_payload.get(SHARED_PREPROCESS_MARKER):
-                    packet["preprocess_result"] = _take_shared_preprocess_result(preprocess_payload, ack_queues)
+                frame_payload = packet.get("frame")
+                if isinstance(frame_payload, dict) and frame_payload.get(SHARED_FRAME_MARKER):
+                    packet["frame"], packet["roi_rect"] = _take_shared_ui_frame(frame_payload, ack_queues)
                 should_continue = visualizer.render(**packet)
             except Exception:
                 traceback.print_exc()
@@ -540,8 +514,9 @@ class UpperMachineApp:
         self.project_root = project_root
 
         self.camera = CameraReader(config.get("camera", {}))
-        self.preprocessor = ImagePreprocessor(config.get("preprocess", {}))
-        self.detector = LaneDetector(config.get("detector", {}))
+        self.lane_geometry_config = config.get("lane_geometry", {})
+        self.roi_config = self.lane_geometry_config.get("roi", {})
+        self.detector = LaneDetector(self.lane_geometry_config)
         lane_config = config.get("rknn_lane_segmenter", {})
         worker_core_masks = list(lane_config.get("worker_core_masks", []))
         configured_worker_count = int(lane_config.get("worker_count", len(worker_core_masks)))
@@ -556,7 +531,6 @@ class UpperMachineApp:
         self.drop_stale_ai_results = bool(ai_config.get("drop_stale_results", True))
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
-        self.fork_route_planner = ForkRoutePlanner(config.get("fork_route", {}))
         self.gold_target_planner = GoldTargetPlanner(config.get("gold_target", {}))
         self.blocking_config = config.get("blocking_analyzer", {})
         self.blocking_class_names = {
@@ -577,7 +551,7 @@ class UpperMachineApp:
         self.lane_timing_interval = max(1, int(timing_config.get("print_interval_frames", 30)))
         self.lane_timing_count = 0
         self.lane_timing_total_ms = 0.0
-        self.lane_timing_preprocess_ms = 0.0
+        self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
         self.lane_timing_max_ms = 0.0
@@ -586,7 +560,6 @@ class UpperMachineApp:
         self.last_avoidance_result: AvoidanceTargetResult | None = None
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
-        self.last_fork_result: ForkRouteResult | None = None
         self.frame_id = 0
 
         self.mp_context = mp.get_context("spawn")
@@ -605,15 +578,12 @@ class UpperMachineApp:
         self.last_segmentation_frame_id = -1
         self.last_segmentation_captured_at = 0.0
         self.last_ai_frame_id = -1
-        self.ui_resized_ack_queue = self.mp_context.Queue()
-        self.ui_roi_ack_queue = self.mp_context.Queue()
+        self.ui_frame_ack_queue = self.mp_context.Queue()
         self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
-        self.ui_resized_pool = SharedArrayPool("ui_resized", self.ui_resized_ack_queue)
-        self.ui_roi_pool = SharedArrayPool("ui_roi", self.ui_roi_ack_queue)
+        self.ui_frame_pool = SharedArrayPool("ui_frame", self.ui_frame_ack_queue)
         self.shared_pools = {
             self.ai_frame_pool.pool_id: self.ai_frame_pool,
-            self.ui_resized_pool.pool_id: self.ui_resized_pool,
-            self.ui_roi_pool.pool_id: self.ui_roi_pool,
+            self.ui_frame_pool.pool_id: self.ui_frame_pool,
         }
         if self.lane_parallel_enabled:
             for worker_index, core_mask in enumerate(worker_core_masks):
@@ -650,8 +620,7 @@ class UpperMachineApp:
             args=(
                 config.get("visualizer", {}),
                 self.ui_queue,
-                self.ui_resized_ack_queue,
-                self.ui_roi_ack_queue,
+                self.ui_frame_ack_queue,
                 self.stop_event,
             ),
             name="xsmart-ui",
@@ -695,12 +664,12 @@ class UpperMachineApp:
             # 第 1 步：先预处理，再用 YOLO 读取 coin、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
             captured_at = lane_start_time
-            preprocess_result = self.preprocessor.process(frame)
-            lane_preprocess_time = time.perf_counter()
+            roi_rect = self._compute_roi_rect(frame)
+            lane_roi_time = time.perf_counter()
             self.frame_id += 1
             ai_frame_payload = None
             if self.frame_id % self.ai_inference_stride == 0:
-                ai_frame_payload = self.ai_frame_pool.write(preprocess_result.resized_frame)
+                ai_frame_payload = self.ai_frame_pool.write(frame)
             if ai_frame_payload is not None:
                 _put_latest(
                     self.ai_input_queue,
@@ -716,44 +685,37 @@ class UpperMachineApp:
                 ):
                     self.last_ai_frame_id = int(ai_frame_id)
                     self.last_detected_objects = detected_objects
-            self.last_fork_result = self.fork_route_planner.update(self.last_detected_objects)
-
-            # 第 2 步：在 ROI 中找蓝色航道，并根据已锁定的岔路方向选左/右分支。
-            segmentation_result = self._segment_lane(preprocess_result.resized_frame, captured_at)
-            roi_x1, roi_y1, roi_x2, roi_y2 = preprocess_result.roi_rect
+            segmentation_result = self._segment_lane(frame, captured_at)
+            roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             detection_result = self.detector.detect_from_mask(
                 roi_mask,
-                route_direction=self.last_fork_result.requested_direction,
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
             )
             lane_detect_time = time.perf_counter()
-            self.last_fork_result = self.fork_route_planner.update(
-                self.last_detected_objects,
-                fork_detected=detection_result.fork_result.fork_detected,
-            )
 
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
             tracked_state = self.tracker.update(
                 detection_result,
-                prefer_current=detection_result.fork_result.selected_direction is not None,
+                prefer_current=False,
             )
             lane_track_time = time.perf_counter()
             self._record_lane_timing(
                 total_ms=(lane_track_time - lane_start_time) * 1000.0,
-                preprocess_ms=(lane_preprocess_time - lane_start_time) * 1000.0,
-                detect_ms=(lane_detect_time - lane_preprocess_time) * 1000.0,
+                roi_ms=(lane_roi_time - lane_start_time) * 1000.0,
+                detect_ms=(lane_detect_time - lane_roi_time) * 1000.0,
                 track_ms=(lane_track_time - lane_detect_time) * 1000.0,
             )
             planning_state = self._build_planning_state(
-                preprocess_result=preprocess_result,
+                roi_rect=roi_rect,
                 detection_result=detection_result,
                 tracked_state=tracked_state,
             )
             # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
             module_hints = self._collect_future_module_hints(
-                preprocess_result=preprocess_result,
+                frame=frame,
+                roi_rect=roi_rect,
                 detection_result=detection_result,
                 tracked_state=planning_state,
             )
@@ -780,19 +742,16 @@ class UpperMachineApp:
             )
 
             # 第 8 步：显示调试画面，看掩膜、中心线、误差和控制量是否正常。
-            ui_preprocess_payload = None
+            ui_frame_payload = None
             should_render_ui = self.ui_active and self.frame_id % self.ui_frame_stride == 0
             if should_render_ui:
-                ui_preprocess_payload = _share_preprocess_result(
-                    preprocess_result,
-                    resized_pool=self.ui_resized_pool,
-                    roi_pool=self.ui_roi_pool,
-                )
-            if should_render_ui and ui_preprocess_payload is not None:
+                ui_frame_payload = _share_ui_frame(frame, roi_rect, self.ui_frame_pool)
+            if should_render_ui and ui_frame_payload is not None:
                 _put_latest(
                     self.ui_queue,
                     {
-                        "preprocess_result": ui_preprocess_payload,
+                        "frame": ui_frame_payload,
+                        "roi_rect": roi_rect,
                         "detection_result": detection_result,
                         "tracked_state": planning_state,
                         "control_command": control_command,
@@ -802,10 +761,23 @@ class UpperMachineApp:
                         "avoidance_result": self.last_avoidance_result,
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
-                        "fork_route_result": self.last_fork_result,
                     },
                     release_func=self._release_owned_shared_payload,
                 )
+
+    def _compute_roi_rect(self, frame: np.ndarray) -> tuple[int, int, int, int]:
+        """Convert normalized lane ROI configuration to a clipped frame rectangle."""
+
+        height, width = frame.shape[:2]
+        left = float(self.roi_config.get("left_ratio", 0.05))
+        right = float(self.roi_config.get("right_ratio", 0.95))
+        top = float(self.roi_config.get("top_ratio", 0.585))
+        bottom = float(self.roi_config.get("bottom_ratio", 1.0))
+        x1 = max(0, min(width - 1, int(round(width * left))))
+        x2 = max(x1 + 1, min(width, int(round(width * right))))
+        y1 = max(0, min(height - 1, int(round(height * top))))
+        y2 = max(y1 + 1, min(height, int(round(height * bottom))))
+        return x1, y1, x2, y2
 
     def _segment_lane(self, frame: np.ndarray, captured_at: float | None = None) -> SegmentationResult:
         """Segment synchronously or through the configured low-latency worker pool."""
@@ -872,7 +844,7 @@ class UpperMachineApp:
     def _record_lane_timing(
         self,
         total_ms: float,
-        preprocess_ms: float,
+        roi_ms: float,
         detect_ms: float,
         track_ms: float,
     ) -> None:
@@ -883,7 +855,7 @@ class UpperMachineApp:
 
         self.lane_timing_count += 1
         self.lane_timing_total_ms += total_ms
-        self.lane_timing_preprocess_ms += preprocess_ms
+        self.lane_timing_roi_ms += roi_ms
         self.lane_timing_detect_ms += detect_ms
         self.lane_timing_track_ms += track_ms
         self.lane_timing_max_ms = max(self.lane_timing_max_ms, total_ms)
@@ -896,14 +868,14 @@ class UpperMachineApp:
             "巡线耗时: "
             f"avg={self.lane_timing_total_ms / count:.2f} ms, "
             f"max={self.lane_timing_max_ms:.2f} ms, "
-            f"pre={self.lane_timing_preprocess_ms / count:.2f} ms, "
+            f"roi={self.lane_timing_roi_ms / count:.2f} ms, "
             f"detect={self.lane_timing_detect_ms / count:.2f} ms, "
             f"track={self.lane_timing_track_ms / count:.2f} ms"
         )
 
         self.lane_timing_count = 0
         self.lane_timing_total_ms = 0.0
-        self.lane_timing_preprocess_ms = 0.0
+        self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
         self.lane_timing_max_ms = 0.0
@@ -971,14 +943,16 @@ class UpperMachineApp:
 
     def _collect_future_module_hints(
         self,
-        preprocess_result: Any,
+        frame: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
         detection_result: Any,
         tracked_state: TrackedLaneState,
     ) -> ModuleHints:
         """为后续目标检测、OCR、红绿灯和金币规划模块预留提示接口。
 
         输入:
-            preprocess_result: 当前帧预处理结果，便于后续模块直接复用 ROI。
+            frame: 当前原始相机帧。
+            roi_rect: 巡线 ROI 矩形。
             detection_result: 当前帧巡线检测结果，便于其他模块参考中心线或置信度。
             tracked_state: 当前帧平滑后的巡线状态。
 
@@ -988,7 +962,8 @@ class UpperMachineApp:
             后续可在此接入红绿灯限速、OCR 区域规则、金币规划限速等高层策略。
         """
 
-        _ = preprocess_result
+        _ = frame
+        _ = roi_rect
         _ = detection_result
         _ = tracked_state
         if (
@@ -1006,7 +981,7 @@ class UpperMachineApp:
 
     def _detect_objects_for_roi(
         self,
-        preprocess_result: PreprocessResult,
+        roi_rect: tuple[int, int, int, int],
         detection_result: LaneDetectionResult,
         tracked_state: TrackedLaneState,
     ) -> list[DetectedObject]:
@@ -1023,23 +998,25 @@ class UpperMachineApp:
             obj for obj in self.last_detected_objects
             if obj.class_name.casefold() in self.blocking_class_names
         ]
-        roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
+        x1, y1, x2, y2 = roi_rect
+        roi_width, roi_height = x2 - x1, y2 - y1
         return attach_roi_bboxes(
             objects=objects_from_detector,
-            roi_rect=preprocess_result.roi_rect,
+            roi_rect=roi_rect,
             roi_width=roi_width,
             roi_height=roi_height,
         )
 
     def _build_planning_state(
         self,
-        preprocess_result: PreprocessResult,
+        roi_rect: tuple[int, int, int, int],
         detection_result: LaneDetectionResult,
         tracked_state: TrackedLaneState,
     ) -> TrackedLaneState:
         """Replace lane metrics with target-point metrics before high-level planning."""
 
-        roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
+        x1, y1, x2, y2 = roi_rect
+        roi_width, roi_height = x2 - x1, y2 - y1
         centerline_points = tracked_state.centerline_points or detection_result.centerline_points
         normal_target = self.target_selector.select(
             centerline_points=centerline_points,
@@ -1048,27 +1025,15 @@ class UpperMachineApp:
             lane_confidence=tracked_state.confidence,
             curvature=tracked_state.curvature,
         )
-        if self.last_fork_result is not None and self.last_fork_result.active:
-            gold_result = GoldTargetResult(
-                active=False,
-                target_object=None,
-                target_point_roi=(float(roi_width) * 0.5, float(max(0, roi_height - 1))),
-                final_lateral_error_px=0.0,
-                final_heading_error_deg=0.0,
-                confidence=0.0,
-                speed_limit=None,
-                reason=f"fork route active: {self.last_fork_result.requested_direction}",
-            )
-        else:
-            gold_result = self.gold_target_planner.plan(
-                objects=self.last_detected_objects,
-                roi_rect=preprocess_result.roi_rect,
-                roi_width=roi_width,
-                roi_height=roi_height,
-            )
+        gold_result = self.gold_target_planner.plan(
+            objects=self.last_detected_objects,
+            roi_rect=roi_rect,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
         self.last_gold_result = gold_result
         objects = self._detect_objects_for_roi(
-            preprocess_result=preprocess_result,
+            roi_rect=roi_rect,
             detection_result=detection_result,
             tracked_state=tracked_state,
         )

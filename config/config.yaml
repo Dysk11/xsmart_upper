@@ -22,91 +22,34 @@ camera:
   reconnect_interval_sec: 0.5
   max_reconnect_attempts: 5
 
-preprocess:
-  resize:
-    # 是否先统一缩放，方便后续参数固定。
-    enable: false
-    width: 800
-    height: 600
+lane_geometry:
   roi:
-    # ROI 用比例表示，减少分辨率变化带来的重复调参。
     top_ratio: 0.585
     bottom_ratio: 1.0
     left_ratio: 0.05
     right_ratio: 0.95
-  gaussian_blur:
-    # 轻度模糊能压掉部分噪点，但太大可能让边界发糊。
-    enable: false
-    kernel_size: 5
-    sigma_x: 0.0
-  clahe:
-    # CLAHE 用于缓解局部过曝或阴影导致的对比度问题。
-    enable: false
-    clip_limit: 2.0
-    tile_grid_size: 8
-  brightness_normalization:
-    # 亮度归一化用于降低左右光照不均的影响。
-    enable: false
-    target_mean: 150.0
-    min_gain: 0.7
-    max_gain: 1.35
-
-detector:
-  # 颜色空间可选 hsv 或 lab，现场建议都试一下再定。
-  color_space: hsv
-  hsv:
-    # 蓝色航道的 HSV 阈值。
-    lower: [94, 90, 62]
-    upper: [128, 255, 255]
-  lab:
-    # 蓝色航道的 Lab 阈值。
-    lower: [20, 120, 80]
-    upper: [255, 170, 135]
-  morphology:
-    # 开闭运算参数，用于去噪和补洞。
-    open_kernel: 1
-    close_kernel: 2
-    erode_iterations: 0
-    dilate_iterations: 1
-  connected_components:
-    # 连通域筛选参数，避免把零散小蓝块当成主航道。
-    min_area: 680
-    min_height: 21
-    max_components: 3
-    # 下面这一组参数用于“主航道链连接约束”，不是去删远处蓝色航道。
-    # 原则是：宁可停止继续往上接，也不要把墙上广告牌或航道外蓝块接进中心线。
-    min_component_chain_score: 35.0
-    short_gap_y_threshold: 24
-    short_gap_max_dx_px: 120
-    max_far_width_growth_ratio: 1.45
-    width_growth_guard_top_ratio: 0.48
-    environment_guard_top_ratio: 0.34
-    environment_guard_min_chain_length: 2
-    environment_compact_aspect_ratio_max: 2.2
-    environment_small_area_max: 4200
-    environment_small_width_ratio: 0.72
-    environment_side_penalty: 28.0
+  boundary:
+    gradient_jump_ratio: 0.05
+    gradient_step_ratio: 0.025
+    max_single_side_gap_rows: 12
+    min_run_width_px: 6
+  temporal_filter:
+    weights: [0.20, 0.50, 0.30]
   centerline:
-    # scan_step 越小点越密，效果更细，但计算量略大。
     scan_step: 4
     min_valid_points: 6
-    min_lane_width_px: 18
     default_lane_width_px: 60
-    # 这条赛道是块状蓝白航道，默认关闭单侧推中心，避免把中心线推到航道外。
-    single_side_infer_ratio: 0.55
-    enable_single_side_inference: false
-    single_side_edge_margin_px: 28
-    prediction_blend: 0.2
-    distance_weight: 0.12
-    center_bias: 0.02
     lookahead_ratio: 0.45
-    max_center_jump_px: 120
-    fit_top_extension_rows: 1
   confidence:
-    # 置信度低于 lost_threshold 时认为本帧基本不可用。
     lost_threshold: 0.22
     expected_area_ratio: 0.04
     residual_tolerance_px: 22.0
+  fork:
+    corner_span_rows: 10
+    outward_jump_ratio: 0.08
+    min_lost_rows: 3
+    confirm_frames: 2
+    release_frames: 3
 
 tracker:
   # EMA 平滑参数和短时丢线预测参数。
@@ -133,7 +76,7 @@ rknn_lane_segmenter:
   model_path: models/yolov5n_seg_track_480x640_int8_rk3588.rknn
   # 按 [width, height] 配置；模型固定输入为 RGB uint8 NHWC 640x480。
   input_size: [640, 480]
-  score_threshold: 0.25
+  score_threshold: 0.30
   nms_threshold: 0.45
   mask_threshold: 0.5
   max_instances: 1
@@ -155,7 +98,7 @@ rknn_object_detector:
   input_layout: nhwc
   input_color: rgb
   input_dtype: uint8
-  score_threshold: 0.20
+  score_threshold: 0.50
   nms_threshold: 0.45
   max_detections: 30
   runtime_backend: lite2
@@ -166,15 +109,6 @@ rknn_object_detector:
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
   # 单核运行入口；可选值：NPU_CORE_0、NPU_CORE_1、NPU_CORE_2。
   core_mask: NPU_CORE_1
-
-fork_route:
-  enabled: true
-  left_class_name: Left
-  right_class_name: Right
-  min_confidence: 0.45
-  sign_hold_frames: 90
-  clear_after_no_fork_frames: 8
-  invert_direction: false
 
 gold_target:
   enabled: true
@@ -231,7 +165,6 @@ planner:
 bridge:
   # bridge.type 选 mock 时只打印，选 serial 时走真实串口。
   type: mock
-  mode_name: LINE
   serial:
     # 这里是串口参数，后续和 TC264 联调时重点关注这一段。
     port: /dev/ttyUSB0
@@ -265,14 +198,3 @@ logger:
   # CSV 日志方便赛后分析误差和调速效果。
   enable: false
   output_dir: outputs/logs
-
-extensions:
-  # 下面这些是后续扩展模块的预留开关，当前版本还未启用。
-  target_detector:
-    enable: true
-  ocr:
-    enable: false
-  traffic_light:
-    enable: false
-  coin_planner:
-    enable: false

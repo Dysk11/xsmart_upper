@@ -11,12 +11,10 @@ import numpy as np
 
 from core.avoidance_target_planner import AvoidanceTargetResult
 from core.blocking_analyzer import BlockingAnalysisResult, DetectedObject
-from core.fork_route_planner import ForkRouteResult
 from core.gold_target_planner import GoldTargetResult
 from core.lane_detector import LaneDetectionResult
 from core.lane_tracker import TrackedLaneState
 from core.planner import ControlCommand
-from core.preprocess import PreprocessResult
 from core.target_selector import TargetPointResult
 from utils.image_utils import draw_centerline, draw_text_lines
 
@@ -53,7 +51,8 @@ class Visualizer:
 
     def render(
         self,
-        preprocess_result: PreprocessResult,
+        frame: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
         detection_result: LaneDetectionResult,
         tracked_state: TrackedLaneState,
         control_command: ControlCommand,
@@ -63,12 +62,11 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
-        fork_route_result: ForkRouteResult | None = None,
     ) -> bool:
         """生成一帧调试画面，并根据配置显示或保存。
 
         输入:
-            preprocess_result: 预处理阶段输出结果。
+            frame: 原始相机帧。
             detection_result: 当前帧检测结果。
             tracked_state: 当前帧时序平滑状态。
             control_command: 当前帧高层控制量。
@@ -79,7 +77,8 @@ class Visualizer:
         """
 
         canvas = self._build_canvas(
-            preprocess_result=preprocess_result,
+            frame=frame,
+            roi_rect=roi_rect,
             detection_result=detection_result,
             tracked_state=tracked_state,
             control_command=control_command,
@@ -89,7 +88,6 @@ class Visualizer:
             avoidance_result=avoidance_result,
             detected_objects=detected_objects,
             gold_result=gold_result,
-            fork_route_result=fork_route_result,
         )
 
         if self.save_video:
@@ -123,7 +121,8 @@ class Visualizer:
 
     def _build_canvas(
         self,
-        preprocess_result: PreprocessResult,
+        frame: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
         detection_result: LaneDetectionResult,
         tracked_state: TrackedLaneState,
         control_command: ControlCommand,
@@ -133,12 +132,11 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
-        fork_route_result: ForkRouteResult | None = None,
     ) -> np.ndarray:
         """将原图、ROI、掩膜和状态文字合成为一张调试大图。
 
         输入:
-            preprocess_result: 预处理阶段输出结果。
+            frame: 原始相机帧。
             detection_result: 当前帧检测结果。
             tracked_state: 当前帧时序平滑状态。
             control_command: 当前帧高层控制量。
@@ -148,21 +146,29 @@ class Visualizer:
             返回用于显示或保存的拼接调试图像。
         """
 
-        x1, y1, x2, y2 = preprocess_result.roi_rect
+        x1, y1, x2, y2 = roi_rect
         centerline_points = tracked_state.centerline_points or detection_result.centerline_points
 
-        original_panel = preprocess_result.resized_frame.copy()
+        original_panel = frame.copy()
         self._overlay_roi_mask(original_panel, detection_result.filtered_mask, (x1, y1, x2, y2))
         cv2.rectangle(original_panel, (x1, y1), (x2, y2), (0, 255, 255), 2)
         cv2.line(
             original_panel,
-            (preprocess_result.resized_frame.shape[1] // 2, 0),
-            (preprocess_result.resized_frame.shape[1] // 2, preprocess_result.resized_frame.shape[0] - 1),
+            (frame.shape[1] // 2, 0),
+            (frame.shape[1] // 2, frame.shape[0] - 1),
             (60, 60, 255),
             1,
         )
         original_panel = draw_centerline(original_panel, centerline_points, color=(0, 255, 0), offset=(x1, y1))
         fork_lane = detection_result.fork_result
+        original_panel = draw_centerline(
+            original_panel, detection_result.left_boundary_points,
+            color=(255, 80, 80), radius=1, thickness=1, offset=(x1, y1),
+        )
+        original_panel = draw_centerline(
+            original_panel, detection_result.right_boundary_points,
+            color=(80, 80, 255), radius=1, thickness=1, offset=(x1, y1),
+        )
         if fork_lane.left_points:
             original_panel = draw_centerline(
                 original_panel,
@@ -219,7 +225,7 @@ class Visualizer:
                 original_panel,
                 blocking_result,
                 roi_offset=(x1, y1),
-                roi_height=preprocess_result.roi_frame.shape[0],
+                roi_height=y2 - y1,
             )
         original_panel = draw_text_lines(
             original_panel,
@@ -229,7 +235,6 @@ class Visualizer:
                 control_command=control_command,
                 fps_value=fps_value,
                 gold_result=gold_result,
-                fork_route_result=fork_route_result,
                 detection_result=detection_result,
             ) or [
                 "窗口1：原始画面",
@@ -339,7 +344,6 @@ class Visualizer:
         control_command: ControlCommand,
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
-        fork_route_result: ForkRouteResult | None = None,
         detection_result: LaneDetectionResult | None = None,
     ) -> list[str]:
         if avoidance_result is None:
@@ -349,14 +353,18 @@ class Visualizer:
         fork_reason = "fork: none"
         if detection_result is not None:
             fork_lane = detection_result.fork_result
-            requested = fork_lane.requested_direction or "none"
-            selected = fork_lane.selected_direction or "none"
-            hold = fork_route_result.hold_frames_left if fork_route_result is not None else 0
-            active = fork_route_result.active if fork_route_result is not None else False
             fork_reason = (
-                f"fork: req={requested} sel={selected} active={active} "
-                f"hold={hold} {fork_lane.reason}"
+                f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
+                f"confirm={fork_lane.confirm_frames}"
             )
+        for corner, color, label in (
+            (fork_lane.left_corner, (255, 0, 255), "LF"),
+            (fork_lane.right_corner, (0, 128, 255), "RF"),
+        ):
+            if corner is not None:
+                point = (int(corner[0] + x1), int(corner[1] + y1))
+                cv2.rectangle(original_panel, (point[0] - 6, point[1] - 6), (point[0] + 6, point[1] + 6), color, 2)
+                cv2.putText(original_panel, label, (point[0] + 8, point[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
         return [
             "窗口1：原始画面",
             "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",

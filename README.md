@@ -29,7 +29,6 @@ xsmart_upper/
     config.yaml
   core/
     camera.py
-    preprocess.py
     lane_detector.py
     lane_tracker.py
     planner.py
@@ -93,63 +92,47 @@ camera:
 
 共享内存使用 16 字节原生 `QII` 头部（帧号、宽、高），后接连续 RGB888 图像。接收端会转换为项目下游统一使用的 BGR 图像。
 
-### 2. `preprocess`
+### 2. `lane_geometry`
 
-- `resize`: 缩放开关与目标尺寸
-- `roi`: ROI 区域比例，建议重点覆盖赛道中下部
-- `gaussian_blur`: 高斯模糊开关与核大小
-- `clahe`: 局部对比度增强参数
-- `brightness_normalization`: 亮度归一化开关与目标亮度
+- `roi`: 直接在相机帧上定义巡线 ROI，应覆盖赛道中下部
+- `boundary`: 逐行边界跟踪、梯度限幅和短时丢线补偿参数
+- `temporal_filter.weights`: 三帧加权滤波系数，默认 `[0.20, 0.50, 0.30]`
+- `centerline`: 中心线采样、有效点数、默认赛道宽度和前视比例
+- `confidence`: 车道置信度和丢线判定参数
+- `fork`: 左右边界拐点、外移阈值及岔路确认/释放帧数
 
-### 3. `detector`
-
-- `color_space`: 蓝色检测使用 `hsv` 或 `lab`
-- `hsv.lower` / `hsv.upper`: HSV 阈值
-- `lab.lower` / `lab.upper`: Lab 阈值
-- `morphology`: 开闭运算和腐蚀膨胀参数
-- `connected_components`: 连通域筛选参数
-- `centerline`: 分层扫描、单侧边界推断、拟合相关参数
-- `confidence`: 置信度与丢线阈值
-
-### 4. `tracker`
+### 3. `tracker`
 
 - `ema_alpha`: 常规帧平滑权重
 - `recovery_alpha`: 丢线恢复后的加速收敛权重
 - `confidence_gate`: 高置信度阈值
 - `max_prediction_frames`: 丢线时最多允许使用历史预测的帧数
 
-### 5. `planner`
+### 4. `planner`
 
 - `lateral_gain` / `heading_gain` / `curvature_gain`: 高层转向合成权重
 - `base_speed` / `max_speed` / `min_speed`: 速度策略范围
 - `straight_boost_speed`: 直道附加速度
 - `lost_speed`: 丢线时保守速度
 
-### 6. `bridge`
+### 5. `bridge`
 
 - `type`: `mock` 或 `serial`
 - `serial.port`: 串口名，例如 `/dev/ttyS4`
 - `serial.baudrate`: 波特率
 - `serial.timeout`: 串口超时
 
-### 7. `visualizer`
+### 6. `visualizer`
 
 - `show_window`: 是否显示调试窗口
 - `save_video`: 是否保存调试视频
 - `save_screenshot`: 是否允许按 `s` 保存截图
 - `save_dir`: 调试视频与截图输出目录
 
-### 8. `logger`
+### 7. `logger`
 
 - `enable`: 是否记录 CSV
 - `output_dir`: 日志输出目录
-
-### 9. `extensions`
-
-- `target_detector` / `ocr` / `traffic_light` / `coin_planner`: 预留扩展节点
-- 当前默认均为 `enable: false`
-- 后续可在 `main.py` 的 `_collect_future_module_hints()` 中接入这些模块输出
-- 扩展模块如果只想影响高层策略，建议统一转换成 `core/planner.py` 中的 `ModuleHints`
 
 ## 如何运行实时摄像头模式
 
@@ -307,7 +290,7 @@ ser.write(data)
 
 ## RKNN 航道分割部署
 
-当前主巡线链路在 RK3588 上使用单类 `track` 的 YOLOv5n-seg INT8 模型替代 HSV/Lab 初始分割，模型输出 mask 仍交给原有连通域、中心线、分叉、跟踪和控制模块处理。
+当前主巡线链路在 RK3588 上使用单类 `track` 的 YOLOv5n-seg INT8 模型生成 mask。应用层不再执行缩放、增强或颜色预处理；模型内部仍保留必需的 RGB/letterbox 输入转换。mask 在 ROI 中逐行提取左右边界、滤波中线并识别左右岔路。
 
 - 模型：`models/yolov5n_seg_track_480x640_int8_rk3588.rknn`
 - SHA-256：`0ffd0f431505fa362b4d1f4a94ae69321b2c77a4081c6a919f758f28712b1dce`
@@ -348,10 +331,11 @@ Windows 端可使用 `tools/run_orangepi_benchmark.ps1 -Scout` 通过专用 SSH 
 
 ## 巡线算法设计说明
 
-- 颜色空间（HSV/Lab）阈值分割 + 形态学处理；
-- 连通域筛选 + 分层扫描提取中心；
-- 单侧边界推断 + 二次曲线拟合；
-- EMA 时序平滑 + 高层速度策略。
+- 从车体附近向远处扫描 `track` mask，每行跟踪与历史中心最连续的前景区间；
+- 根据左右边界得到原始中线，依次执行梯度限幅和五点滑动平均；
+- 把 120 行赛道权重重采样到当前 ROI，计算加权横向误差并做三帧时域滤波；
+- 通过左右边界外移、拐点、丢线统计和连续帧确认独立上报左/右岔路，默认仍沿当前主路行驶；
+- 避障、coin 目标和丢线历史恢复仍在原有优先级链中工作。
 
 ## 输出日志
 

@@ -18,7 +18,6 @@ from core.avoidance_target_planner import AvoidanceTargetPlanner, AvoidanceTarge
 from core.blocking_analyzer import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
 from core.lane_detector import LaneDetector
 from core.lane_tracker import LaneTracker
-from core.preprocess import ImagePreprocessor, PreprocessResult
 from core.target_selector import TargetPointResult, TargetSelector
 from utils.image_utils import draw_centerline, ensure_bgr, stack_images
 
@@ -47,10 +46,19 @@ def parse_mock_bboxes(values: Sequence[str]) -> list[DetectedObject]:
     return objects
 
 
+def compute_roi_rect(frame, config: dict) -> tuple[int, int, int, int]:
+    height, width = frame.shape[:2]
+    x1 = max(0, min(width - 1, int(width * float(config.get("left_ratio", 0.05)))))
+    x2 = max(x1 + 1, min(width, int(width * float(config.get("right_ratio", 0.95)))))
+    y1 = max(0, min(height - 1, int(height * float(config.get("top_ratio", 0.585)))))
+    y2 = max(y1 + 1, min(height, int(height * float(config.get("bottom_ratio", 1.0)))))
+    return x1, y1, x2, y2
+
+
 class OfflineAvoidanceTester:
     def __init__(self, config: dict, mock_objects: list[DetectedObject]) -> None:
-        self.preprocessor = ImagePreprocessor(config.get("preprocess", {}))
-        self.detector = LaneDetector(config.get("detector", {}))
+        self.roi_config = config.get("lane_geometry", {}).get("roi", {})
+        self.detector = LaneDetector(config.get("lane_geometry", {}))
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
         self.blocking_analyzer = BlockingAnalyzer(config.get("blocking_analyzer", {}))
@@ -61,14 +69,16 @@ class OfflineAvoidanceTester:
         self.mock_objects = mock_objects
 
     def process_frame(self, frame):
-        preprocess_result = self.preprocessor.process(frame)
-        detection_result = self.detector.detect(preprocess_result.roi_frame)
+        roi_rect = compute_roi_rect(frame, self.roi_config)
+        x1, y1, x2, y2 = roi_rect
+        roi_frame = frame[y1:y2, x1:x2]
+        detection_result = self.detector.detect(roi_frame)
         tracked_state = self.tracker.update(detection_result)
-        roi_height, roi_width = preprocess_result.roi_frame.shape[:2]
+        roi_height, roi_width = roi_frame.shape[:2]
         centerline_points = tracked_state.centerline_points or detection_result.centerline_points
         objects_with_roi = attach_roi_bboxes(
             objects=self.mock_objects,
-            roi_rect=preprocess_result.roi_rect,
+            roi_rect=roi_rect,
             roi_width=roi_width,
             roi_height=roi_height,
         )
@@ -97,7 +107,8 @@ class OfflineAvoidanceTester:
         )
         print_debug(normal_target, blocking_result, avoidance_result)
         return build_debug_canvas(
-            preprocess_result=preprocess_result,
+            frame=frame,
+            roi_rect=roi_rect,
             normal_target=normal_target,
             blocking_result=blocking_result,
             avoidance_result=avoidance_result,
@@ -129,7 +140,8 @@ def print_debug(
 
 
 def build_debug_canvas(
-    preprocess_result: PreprocessResult,
+    frame,
+    roi_rect,
     normal_target: TargetPointResult,
     blocking_result: BlockingAnalysisResult,
     avoidance_result: AvoidanceTargetResult,
@@ -137,12 +149,12 @@ def build_debug_canvas(
     centerline_points,
     mock_objects: Sequence[DetectedObject],
 ):
-    x1, y1, _, _ = preprocess_result.roi_rect
-    original = preprocess_result.resized_frame.copy()
+    x1, y1, _, _ = roi_rect
+    original = frame.copy()
     cv2.rectangle(
         original,
         (x1, y1),
-        (preprocess_result.roi_rect[2], preprocess_result.roi_rect[3]),
+        (roi_rect[2], roi_rect[3]),
         (0, 255, 255),
         2,
     )
@@ -160,8 +172,8 @@ def build_debug_canvas(
     if blocking_result.blocking_object is not None:
         danger_left = int(round(blocking_result.danger_left + x1))
         danger_right = int(round(blocking_result.danger_right + x1))
-        cv2.line(original, (danger_left, y1), (danger_left, preprocess_result.roi_rect[3]), (0, 255, 255), 1)
-        cv2.line(original, (danger_right, y1), (danger_right, preprocess_result.roi_rect[3]), (0, 255, 255), 1)
+        cv2.line(original, (danger_left, y1), (danger_left, roi_rect[3]), (0, 255, 255), 1)
+        cv2.line(original, (danger_right, y1), (danger_right, roi_rect[3]), (0, 255, 255), 1)
         lane_x = int(round(blocking_result.lane_center_x_at_obstacle + x1))
         y_bottom = int(round(blocking_result.blocking_object.bbox_roi[3] + y1))
         cv2.circle(original, (lane_x, y_bottom), 6, (255, 0, 255), -1)
