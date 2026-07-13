@@ -4,7 +4,7 @@ app:
 
 camera:
   # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，shared_memory 表示 AR 共享内存。
-  mode: video
+  mode: shared_memory
   # 摄像头设备号，Linux 下常见为 0、1、2。
   device_id: 0
   # 视频模式下使用的视频路径。
@@ -201,13 +201,13 @@ extensions:
     enable: true
     det_model_path: third_party/ppocr/PPOCR-Det/model/ppocrv4_det.rknn
     rec_model_path: third_party/ppocr/PPOCR-Rec/model/ppocrv4_rec.rknn
-    system_python_dir: third_party/ppocr/PPOCR-System/python
+    system_python_dir: third_party/ppocr/PPOCR-System/ppocr_runtime
     target: rk3588
     core_mask: NPU_CORE_1
     class_names: [road_sign]
     bbox_min_confidence: 0.50
-    bbox_min_width_px: 96
-    bbox_min_height_px: 48
+    bbox_min_width_px: 140
+    bbox_min_height_px: 70
     bbox_padding_ratio: 0.10
     input_width: 480
     input_height: 480
@@ -215,6 +215,7 @@ extensions:
     accept_score: 0.60
     retry_interval_sec: 0.50
     cooldown_seconds: 20.0
+    bbox_display_seconds: 1.0
     output_dir: outputs/logs
 
 logger:

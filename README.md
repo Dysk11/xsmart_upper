@@ -341,8 +341,11 @@ Windows 端可使用 `tools/run_orangepi_benchmark.ps1 -Scout` 通过专用 SSH 
 
 目标检测在同一帧识别到 `road_sign` 且原始框至少为 `96x48` 像素时，AI
 子进程会按检测框中心扩展 10% 并送入 PP-OCRv4 Det/Rec RKNN 模型。只有整体
-置信度达到 `0.80` 的非空文字才写入
+置信度达到 `0.60` 的非空文字才写入
 `outputs/logs/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后全局暂停 OCR 20 秒。
+每次 OCR 尝试都会在控制台输出 `[OCR]` 行，并在调试窗口用紫色框标出裁剪区域；
+紫框默认显示 1 秒后清除，最新文字、置信度和耗时继续保留。低分候选只显示，
+不写 JSONL，也不启动冷却。
 模型、阈值、NPU 核和输出目录均在 `config/config.yaml` 的
 `extensions.ocr` 中配置。板端只需要 RKNN-Toolkit-Lite2，不使用 ONNX 或
 PaddlePaddle；额外 Python 依赖为 `shapely`、`pyclipper` 和 `six`。

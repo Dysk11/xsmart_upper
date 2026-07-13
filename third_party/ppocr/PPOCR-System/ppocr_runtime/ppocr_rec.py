@@ -17,8 +17,8 @@ import argparse
 import cv2
 import numpy as np
 from pathlib import Path
-import utils.operators
-from utils.rec_postprocess import CTCLabelDecode
+from .utils import operators
+from .utils.rec_postprocess import CTCLabelDecode
 
 # add path
 from pathlib import Path
@@ -54,7 +54,7 @@ class TextRecognizer:
         self.preprocess_funct = []
         for item in PRE_PROCESS_CONFIG:
             for key in item:
-                pclass = getattr(utils.operators, key)
+                pclass = getattr(operators, key)
                 p = pclass(**item[key])
                 self.preprocess_funct.append(p)
 

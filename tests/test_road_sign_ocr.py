@@ -118,6 +118,9 @@ def test_low_confidence_retries_without_logging_or_cooldown() -> None:
     logger = FakeLogger()
     session = RoadSignOcrSession(config(), recognizer=recognizer, event_logger=logger, clock=clock)
     assert session.update(FRAME, 1, SIGN) is None
+    assert session.last_attempt is not None
+    assert session.last_attempt.text == "模糊"
+    assert session.last_attempt.confidence == 0.79
     clock.now = 0.49
     assert session.update(FRAME, 2, SIGN) is None
     assert recognizer.calls == 1

@@ -16,8 +16,8 @@ import sys
 import cv2
 import numpy as np
 import argparse
-import utils.operators
-from utils.db_postprocess import DBPostProcess, DetPostProcess
+from .utils import operators
+from .utils.db_postprocess import DBPostProcess, DetPostProcess
 
 # add path
 from pathlib import Path
@@ -62,7 +62,7 @@ class TextDetector:
         self.preprocess_funct = []
         for item in RKNN_PRE_PROCESS_CONFIG:
             for key in item:
-                pclass = getattr(utils.operators, key)
+                pclass = getattr(operators, key)
                 p = pclass(**item[key])
                 self.preprocess_funct.append(p)
 

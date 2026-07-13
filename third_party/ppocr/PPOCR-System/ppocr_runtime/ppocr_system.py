@@ -17,8 +17,8 @@ import cv2
 import copy
 import numpy as np
 import argparse
-import ppocr_rec as predict_rec
-import ppocr_det as predict_det
+from . import ppocr_rec as predict_rec
+from . import ppocr_det as predict_det
 
 os.environ["FLAGS_allocator_strategy"] = 'auto_growth'
 

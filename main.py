@@ -17,7 +17,7 @@ import queue
 import sys
 import time
 import traceback
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict
 
@@ -48,6 +48,30 @@ from utils.fps import FPSCounter
 
 SHARED_ARRAY_MARKER = "__xsmart_shared_array__"
 SHARED_FRAME_MARKER = "__xsmart_shared_frame__"
+
+
+@dataclass
+class OcrBBoxDisplayTimer:
+    """Track the short-lived OCR crop rectangle independently from OCR text."""
+
+    hold_seconds: float = 1.0
+    visible_until: float = 0.0
+    last_frame_id: int = 0
+
+    def observe(self, result: OcrResult | None, now: float) -> bool:
+        if result is None or result.frame_id <= self.last_frame_id:
+            return False
+        self.last_frame_id = result.frame_id
+        self.visible_until = now + max(0.0, float(self.hold_seconds))
+        return True
+
+    def is_visible(self, result: OcrResult | None, now: float) -> bool:
+        return bool(
+            result is not None
+            and result.frame_id > 0
+            and result.source_bbox is not None
+            and now < self.visible_until
+        )
 
 
 class SharedArrayPool:
@@ -305,6 +329,7 @@ def _ai_inference_worker(
     ocr_session = RoadSignOcrSession(ocr_config, project_root=Path(project_root))
     ack_queues = {"ai_frame": ack_queue}
     last_ocr_result: OcrResult | None = None
+    last_ocr_attempt: OcrResult | None = None
     try:
         while not stop_event.is_set():
             try:
@@ -325,6 +350,14 @@ def _ai_inference_worker(
                 detections = detector.detect(frame)
                 try:
                     ocr_result = ocr_session.update(frame, frame_id, detections)
+                    if (
+                        ocr_session.last_attempt is not None
+                        and (
+                            last_ocr_attempt is None
+                            or ocr_session.last_attempt.frame_id > last_ocr_attempt.frame_id
+                        )
+                    ):
+                        last_ocr_attempt = ocr_session.last_attempt
                     if ocr_result is not None and ocr_result.event_id > 0:
                         last_ocr_result = ocr_result
                 except Exception:
@@ -339,13 +372,23 @@ def _ai_inference_worker(
                         detector.last_timing,
                         detections,
                         last_ocr_result,
+                        last_ocr_attempt,
                     ),
                 )
             except Exception:
                 traceback.print_exc()
                 _put_latest(
                     output_queue,
-                    (frame_id, captured_at, time.perf_counter(), time.perf_counter(), {}, [], last_ocr_result),
+                    (
+                        frame_id,
+                        captured_at,
+                        time.perf_counter(),
+                        time.perf_counter(),
+                        {},
+                        [],
+                        last_ocr_result,
+                        last_ocr_attempt,
+                    ),
                 )
     finally:
         detector.close()
@@ -605,7 +648,12 @@ class UpperMachineApp:
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
         self.last_ocr_result = OcrResult()
+        self.last_ocr_attempt = OcrResult()
         self._last_ocr_event_id = 0
+        ocr_config = config.get("extensions", {}).get("ocr", {})
+        self.ocr_bbox_timer = OcrBBoxDisplayTimer(
+            hold_seconds=float(ocr_config.get("bbox_display_seconds", 1.0))
+        )
         self.frame_id = 0
 
         self.mp_context = mp.get_context("spawn")
@@ -739,6 +787,7 @@ class UpperMachineApp:
                     _timing,
                     detected_objects,
                     worker_ocr_result,
+                    worker_ocr_attempt,
                 ) = latest_ai_result
                 result_age = self.frame_id - int(ai_frame_id)
                 if int(ai_frame_id) > self.last_ai_frame_id and (
@@ -751,6 +800,10 @@ class UpperMachineApp:
                         self._last_ocr_event_id,
                         worker_ocr_result,
                     )
+                    if self.ocr_bbox_timer.observe(worker_ocr_attempt, time.monotonic()):
+                        assert worker_ocr_attempt is not None
+                        self.last_ocr_attempt = worker_ocr_attempt
+                        self._print_ocr_attempt(worker_ocr_attempt)
             segmentation_result = self._segment_lane(frame, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
@@ -827,9 +880,30 @@ class UpperMachineApp:
                         "avoidance_result": self.last_avoidance_result,
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
+                        "ocr_result": (
+                            self.last_ocr_attempt
+                            if self.last_ocr_attempt.frame_id > 0
+                            else None
+                        ),
+                        "show_ocr_bbox": self.ocr_bbox_timer.is_visible(
+                            self.last_ocr_attempt,
+                            time.monotonic(),
+                        ),
                     },
                     release_func=self._release_owned_shared_payload,
                 )
+
+    @staticmethod
+    def _print_ocr_attempt(result: OcrResult) -> None:
+        status = "accepted" if result.event_id > 0 else ("error" if result.error else "candidate")
+        text = result.text if result.text else "<empty>"
+        print(
+            f"[OCR] frame={result.frame_id} status={status} "
+            f"confidence={result.confidence:.3f} latency={result.inference_ms:.1f}ms "
+            f"bbox={result.source_bbox} text={text!r}"
+            + (f" error={result.error}" if result.error else ""),
+            flush=True,
+        )
 
     def _compute_roi_rect(self, frame: np.ndarray) -> tuple[int, int, int, int]:
         """Convert normalized lane ROI configuration to a clipped frame rectangle."""

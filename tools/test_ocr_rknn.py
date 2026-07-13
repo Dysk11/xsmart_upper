@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 import sys
@@ -26,8 +27,8 @@ def main() -> int:
         config = yaml.safe_load(handle)["extensions"]["ocr"]
 
     system_python = _resolve(project_root, config["system_python_dir"])
-    sys.path.insert(0, str(system_python))
-    from ppocr_system import TextSystem
+    sys.path.insert(0, str(system_python.parent))
+    TextSystem = importlib.import_module(f"{system_python.name}.ppocr_system").TextSystem
 
     model_args = SimpleNamespace(
         det_model_path=str(_resolve(project_root, config["det_model_path"])),

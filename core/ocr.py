@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
+import importlib
 import sys
 import time
 
@@ -152,11 +153,13 @@ class OcrRecognizer:
             return self._system
 
         system_python = self._resolve_path(
-            self.config.get("system_python_dir", "third_party/ppocr/PPOCR-System/python")
+            self.config.get("system_python_dir", "third_party/ppocr/PPOCR-System/ppocr_runtime")
         )
-        if str(system_python) not in sys.path:
-            sys.path.insert(0, str(system_python))
-        from ppocr_system import TextSystem  # type: ignore[import-not-found]
+        package_parent = system_python.parent
+        if str(package_parent) not in sys.path:
+            sys.path.insert(0, str(package_parent))
+        module = importlib.import_module(f"{system_python.name}.ppocr_system")
+        TextSystem = module.TextSystem
 
         args = SimpleNamespace(
             det_model_path=str(self._resolve_path(self.config["det_model_path"])),

@@ -90,7 +90,7 @@ class RoadSignOcrSession:
         self.bbox_min_width_px = max(1, int(config.get("bbox_min_width_px", 96)))
         self.bbox_min_height_px = max(1, int(config.get("bbox_min_height_px", 48)))
         self.bbox_padding_ratio = max(0.0, float(config.get("bbox_padding_ratio", 0.10)))
-        self.accept_score = float(config.get("accept_score", 0.80))
+        self.accept_score = float(config.get("accept_score", 0.60))
         self.retry_interval_sec = max(0.0, float(config.get("retry_interval_sec", 0.50)))
         self.cooldown_seconds = max(0.0, float(config.get("cooldown_seconds", 20.0)))
         self.clock = clock
@@ -107,6 +107,7 @@ class RoadSignOcrSession:
         self._cooldown_until = 0.0
         self._pending_log_result: OcrResult | None = None
         self._last_result: OcrResult | None = None
+        self.last_attempt: OcrResult | None = None
         self.last_error: str | None = None
 
     def update(
@@ -149,6 +150,7 @@ class RoadSignOcrSession:
             is_new=False,
             locked=False,
         )
+        self.last_attempt = candidate
         if candidate.error or not candidate.text or candidate.confidence < self.accept_score:
             self.last_error = candidate.error
             self._next_retry_at = now + self.retry_interval_sec
@@ -172,6 +174,7 @@ class RoadSignOcrSession:
             self._next_retry_at = now + self.retry_interval_sec
             return
         self._last_result = self._pending_log_result
+        self.last_attempt = self._last_result
         self._pending_log_result = None
         self._cooldown_until = now + self.cooldown_seconds
         self._next_retry_at = self._cooldown_until

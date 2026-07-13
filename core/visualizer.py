@@ -14,6 +14,7 @@ from core.blocking_analyzer import BlockingAnalysisResult, DetectedObject
 from core.gold_target_planner import GoldTargetResult
 from core.lane_detector import LaneDetectionResult
 from core.lane_tracker import TrackedLaneState
+from core.ocr import OcrResult
 from core.planner import ControlCommand
 from core.target_selector import TargetPointResult
 from utils.image_utils import draw_centerline, draw_text_lines
@@ -62,6 +63,8 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        ocr_result: OcrResult | None = None,
+        show_ocr_bbox: bool = True,
     ) -> bool:
         """生成一帧调试画面，并根据配置显示或保存。
 
@@ -88,6 +91,8 @@ class Visualizer:
             avoidance_result=avoidance_result,
             detected_objects=detected_objects,
             gold_result=gold_result,
+            ocr_result=ocr_result,
+            show_ocr_bbox=show_ocr_bbox,
         )
 
         if self.save_video:
@@ -132,6 +137,8 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        ocr_result: OcrResult | None = None,
+        show_ocr_bbox: bool = True,
     ) -> np.ndarray:
         """将原图、ROI、掩膜和状态文字合成为一张调试大图。
 
@@ -234,6 +241,9 @@ class Visualizer:
             )
         if detected_objects:
             self._draw_detected_objects(original_panel, detected_objects)
+        if show_ocr_bbox and ocr_result is not None and ocr_result.source_bbox is not None:
+            bx1, by1, bx2, by2 = ocr_result.source_bbox
+            cv2.rectangle(original_panel, (bx1, by1), (bx2, by2), (255, 0, 255), 3)
         if gold_result is not None and gold_result.active:
             self._draw_target_point(
                 original_panel,
@@ -258,6 +268,7 @@ class Visualizer:
                 fps_value=fps_value,
                 gold_result=gold_result,
                 detection_result=detection_result,
+                ocr_result=ocr_result,
             ) or [
                 "窗口1：原始画面",
                 "黄色框 = ROI范围  红线 = 车身中心参考线  绿线 = 航道中心线",
@@ -367,9 +378,10 @@ class Visualizer:
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
         detection_result: LaneDetectionResult | None = None,
+        ocr_result: OcrResult | None = None,
     ) -> list[str]:
         if avoidance_result is None:
-            return []
+            return self._ocr_status_lines(ocr_result)
         blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
         fork_reason = "fork: none"
@@ -379,7 +391,7 @@ class Visualizer:
                 f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
                 f"confirm={fork_lane.confirm_frames}"
             )
-        return [
+        lines = [
             "窗口1：原始画面",
             "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
@@ -389,6 +401,19 @@ class Visualizer:
             f"{fork_reason}",
             f"{gold_reason}",
             f"{blocking_reason}",
+        ]
+        lines.extend(self._ocr_status_lines(ocr_result))
+        return lines
+
+    @staticmethod
+    def _ocr_status_lines(ocr_result: OcrResult | None) -> list[str]:
+        if ocr_result is None or ocr_result.frame_id <= 0:
+            return []
+        status = "accepted" if ocr_result.event_id > 0 else ("error" if ocr_result.error else "candidate")
+        text = ocr_result.text or "<empty>"
+        return [
+            f"OCR[{status}] conf={ocr_result.confidence:.3f} "
+            f"{ocr_result.inference_ms:.1f}ms: {text}"
         ]
 
     def _write_video(self, canvas: np.ndarray) -> None:
