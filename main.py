@@ -36,9 +36,11 @@ from core.gold_target_planner import GoldTargetPlanner, GoldTargetResult
 from core.lane_detector import LaneDetectionResult, LaneDetector
 from core.lane_tracker import LaneTracker, TrackedLaneState
 from core.logger import CsvLogger
+from core.ocr import OcrResult
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
 from core.rknn_object_detector import RknnObjectDetector
 from core.rknn_lane_segmenter import RknnLaneSegmenter, SegmentationResult
+from core.road_sign_ocr import RoadSignOcrSession
 from core.target_selector import TargetPointResult, TargetSelector
 from core.visualizer import Visualizer
 from utils.fps import FPSCounter
@@ -273,17 +275,36 @@ def _drain_latest(work_queue: Any, release_func: Any = _release_shared_payload) 
         latest = item
 
 
+def consume_ocr_event(
+    previous: OcrResult,
+    seen_event_id: int,
+    worker_result: OcrResult | None,
+) -> tuple[OcrResult, int]:
+    """Expose each monotonically increasing OCR event as new exactly once."""
+
+    if worker_result is None or worker_result.event_id <= 0:
+        return replace(previous, is_new=False), seen_event_id
+    if worker_result.event_id < seen_event_id:
+        return replace(previous, is_new=False), seen_event_id
+    is_new = worker_result.event_id > seen_event_id
+    return replace(worker_result, is_new=is_new), max(seen_event_id, worker_result.event_id)
+
+
 def _ai_inference_worker(
     detector_config: Dict[str, Any],
+    ocr_config: Dict[str, Any],
+    project_root: str,
     input_queue: Any,
     output_queue: Any,
     ack_queue: Any,
     stop_event: Any,
 ) -> None:
-    """Run RKNN object detection in an independent process."""
+    """Run object detection and exact-frame road-sign OCR in one AI process."""
 
     detector = RknnObjectDetector(detector_config)
+    ocr_session = RoadSignOcrSession(ocr_config, project_root=Path(project_root))
     ack_queues = {"ai_frame": ack_queue}
+    last_ocr_result: OcrResult | None = None
     try:
         while not stop_event.is_set():
             try:
@@ -302,15 +323,33 @@ def _ai_inference_worker(
                 )
                 ipc_finished = time.perf_counter()
                 detections = detector.detect(frame)
+                try:
+                    ocr_result = ocr_session.update(frame, frame_id, detections)
+                    if ocr_result is not None and ocr_result.event_id > 0:
+                        last_ocr_result = ocr_result
+                except Exception:
+                    traceback.print_exc()
                 _put_latest(
                     output_queue,
-                    (frame_id, captured_at, time.perf_counter(), ipc_finished, detector.last_timing, detections),
+                    (
+                        frame_id,
+                        captured_at,
+                        time.perf_counter(),
+                        ipc_finished,
+                        detector.last_timing,
+                        detections,
+                        last_ocr_result,
+                    ),
                 )
             except Exception:
                 traceback.print_exc()
-                _put_latest(output_queue, (frame_id, captured_at, time.perf_counter(), time.perf_counter(), {}, []))
+                _put_latest(
+                    output_queue,
+                    (frame_id, captured_at, time.perf_counter(), time.perf_counter(), {}, [], last_ocr_result),
+                )
     finally:
         detector.close()
+        ocr_session.close()
 
 
 def _lane_inference_worker(
@@ -466,6 +505,11 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
             resolve_project_path(project_root, str(rknn_segmenter_config["model_path"]))
         )
 
+    ocr_config = runtime_config.setdefault("extensions", {}).setdefault("ocr", {})
+    for path_key in ("det_model_path", "rec_model_path", "system_python_dir", "output_dir"):
+        if ocr_config.get(path_key):
+            ocr_config[path_key] = str(resolve_project_path(project_root, str(ocr_config[path_key])))
+
     return runtime_config
 
 
@@ -560,6 +604,8 @@ class UpperMachineApp:
         self.last_avoidance_result: AvoidanceTargetResult | None = None
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
+        self.last_ocr_result = OcrResult()
+        self._last_ocr_event_id = 0
         self.frame_id = 0
 
         self.mp_context = mp.get_context("spawn")
@@ -608,6 +654,8 @@ class UpperMachineApp:
             target=_ai_inference_worker,
             args=(
                 config.get("rknn_object_detector", {}),
+                config.get("extensions", {}).get("ocr", {}),
+                str(project_root),
                 self.ai_input_queue,
                 self.ai_output_queue,
                 self.ai_ack_queue,
@@ -676,15 +724,33 @@ class UpperMachineApp:
                     (self.frame_id, captured_at, ai_frame_payload),
                     release_func=self._release_owned_shared_payload,
                 )
+            self.last_ocr_result, self._last_ocr_event_id = consume_ocr_event(
+                self.last_ocr_result,
+                self._last_ocr_event_id,
+                None,
+            )
             latest_ai_result = _drain_latest(self.ai_output_queue)
             if latest_ai_result is not None:
-                ai_frame_id, _captured_at, _completed_at, _ipc_finished, _timing, detected_objects = latest_ai_result
+                (
+                    ai_frame_id,
+                    _captured_at,
+                    _completed_at,
+                    _ipc_finished,
+                    _timing,
+                    detected_objects,
+                    worker_ocr_result,
+                ) = latest_ai_result
                 result_age = self.frame_id - int(ai_frame_id)
                 if int(ai_frame_id) > self.last_ai_frame_id and (
                     not self.drop_stale_ai_results or result_age <= self.ai_max_result_age_frames
                 ):
                     self.last_ai_frame_id = int(ai_frame_id)
                     self.last_detected_objects = detected_objects
+                    self.last_ocr_result, self._last_ocr_event_id = consume_ocr_event(
+                        self.last_ocr_result,
+                        self._last_ocr_event_id,
+                        worker_ocr_result,
+                    )
             segmentation_result = self._segment_lane(frame, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]

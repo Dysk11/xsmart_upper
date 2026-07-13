@@ -337,6 +337,16 @@ Windows 端可使用 `tools/run_orangepi_benchmark.ps1 -Scout` 通过专用 SSH 
 - 通过左右边界外移、拐点、丢线统计和连续帧确认独立上报左/右岔路，默认仍沿当前主路行驶；
 - 避障、coin 目标和丢线历史恢复仍在原有优先级链中工作。
 
+## RK3588 PP-OCR 路牌识别
+
+目标检测在同一帧识别到 `road_sign` 且原始框至少为 `96x48` 像素时，AI
+子进程会按检测框中心扩展 10% 并送入 PP-OCRv4 Det/Rec RKNN 模型。只有整体
+置信度达到 `0.80` 的非空文字才写入
+`outputs/logs/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后全局暂停 OCR 20 秒。
+模型、阈值、NPU 核和输出目录均在 `config/config.yaml` 的
+`extensions.ocr` 中配置。板端只需要 RKNN-Toolkit-Lite2，不使用 ONNX 或
+PaddlePaddle；额外 Python 依赖为 `shapely`、`pyclipper` 和 `six`。
+
 ## 输出日志
 
 CSV 日志保存在 `outputs/logs/`，包含误差、曲率、置信度、目标速度/转向等，适合离线分析。

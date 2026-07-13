@@ -194,6 +194,29 @@ visualizer:
   video_fps: 25
 
   frame_stride: 3
+
+extensions:
+  ocr:
+    # RK3588 only: both models run through RKNN-Toolkit-Lite2, without ONNX fallback.
+    enable: true
+    det_model_path: third_party/ppocr/PPOCR-Det/model/ppocrv4_det.rknn
+    rec_model_path: third_party/ppocr/PPOCR-Rec/model/ppocrv4_rec.rknn
+    system_python_dir: third_party/ppocr/PPOCR-System/python
+    target: rk3588
+    core_mask: NPU_CORE_1
+    class_names: [road_sign]
+    bbox_min_confidence: 0.50
+    bbox_min_width_px: 96
+    bbox_min_height_px: 48
+    bbox_padding_ratio: 0.10
+    input_width: 480
+    input_height: 480
+    min_score: 0.50
+    accept_score: 0.60
+    retry_interval_sec: 0.50
+    cooldown_seconds: 20.0
+    output_dir: outputs/logs
+
 logger:
   # CSV 日志方便赛后分析误差和调速效果。
   enable: false
