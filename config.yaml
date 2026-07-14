@@ -1,0 +1,216 @@
+# X-SmartCar runtime configuration
+
+# Application
+app:
+  fps_smoothing_alpha: 0.1
+
+# Input
+camera:
+  mode: shared_memory
+  device_id: 0
+  video_path: outputs/video/record_20260708_135111.mp4
+  shared_memory_name: shm_ar_video
+  loop_video: false
+  width: 640
+  height: 480
+  fps: 60
+  mirror: false
+  reconnect_interval_sec: 0.5
+  max_reconnect_attempts: 5
+
+# Lane perception
+rknn_lane_segmenter:
+  enable: true
+  model_path: models/lane/yolov5n_seg_track_480x640_int8_rk3588.rknn
+  input_size: [640, 480]
+  score_threshold: 0.30
+  nms_threshold: 0.45
+  mask_threshold: 0.5
+  max_instances: 1
+  runtime_backend: lite2
+  core_mask: NPU_CORE_0
+  parallel: true
+  worker_count: 3
+  worker_core_masks: [NPU_CORE_0, NPU_CORE_1, NPU_CORE_2]
+  max_result_age_frames: 4
+  drop_stale_results: true
+
+lane_geometry:
+  roi:
+    top_ratio: 0.585
+    bottom_ratio: 1.0
+    left_ratio: 0.05
+    right_ratio: 0.95
+  boundary:
+    gradient_jump_ratio: 0.05
+    gradient_step_ratio: 0.025
+    max_single_side_gap_rows: 12
+    min_run_width_px: 6
+  temporal_filter:
+    weights: [0.20, 0.50, 0.30]
+  centerline:
+    scan_step: 4
+    min_valid_points: 6
+    default_lane_width_px: 60
+    lookahead_ratio: 0.45
+  confidence:
+    lost_threshold: 0.22
+    expected_area_ratio: 0.04
+    residual_tolerance_px: 22.0
+  fork:
+    corner_span_rows: 10
+    outward_jump_ratio: 0.08
+    min_lost_rows: 3
+    confirm_frames: 2
+    release_frames: 3
+
+tracker:
+  ema_alpha: 0.25
+  recovery_alpha: 0.45
+  confidence_gate: 0.45
+  max_prediction_frames: 6
+  prediction_decay: 0.88
+  min_prediction_confidence: 0.10
+  centerline_alpha: 0.25
+  max_centerline_point_shift_px: 80
+
+# Object and road-sign perception
+rknn_object_detector:
+  enable: true
+  model_path: models/object/rknn_7classes.rknn
+  input_size: [640, 480]
+  input_layout: nhwc
+  input_color: rgb
+  input_dtype: uint8
+  score_threshold: 0.50
+  nms_threshold: 0.45
+  max_detections: 30
+  runtime_backend: lite2
+  inference_stride: 2
+  max_result_age_frames: 12
+  drop_stale_results: true
+  class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
+  core_mask: NPU_CORE_1
+
+ocr:
+  enable: true
+  det_model_path: models/ocr/ppocrv4_det.rknn
+  rec_model_path: models/ocr/ppocrv4_rec.rknn
+  target: rk3588
+  core_mask: NPU_CORE_1
+  class_names: [road_sign]
+  bbox_min_confidence: 0.50
+  bbox_min_width_px: 140
+  bbox_min_height_px: 70
+  bbox_padding_ratio: 0.10
+  input_width: 480
+  input_height: 480
+  min_score: 0.50
+  accept_score: 0.60
+  retry_interval_sec: 0.50
+  cooldown_seconds: 20.0
+  bbox_display_seconds: 1.0
+  output_dir: outputs/logs/ocr
+
+# Planning
+target_selector:
+  base_lookahead_px: 120
+  min_lookahead_px: 70
+  max_lookahead_px: 180
+  curvature_gain: 80
+  low_confidence_lookahead_px: 80
+  low_confidence_threshold: 0.45
+
+gold_target:
+  enabled: true
+  class_names: [coin]
+  min_confidence: 0.20
+  hold_frames: 4
+  approach_speed_limit: 0.85
+  close_speed_limit: 0.45
+  close_y_ratio: 0.82
+  max_above_roi_ratio: 0.8
+  aim_at: bottom_center
+
+blocking_analyzer:
+  enabled: true
+  allowed_class_names: [car, human]
+  corridor_half_width_px: 90
+  confidence_threshold: 0.45
+  min_box_area: 600
+  near_y_ratio: 0.42
+  too_close_y_ratio: 0.82
+  blocking_score_threshold: 0.25
+  side_deadband_px: 25
+
+avoidance_target_planner:
+  enabled: true
+  max_avoid_bias_px: 110
+  bias_alpha: 0.25
+  return_decay: 0.85
+  clear_frames: 8
+  front_margin_px: 45
+  rear_margin_px: 35
+  target_front_margin_px: 35
+  min_lane_confidence_to_start_avoid: 0.45
+  max_target_jump_px: 50
+
+road_sign_analyzer:
+  enable: true
+  api_url: https://qianfan.baidubce.com/v2/chat/completions
+  model: ernie-4.5-turbo-vl
+  api_key_env: QIANFAN_API_KEY
+  connect_timeout_sec: 2.0
+  read_timeout_sec: 8.0
+  max_attempts: 2
+  retry_interval_sec: 0.5
+  default_direction: left
+  decision_ttl_sec: 20.0
+  output_dir: outputs/logs/api
+
+planner:
+  lateral_gain: 0.065
+  heading_gain: 0.85
+  curvature_gain: 140.0
+  max_steer_deg: 35.0
+  base_speed: 1.6
+  max_speed: 2.2
+  min_speed: 0.45
+  straight_curvature_threshold: 0.0025
+  straight_boost_speed: 0.2
+  curvature_speed_gain: 120.0
+  heading_speed_gain: 0.03
+  confidence_speed_gain: 0.7
+  caution_confidence_threshold: 0.55
+  lost_speed: 0.25
+  lost_steer_decay: 0.6
+
+# Communication and output
+bridge:
+  type: mock
+  serial:
+    port: /dev/ttyUSB0
+    baudrate: 115200
+    timeout: 0.02
+    write_timeout: 0.02
+    reconnect_interval_sec: 0.5
+    max_reconnect_attempts: 3
+
+visualizer:
+  show_window: true
+  window_name: X-SmartCar Upper
+  font_path: "C:/Windows/Fonts/msyh.ttc"
+  font_size: 22
+  mask_alpha: 0.35
+  mask_color: [0, 180, 255]
+  save_video: false
+  save_screenshot: false
+  save_dir: outputs/visual
+  video_name: xsmart.mp4
+  video_fourcc: mp4v
+  video_fps: 25
+  frame_stride: 1
+
+logger:
+  enable: false
+  output_dir: outputs/logs
