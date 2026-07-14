@@ -39,6 +39,7 @@ from core.logger import CsvLogger
 from core.ocr import OcrResult
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
 from core.qianfan_route import (
+    QianfanApiLogger,
     QianfanRouteClient,
     QianfanRouteConfig,
     QianfanRouteDecision,
@@ -415,7 +416,8 @@ def _qianfan_route_worker(
             f"event={details['event_id']} attempt={details['attempt']}/{details['max_attempts']} "
             f"timeout=({details['connect_timeout_sec']:.1f},{details['read_timeout_sec']:.1f})s "
             f"latency={details['elapsed_sec']:.3f}s question={details['question']!r} "
-            f"answer={details['raw_answer']!r} direction={details['direction'] or '-'}"
+            f"http={details['http_status']} answer={details['raw_answer']!r} "
+            f"direction={details['direction'] or '-'}"
             + (f" error={details['error']}" if details["error"] else ""),
             flush=True,
         )
@@ -593,6 +595,12 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
         if ocr_config.get(path_key):
             ocr_config[path_key] = str(resolve_project_path(project_root, str(ocr_config[path_key])))
 
+    qianfan_config = runtime_config.setdefault("extensions", {}).setdefault("qianfan_route", {})
+    if qianfan_config.get("output_dir"):
+        qianfan_config["output_dir"] = str(
+            resolve_project_path(project_root, str(qianfan_config["output_dir"]))
+        )
+
     return runtime_config
 
 
@@ -696,7 +704,12 @@ class UpperMachineApp:
         )
         qianfan_config_mapping = config.get("extensions", {}).get("qianfan_route", {})
         self.qianfan_config = QianfanRouteConfig.from_mapping(qianfan_config_mapping)
-        self.qianfan_route_state = QianfanRouteState(enabled=self.qianfan_config.enable)
+        self.qianfan_route_state = QianfanRouteState(
+            enabled=self.qianfan_config.enable,
+            default_direction=self.qianfan_config.default_direction,
+            decision_ttl_sec=self.qianfan_config.decision_ttl_sec,
+        )
+        self.qianfan_api_logger = QianfanApiLogger(self.qianfan_config.output_dir)
         self.frame_id = 0
 
         self.mp_context = mp.get_context("spawn")
@@ -873,6 +886,13 @@ class UpperMachineApp:
                 )
             qianfan_result = _drain_latest(self.qianfan_output_queue)
             if isinstance(qianfan_result, QianfanRouteDecision) and self.qianfan_route_state.accept(qianfan_result):
+                try:
+                    self.qianfan_api_logger.append_result(
+                        qianfan_result,
+                        self.qianfan_config.decision_ttl_sec,
+                    )
+                except Exception as exc:
+                    print(f"[QIANFAN] API log error: {type(exc).__name__}: {exc}", flush=True)
                 print(
                     f"[QIANFAN] event={qianfan_result.event_id} status={qianfan_result.status} "
                     f"direction={qianfan_result.direction} attempts={qianfan_result.attempts} "
@@ -922,7 +942,6 @@ class UpperMachineApp:
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
             payload = self._build_payload(control_command, planning_state)
             self.bridge.send(payload)
-            self.qianfan_route_state.observe_fork(detection_result.fork_result)
             fps_value = self.fps_counter.update()
 
             # 第 7 步：把关键数据落盘，方便赛后分析和调参。
@@ -1156,6 +1175,7 @@ class UpperMachineApp:
             "ts_ms": control_command.ts_ms,
             "mode": control_command.mode,
             "target_speed": control_command.target_speed,
+            "motion_flag": int(control_command.target_speed > 0.0),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
             "heading_error_deg": tracked_state.heading_error_deg,

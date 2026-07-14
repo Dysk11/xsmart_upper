@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import requests
 
 from core.qianfan_route import (
     QUESTION_SUFFIX,
+    QianfanApiLogger,
     QianfanRouteClient,
     QianfanRouteConfig,
     QianfanRouteDecision,
@@ -49,6 +51,14 @@ class FakeQueue:
         self.items.append(item)
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 def test_question_and_direction_parser_are_strict() -> None:
     assert build_question("右边危险") == "右边危险" + QUESTION_SUFFIX
     assert parse_direction(" LEFT\n") == "left"
@@ -64,6 +74,7 @@ def test_question_and_direction_parser_are_strict() -> None:
         ("read_timeout_sec", -1),
         ("max_attempts", 0),
         ("retry_interval_sec", -0.1),
+        ("decision_ttl_sec", 0),
     ],
 )
 def test_config_rejects_invalid_retry_values(key: str, value: float) -> None:
@@ -77,7 +88,9 @@ def test_config_defaults_match_rk3588_runtime_policy() -> None:
     assert config.read_timeout_sec == 8.0
     assert config.max_attempts == 2
     assert config.retry_interval_sec == 0.5
-    assert config.fallback_direction == "left"
+    assert config.default_direction == "left"
+    assert config.decision_ttl_sec == 20.0
+    assert config.output_dir == "outputs/logs/api"
 
 
 def test_custom_timeout_and_attempt_count_are_passed_to_http(monkeypatch) -> None:
@@ -92,6 +105,7 @@ def test_custom_timeout_and_attempt_count_are_passed_to_http(monkeypatch) -> Non
     assert result.status == "success"
     assert session.calls[0][1]["timeout"] == (1.25, 3.5)
     assert session.calls[0][1]["json"]["model"] == "ernie-4.5-turbo-vl"
+    assert "secret" not in repr(result.attempt_records)
 
 
 def test_retryable_timeout_then_success(monkeypatch) -> None:
@@ -161,25 +175,69 @@ def test_missing_api_key_immediately_falls_back(monkeypatch) -> None:
     assert len(session.calls) == 0
 
 
-def test_route_state_deduplicates_and_clears_after_fork_release() -> None:
-    state = QianfanRouteState()
+def test_route_state_defaults_left_and_keeps_decision_for_ttl() -> None:
+    clock = FakeClock()
+    state = QianfanRouteState(decision_ttl_sec=20.0, clock=clock)
     queue = FakeQueue()
+    assert state.route_direction == "left"
     assert state.submit(5, "右边危险", queue)
     assert not state.submit(5, "重复", queue)
     assert len(queue.items) == 1
 
     pending_fork = SimpleNamespace(fork_detected=True, selected_direction=None)
     assert state.should_stop(pending_fork)
-    assert not state.observe_fork(pending_fork)
-    assert not state.observe_fork(SimpleNamespace(fork_detected=False, selected_direction=None))
     assert state.pending_event_id == 5
-    decision = QianfanRouteDecision(5, "success", "left")
+    decision = QianfanRouteDecision(5, "success", "right")
     assert state.accept(decision)
-    assert state.should_stop(pending_fork)
+    assert state.route_direction == "right"
 
-    selected_fork = SimpleNamespace(fork_detected=True, selected_direction="left")
+    selected_fork = SimpleNamespace(fork_detected=True, selected_direction="right")
     assert not state.should_stop(selected_fork)
-    assert not state.observe_fork(selected_fork)
-    assert state.observe_fork(SimpleNamespace(fork_detected=False, selected_direction=None))
-    assert state.idle
-    assert state.route_direction is None
+    clock.now = 19.999
+    assert state.route_direction == "right"
+    clock.now = 20.0
+    assert state.route_direction == "left"
+
+
+def test_new_ocr_during_active_window_overrides_and_restarts_ttl() -> None:
+    clock = FakeClock()
+    state = QianfanRouteState(decision_ttl_sec=20.0, clock=clock)
+    queue = FakeQueue()
+    assert state.submit(1, "第一块", queue)
+    assert state.accept(QianfanRouteDecision(1, "success", "right"))
+    clock.now = 10.0
+    assert state.submit(2, "第二块", queue)
+    assert state.should_stop(SimpleNamespace(fork_detected=True, selected_direction="right"))
+    assert state.accept(QianfanRouteDecision(2, "success", "left"))
+    assert state.route_direction == "left"
+    clock.now = 29.999
+    assert state.decision is not None
+    clock.now = 30.0
+    assert state.route_direction == "left"
+    assert state.decision is None
+
+
+def test_api_logger_writes_attempts_and_decision_without_api_key(tmp_path) -> None:
+    logger = QianfanApiLogger(tmp_path)
+    decision = QianfanRouteDecision(
+        event_id=3,
+        status="success",
+        direction="right",
+        raw_answer="right",
+        attempts=1,
+        elapsed_sec=0.25,
+        attempt_records=({
+            "event_id": 3,
+            "attempt": 1,
+            "question": "测试",
+            "http_status": 200,
+            "raw_answer": "right",
+        },),
+    )
+    path = logger.append_result(decision, 20.0)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert [record["record_type"] for record in records] == ["attempt", "decision"]
+    assert records[1]["decision_ttl_sec"] == 20.0
+    assert records[1]["direction"] == "right"
+    assert "QIANFAN_API_KEY" not in path.read_text(encoding="utf-8")

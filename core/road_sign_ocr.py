@@ -91,8 +91,12 @@ class RoadSignOcrSession:
         self.bbox_min_height_px = max(1, int(config.get("bbox_min_height_px", 48)))
         self.bbox_padding_ratio = max(0.0, float(config.get("bbox_padding_ratio", 0.10)))
         self.accept_score = float(config.get("accept_score", 0.60))
-        self.retry_interval_sec = max(0.0, float(config.get("retry_interval_sec", 0.50)))
-        self.cooldown_seconds = max(0.0, float(config.get("cooldown_seconds", 20.0)))
+        self.retry_interval_sec = float(config.get("retry_interval_sec", 0.50))
+        self.cooldown_seconds = float(config.get("cooldown_seconds", 20.0))
+        if self.retry_interval_sec < 0:
+            raise ValueError("extensions.ocr.retry_interval_sec must not be negative")
+        if self.cooldown_seconds < 0:
+            raise ValueError("extensions.ocr.cooldown_seconds must not be negative")
         self.clock = clock
 
         root = project_root or Path.cwd()

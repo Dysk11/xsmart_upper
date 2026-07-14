@@ -216,7 +216,7 @@ extensions:
     retry_interval_sec: 0.50
     cooldown_seconds: 20.0
     bbox_display_seconds: 1.0
-    output_dir: outputs/logs
+    output_dir: outputs/logs/ocr
 
   qianfan_route:
     enable: true
@@ -227,7 +227,9 @@ extensions:
     read_timeout_sec: 8.0
     max_attempts: 2
     retry_interval_sec: 0.5
-    fallback_direction: left
+    default_direction: left
+    decision_ttl_sec: 20.0
+    output_dir: outputs/logs/api
 
 logger:
   # CSV 日志方便赛后分析误差和调速效果。

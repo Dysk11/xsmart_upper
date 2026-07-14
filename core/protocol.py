@@ -6,24 +6,18 @@ from typing import Any, Dict, Mapping
 
 
 PROTOCOL_DESCRIPTION = """
-默认文本协议说明:
-1. 每条消息为一行 UTF-8 文本，以换行符 '\\n' 结尾。
-2. 字段之间使用逗号分隔，字段格式为 key=value。
-3. 默认字段顺序如下:
-   ts_ms, mode, target_speed, steer_deg, lateral_error_px,
-   heading_error_deg, curvature, confidence, is_lane_lost
-4. 示例:
-   ts_ms=1711111111111,mode=NORMAL,target_speed=1.200,steer_deg=-3.500,
-   lateral_error_px=12.300,heading_error_deg=-1.200,curvature=0.004500,
-   confidence=0.860,is_lane_lost=0
-5. 若后续 TC264 需要更换为二进制协议，只需改写本文件中的 build_packet()
-   与 parse_packet()，其余模块接口可以保持不变。
+固定 7 字节二进制协议:
+1. 帧头为 AA 55。
+2. 后接横向误差 Int16、转向角 Int16，均为大端序。
+3. 最后一个字节为运行状态，bit0=0 表示停车，bit0=1 表示允许运行；
+   bit1..bit7 保留且固定为 0。
 """.strip()
 
 PACKET_FIELDS = [
     "ts_ms",
     "mode",
     "target_speed",
+    "motion_flag",
     "steer_deg",
     "lateral_error_px",
     "heading_error_deg",
@@ -43,10 +37,17 @@ def normalize_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         返回归一化后的字段字典，字段名与 PACKET_FIELDS 保持一致。
     """
 
+    target_speed = float(payload.get("target_speed", 0.0))
+    motion_flag = (
+        int(payload["motion_flag"]) & 0x01
+        if "motion_flag" in payload
+        else int(target_speed > 0.0)
+    )
     return {
         "ts_ms": int(payload.get("ts_ms", 0)),
         "mode": str(payload.get("mode", "NORMAL")),
-        "target_speed": float(payload.get("target_speed", 0.0)),
+        "target_speed": target_speed,
+        "motion_flag": motion_flag,
         "steer_deg": float(payload.get("steer_deg", 0.0)),
         "lateral_error_px": float(payload.get("lateral_error_px", 0.0)),
         "heading_error_deg": float(payload.get("heading_error_deg", 0.0)),
@@ -81,7 +82,8 @@ def build_packet(payload: Mapping[str, Any]) -> bytes:
         (error >> 8) & 0xFF,
         error & 0xFF,
         (angle >> 8) & 0xFF,
-        angle & 0xFF
+        angle & 0xFF,
+        normalized["motion_flag"] & 0x01,
     ])
     
     return bytes(data)
@@ -98,7 +100,7 @@ def parse_packet(packet: bytes | str) -> Dict[str, Any]:
     """
 
     result: Dict[str, Any] = {}
-    if not isinstance(packet, bytes) or len(packet) < 6:
+    if not isinstance(packet, bytes) or len(packet) != 7:
         return result
 
     if packet[0] == 0xAA and packet[1] == 0x55:
@@ -112,5 +114,6 @@ def parse_packet(packet: bytes | str) -> Dict[str, Any]:
             
         result["lateral_error_px"] = float(error)
         result["steer_deg"] = float(angle)
+        result["motion_flag"] = int(packet[6] & 0x01)
 
     return result

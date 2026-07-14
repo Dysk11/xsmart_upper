@@ -39,3 +39,37 @@ def test_ocr_bbox_timer_requires_a_valid_bbox() -> None:
     result = OcrResult(frame_id=3)
     assert timer.observe(result, now=5.0)
     assert not timer.is_visible(result, now=5.1)
+
+
+def test_payload_motion_flag_tracks_final_target_speed() -> None:
+    from types import SimpleNamespace
+    from main import UpperMachineApp
+
+    state = SimpleNamespace(
+        lateral_error_px=0.0,
+        heading_error_deg=0.0,
+        curvature=0.0,
+        confidence=1.0,
+        is_lane_lost=False,
+    )
+    moving = SimpleNamespace(ts_ms=1, mode="NORMAL", target_speed=0.25, steer_deg=0.0)
+    stopped = SimpleNamespace(ts_ms=2, mode="QIANFAN_WAIT", target_speed=0.0, steer_deg=0.0)
+
+    assert UpperMachineApp._build_payload(None, moving, state)["motion_flag"] == 1
+    assert UpperMachineApp._build_payload(None, stopped, state)["motion_flag"] == 0
+
+
+def test_runtime_config_resolves_separate_ocr_and_api_log_directories(tmp_path) -> None:
+    from pathlib import Path
+    from main import prepare_runtime_config
+
+    config = {
+        "extensions": {
+            "ocr": {"output_dir": "outputs/logs/ocr"},
+            "qianfan_route": {"output_dir": "outputs/logs/api"},
+        }
+    }
+    runtime = prepare_runtime_config(config, tmp_path)
+
+    assert Path(runtime["extensions"]["ocr"]["output_dir"]) == tmp_path / "outputs/logs/ocr"
+    assert Path(runtime["extensions"]["qianfan_route"]["output_dir"]) == tmp_path / "outputs/logs/api"

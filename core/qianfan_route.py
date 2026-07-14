@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
 import requests
@@ -30,7 +33,9 @@ class QianfanRouteConfig:
     read_timeout_sec: float = 8.0
     max_attempts: int = 2
     retry_interval_sec: float = 0.5
-    fallback_direction: str = "left"
+    default_direction: str = "left"
+    decision_ttl_sec: float = 20.0
+    output_dir: str = "outputs/logs/api"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "QianfanRouteConfig":
@@ -44,7 +49,9 @@ class QianfanRouteConfig:
             read_timeout_sec=float(source.get("read_timeout_sec", cls.read_timeout_sec)),
             max_attempts=int(source.get("max_attempts", cls.max_attempts)),
             retry_interval_sec=float(source.get("retry_interval_sec", cls.retry_interval_sec)),
-            fallback_direction=str(source.get("fallback_direction", cls.fallback_direction)).strip().casefold(),
+            default_direction=str(source.get("default_direction", cls.default_direction)).strip().casefold(),
+            decision_ttl_sec=float(source.get("decision_ttl_sec", cls.decision_ttl_sec)),
+            output_dir=str(source.get("output_dir", cls.output_dir)).strip(),
         )
         if not config.api_url:
             raise ValueError("extensions.qianfan_route.api_url must not be empty")
@@ -60,8 +67,12 @@ class QianfanRouteConfig:
             raise ValueError("extensions.qianfan_route.max_attempts must be at least one")
         if config.retry_interval_sec < 0:
             raise ValueError("extensions.qianfan_route.retry_interval_sec must not be negative")
-        if config.fallback_direction not in {"left", "right"}:
-            raise ValueError("extensions.qianfan_route.fallback_direction must be left or right")
+        if config.default_direction not in {"left", "right"}:
+            raise ValueError("extensions.qianfan_route.default_direction must be left or right")
+        if config.decision_ttl_sec <= 0:
+            raise ValueError("extensions.qianfan_route.decision_ttl_sec must be greater than zero")
+        if not config.output_dir:
+            raise ValueError("extensions.qianfan_route.output_dir must not be empty")
         return config
 
 
@@ -81,6 +92,7 @@ class QianfanRouteDecision:
     elapsed_sec: float = 0.0
     error: str = ""
     fallback: bool = False
+    attempt_records: tuple[dict[str, Any], ...] = ()
 
 
 def build_question(ocr_text: str) -> str:
@@ -92,6 +104,52 @@ def parse_direction(answer: Any) -> str | None:
         return None
     normalized = answer.strip().casefold()
     return normalized if normalized in {"left", "right"} else None
+
+
+class QianfanApiLogger:
+    """Append API attempts and final decisions to one UTF-8 JSONL file per run."""
+
+    def __init__(self, output_dir: str | Path) -> None:
+        self.output_dir = Path(output_dir)
+        self.file_path: Path | None = None
+
+    def append_result(
+        self,
+        decision: QianfanRouteDecision,
+        decision_ttl_sec: float,
+        received_at: datetime | None = None,
+    ) -> Path:
+        received = received_at or datetime.now().astimezone()
+        for attempt in decision.attempt_records:
+            self._append({
+                "timestamp": received.isoformat(timespec="milliseconds"),
+                "record_type": "attempt",
+                **attempt,
+            })
+        expires = received + timedelta(seconds=float(decision_ttl_sec))
+        return self._append({
+            "timestamp": received.isoformat(timespec="milliseconds"),
+            "record_type": "decision",
+            "event_id": decision.event_id,
+            "status": decision.status,
+            "direction": decision.direction,
+            "raw_answer": decision.raw_answer,
+            "attempts": decision.attempts,
+            "elapsed_sec": decision.elapsed_sec,
+            "error": decision.error,
+            "fallback": decision.fallback,
+            "decision_ttl_sec": float(decision_ttl_sec),
+            "expires_at": expires.isoformat(timespec="milliseconds"),
+        })
+
+    def _append(self, record: Mapping[str, Any]) -> Path:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        if self.file_path is None:
+            timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+            self.file_path = self.output_dir / f"api_events_{timestamp}.jsonl"
+        with self.file_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(record), ensure_ascii=False) + "\n")
+        return self.file_path
 
 
 class QianfanRouteClient:
@@ -114,9 +172,16 @@ class QianfanRouteClient:
 
     def decide(self, request: QianfanRouteRequest) -> QianfanRouteDecision:
         started_at = self.clock()
+        attempt_records: list[dict[str, Any]] = []
         api_key = os.getenv(self.config.api_key_env, "").strip()
         if not api_key:
-            return self._fallback(request, 0, started_at, f"missing environment variable {self.config.api_key_env}")
+            return self._fallback(
+                request,
+                0,
+                started_at,
+                f"missing environment variable {self.config.api_key_env}",
+                attempt_records=attempt_records,
+            )
 
         question = build_question(request.ocr_text)
         headers = {
@@ -137,6 +202,7 @@ class QianfanRouteClient:
         for attempt in range(1, self.config.max_attempts + 1):
             attempt_started = self.clock()
             retryable = True
+            status_code: int | None = None
             try:
                 response = self.session.post(
                     self.config.api_url,
@@ -158,7 +224,17 @@ class QianfanRouteClient:
                     last_answer = data["choices"][0]["message"]["content"]
                     direction = parse_direction(last_answer)
                     if direction is not None:
-                        self._log_attempt(request, attempt, attempt_started, last_answer, direction, "")
+                        attempt_records.append(
+                            self._log_attempt(
+                                request,
+                                attempt,
+                                attempt_started,
+                                last_answer,
+                                direction,
+                                "",
+                                status_code,
+                            )
+                        )
                         return QianfanRouteDecision(
                             event_id=request.event_id,
                             status="success",
@@ -166,6 +242,7 @@ class QianfanRouteClient:
                             raw_answer=last_answer.strip(),
                             attempts=attempt,
                             elapsed_sec=self.clock() - started_at,
+                            attempt_records=tuple(attempt_records),
                         )
                     last_error = f"invalid answer: {last_answer!r}"
             except requests.exceptions.ConnectTimeout:
@@ -179,13 +256,37 @@ class QianfanRouteClient:
             except requests.exceptions.RequestException as exc:
                 last_error = f"request error: {exc}"
 
-            self._log_attempt(request, attempt, attempt_started, last_answer, "", last_error)
+            attempt_records.append(
+                self._log_attempt(
+                    request,
+                    attempt,
+                    attempt_started,
+                    last_answer,
+                    "",
+                    last_error,
+                    status_code,
+                )
+            )
             if not retryable or attempt >= self.config.max_attempts:
-                return self._fallback(request, attempt, started_at, last_error, last_answer)
+                return self._fallback(
+                    request,
+                    attempt,
+                    started_at,
+                    last_error,
+                    last_answer,
+                    attempt_records,
+                )
             if self.config.retry_interval_sec > 0:
                 self.sleep(self.config.retry_interval_sec)
 
-        return self._fallback(request, self.config.max_attempts, started_at, last_error, last_answer)
+        return self._fallback(
+            request,
+            self.config.max_attempts,
+            started_at,
+            last_error,
+            last_answer,
+            attempt_records,
+        )
 
     def close(self) -> None:
         if self._owns_session:
@@ -198,16 +299,18 @@ class QianfanRouteClient:
         started_at: float,
         error: str,
         raw_answer: str = "",
+        attempt_records: list[dict[str, Any]] | None = None,
     ) -> QianfanRouteDecision:
         return QianfanRouteDecision(
             event_id=request.event_id,
             status="fallback",
-            direction=self.config.fallback_direction,
+            direction=self.config.default_direction,
             raw_answer=raw_answer.strip(),
             attempts=attempts,
             elapsed_sec=self.clock() - started_at,
             error=error,
             fallback=True,
+            attempt_records=tuple(attempt_records or ()),
         )
 
     def _log_attempt(
@@ -218,47 +321,63 @@ class QianfanRouteClient:
         raw_answer: Any,
         direction: str,
         error: str,
-    ) -> None:
-        if self.attempt_logger is None:
-            return
-        self.attempt_logger(
-            {
-                "event_id": request.event_id,
-                "attempt": attempt,
-                "max_attempts": self.config.max_attempts,
-                "connect_timeout_sec": self.config.connect_timeout_sec,
-                "read_timeout_sec": self.config.read_timeout_sec,
-                "elapsed_sec": self.clock() - started_at,
-                "question": build_question(request.ocr_text),
-                "raw_answer": raw_answer if isinstance(raw_answer, str) else repr(raw_answer),
-                "direction": direction,
-                "error": error,
-            }
-        )
+        http_status: int | None,
+    ) -> dict[str, Any]:
+        details = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "event_id": request.event_id,
+            "attempt": attempt,
+            "max_attempts": self.config.max_attempts,
+            "connect_timeout_sec": self.config.connect_timeout_sec,
+            "read_timeout_sec": self.config.read_timeout_sec,
+            "elapsed_sec": self.clock() - started_at,
+            "question": build_question(request.ocr_text),
+            "http_status": http_status,
+            "raw_answer": raw_answer if isinstance(raw_answer, str) else repr(raw_answer),
+            "direction": direction,
+            "error": error,
+        }
+        if self.attempt_logger is not None:
+            self.attempt_logger(details)
+        return details
 
 
 class QianfanRouteState:
-    """Own one OCR-to-fork decision from submission until fork release."""
+    """Keep the newest API direction active for a bounded time window."""
 
-    def __init__(self, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        enabled: bool = True,
+        default_direction: str = "left",
+        decision_ttl_sec: float = 20.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.enabled = bool(enabled)
+        self.default_direction = str(default_direction).casefold()
+        self.decision_ttl_sec = float(decision_ttl_sec)
+        self.clock = clock
+        if self.default_direction not in {"left", "right"}:
+            raise ValueError("default_direction must be left or right")
+        if self.decision_ttl_sec <= 0:
+            raise ValueError("decision_ttl_sec must be greater than zero")
         self.pending_event_id: int | None = None
         self.decision: QianfanRouteDecision | None = None
+        self.decision_expires_at = 0.0
         self.last_submitted_event_id = 0
-        self.fork_engaged = False
 
     @property
-    def route_direction(self) -> str | None:
-        return None if self.decision is None else self.decision.direction
+    def route_direction(self) -> str:
+        self._expire_if_needed()
+        return self.default_direction if self.decision is None else self.decision.direction
 
     @property
     def idle(self) -> bool:
-        return self.pending_event_id is None and self.decision is None
+        return self.pending_event_id is None
 
     def submit(self, event_id: int, text: str, output_queue: Any) -> bool:
         if (
             not self.enabled
-            or not self.idle
+            or self.pending_event_id is not None
             or event_id <= 0
             or event_id <= self.last_submitted_event_id
             or not text
@@ -274,6 +393,7 @@ class QianfanRouteState:
             return False
         self.pending_event_id = None
         self.decision = result
+        self.decision_expires_at = self.clock() + self.decision_ttl_sec
         return True
 
     def should_stop(self, fork_result: Any) -> bool:
@@ -281,23 +401,9 @@ class QianfanRouteState:
             return False
         if self.pending_event_id is not None:
             return True
-        if self.decision is None:
-            return False
-        return getattr(fork_result, "selected_direction", None) != self.decision.direction
+        return getattr(fork_result, "selected_direction", None) != self.route_direction
 
-    def observe_fork(self, fork_result: Any) -> bool:
-        fork_detected = bool(getattr(fork_result, "fork_detected", False))
-        selected_direction = getattr(fork_result, "selected_direction", None)
-        if (
-            fork_detected
-            and self.decision is not None
-            and selected_direction == self.decision.direction
-        ):
-            self.fork_engaged = True
-            return False
-        if self.fork_engaged:
-            self.pending_event_id = None
+    def _expire_if_needed(self) -> None:
+        if self.decision is not None and self.clock() >= self.decision_expires_at:
             self.decision = None
-            self.fork_engaged = False
-            return True
-        return False
+            self.decision_expires_at = 0.0

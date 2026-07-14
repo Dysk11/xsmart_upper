@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from core.blocking_analyzer import DetectedObject
 from core.ocr import OcrResult
@@ -107,6 +108,32 @@ def test_high_confidence_logs_once_then_cools_down_for_20_seconds() -> None:
     assert second is not None and second.text == "左道"
     assert second.event_id == 2
     assert recognizer.calls == 2
+
+
+def test_custom_ocr_cooldown_is_loaded_from_config() -> None:
+    clock = FakeClock()
+    recognizer = FakeRecognizer([
+        OcrResult(text="右道", confidence=0.90),
+        OcrResult(text="左道", confidence=0.92),
+    ])
+    custom = config()
+    custom["cooldown_seconds"] = 3.0
+    session = RoadSignOcrSession(custom, recognizer=recognizer, event_logger=FakeLogger(), clock=clock)
+
+    assert session.update(FRAME, 1, SIGN) is not None
+    clock.now = 2.999
+    session.update(FRAME, 2, SIGN)
+    assert recognizer.calls == 1
+    clock.now = 3.0
+    session.update(FRAME, 3, SIGN)
+    assert recognizer.calls == 2
+
+
+def test_negative_ocr_cooldown_is_rejected() -> None:
+    invalid = config()
+    invalid["cooldown_seconds"] = -1
+    with pytest.raises(ValueError, match="cooldown_seconds"):
+        RoadSignOcrSession(invalid, recognizer=FakeRecognizer([]), event_logger=FakeLogger())
 
 
 def test_low_confidence_retries_without_logging_or_cooldown() -> None:
