@@ -350,6 +350,28 @@ Windows 端可使用 `tools/run_orangepi_benchmark.ps1 -Scout` 通过专用 SSH 
 `extensions.ocr` 中配置。板端只需要 RKNN-Toolkit-Lite2，不使用 ONNX 或
 PaddlePaddle；额外 Python 依赖为 `shapely`、`pyclipper` 和 `six`。
 
+## RK3588 千帆岔路决策
+
+高置信度 OCR 事件会由独立进程发送给千帆 `ernie-4.5-turbo-vl`，HTTP 请求不会阻塞
+摄像头、目标检测或巡线。模型回答必须严格为 `left` 或 `right`，该方向会控制下一处
+已确认岔路；请求未完成时车辆可以继续接近岔路，但到达岔路后会以
+`QIANFAN_WAIT` 模式停车。请求最终失败时使用配置的回退方向，默认走左侧。
+
+启动前在板端设置 API Key：
+
+```bash
+export QIANFAN_API_KEY='你的 API Key'
+python3 main.py --no-gui
+```
+
+`config/config.yaml` 的 `extensions.qianfan_route` 提供 API 地址、模型、API Key 环境
+变量名、连接超时、读取超时、最大尝试次数、重试间隔和回退方向。超时必须大于 0，
+最大尝试次数至少为 1；缺少 API Key 或鉴权失败时不会把密钥打印到日志。
+
+每次尝试和最终决策都会输出 `[QIANFAN]` 日志，包括 OCR 事件号、问题、尝试次数、
+配置超时、耗时、原始回答、解析方向、错误和是否回退。一个 OCR 事件只控制下一处
+岔路，驶离岔路后自动清除。
+
 ## 输出日志
 
 CSV 日志保存在 `outputs/logs/`，包含误差、曲率、置信度、目标速度/转向等，适合离线分析。

@@ -51,6 +51,32 @@ def test_both_forks_are_reported_independently() -> None:
     assert result.fork_result.right_detected
 
 
+def test_route_direction_selects_different_fork_centerlines() -> None:
+    left_result = _detector().detect_from_mask(_fork_mask("both"), route_direction="left")
+    right_result = _detector().detect_from_mask(_fork_mask("both"), route_direction="right")
+
+    assert left_result.fork_result.requested_direction == "left"
+    assert left_result.fork_result.selected_direction == "left"
+    assert right_result.fork_result.requested_direction == "right"
+    assert right_result.fork_result.selected_direction == "right"
+    assert min(x for x, y in left_result.centerline_points if y < 100) < 110
+    assert max(x for x, y in right_result.centerline_points if y < 100) > 190
+
+
+def test_active_fork_waits_when_branch_choices_are_temporarily_missing() -> None:
+    detector = _detector()
+    selected = detector.detect_from_mask(_fork_mask("both"), route_direction="left")
+    assert selected.fork_result.selected_direction == "left"
+
+    trunk_only = np.zeros((220, 300), dtype=np.uint8)
+    cv2.rectangle(trunk_only, (130, 25), (170, 219), 255, -1)
+    waiting = detector.detect_from_mask(trunk_only, route_direction="left")
+
+    assert waiting.fork_result.fork_detected
+    assert waiting.fork_result.selected_direction is None
+    assert "branch unavailable" in waiting.fork_result.reason
+
+
 def test_plain_curve_does_not_trigger_fork() -> None:
     mask = np.zeros((220, 300), dtype=np.uint8)
     points = np.asarray([(130 + int(25 * (1 - y / 219)), y) for y in range(220)], dtype=np.int32)

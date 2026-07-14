@@ -218,6 +218,17 @@ extensions:
     bbox_display_seconds: 1.0
     output_dir: outputs/logs
 
+  qianfan_route:
+    enable: true
+    api_url: https://qianfan.baidubce.com/v2/chat/completions
+    model: ernie-4.5-turbo-vl
+    api_key_env: QIANFAN_API_KEY
+    connect_timeout_sec: 2.0
+    read_timeout_sec: 8.0
+    max_attempts: 2
+    retry_interval_sec: 0.5
+    fallback_direction: left
+
 logger:
   # CSV 日志方便赛后分析误差和调速效果。
   enable: false

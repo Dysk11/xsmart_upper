@@ -38,6 +38,12 @@ from core.lane_tracker import LaneTracker, TrackedLaneState
 from core.logger import CsvLogger
 from core.ocr import OcrResult
 from core.planner import ControlCommand, HighLevelPlanner, ModuleHints
+from core.qianfan_route import (
+    QianfanRouteClient,
+    QianfanRouteConfig,
+    QianfanRouteDecision,
+    QianfanRouteState,
+)
 from core.rknn_object_detector import RknnObjectDetector
 from core.rknn_lane_segmenter import RknnLaneSegmenter, SegmentationResult
 from core.road_sign_ocr import RoadSignOcrSession
@@ -395,6 +401,40 @@ def _ai_inference_worker(
         ocr_session.close()
 
 
+def _qianfan_route_worker(
+    config: Dict[str, Any],
+    input_queue: Any,
+    output_queue: Any,
+    stop_event: Any,
+) -> None:
+    """Resolve accepted OCR text through Qianfan without blocking vision workers."""
+
+    def log_attempt(details: dict[str, Any]) -> None:
+        print(
+            "[QIANFAN] "
+            f"event={details['event_id']} attempt={details['attempt']}/{details['max_attempts']} "
+            f"timeout=({details['connect_timeout_sec']:.1f},{details['read_timeout_sec']:.1f})s "
+            f"latency={details['elapsed_sec']:.3f}s question={details['question']!r} "
+            f"answer={details['raw_answer']!r} direction={details['direction'] or '-'}"
+            + (f" error={details['error']}" if details["error"] else ""),
+            flush=True,
+        )
+
+    client = QianfanRouteClient(config, attempt_logger=log_attempt)
+    try:
+        while not stop_event.is_set():
+            try:
+                request = input_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if request is None:
+                break
+            decision = client.decide(request)
+            _put_latest(output_queue, decision)
+    finally:
+        client.close()
+
+
 def _lane_inference_worker(
     worker_index: int,
     segmenter_config: Dict[str, Any],
@@ -654,12 +694,17 @@ class UpperMachineApp:
         self.ocr_bbox_timer = OcrBBoxDisplayTimer(
             hold_seconds=float(ocr_config.get("bbox_display_seconds", 1.0))
         )
+        qianfan_config_mapping = config.get("extensions", {}).get("qianfan_route", {})
+        self.qianfan_config = QianfanRouteConfig.from_mapping(qianfan_config_mapping)
+        self.qianfan_route_state = QianfanRouteState(enabled=self.qianfan_config.enable)
         self.frame_id = 0
 
         self.mp_context = mp.get_context("spawn")
         self.stop_event = self.mp_context.Event()
         self.ai_input_queue = self.mp_context.Queue(maxsize=1)
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
+        self.qianfan_input_queue = self.mp_context.Queue(maxsize=1)
+        self.qianfan_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
         self.ai_ack_queue = self.mp_context.Queue()
         self.lane_output_queue = self.mp_context.Queue(maxsize=max(2, len(worker_core_masks) * 2))
@@ -711,6 +756,16 @@ class UpperMachineApp:
             ),
             name="xsmart-ai-inference",
         )
+        self.qianfan_process = self.mp_context.Process(
+            target=_qianfan_route_worker,
+            args=(
+                qianfan_config_mapping,
+                self.qianfan_input_queue,
+                self.qianfan_output_queue,
+                self.stop_event,
+            ),
+            name="xsmart-qianfan-route",
+        )
         self.ui_process = self.mp_context.Process(
             target=_ui_worker,
             args=(
@@ -743,6 +798,8 @@ class UpperMachineApp:
         self.bridge.connect()
         self.csv_logger.open()
         self.ai_process.start()
+        if self.qianfan_config.enable:
+            self.qianfan_process.start()
         for process in self.lane_processes:
             process.start()
         if self.ui_active:
@@ -804,11 +861,32 @@ class UpperMachineApp:
                         assert worker_ocr_attempt is not None
                         self.last_ocr_attempt = worker_ocr_attempt
                         self._print_ocr_attempt(worker_ocr_attempt)
+            if self.last_ocr_result.is_new and self.qianfan_route_state.submit(
+                self.last_ocr_result.event_id,
+                self.last_ocr_result.text,
+                self.qianfan_input_queue,
+            ):
+                print(
+                    f"[QIANFAN] event={self.last_ocr_result.event_id} status=pending "
+                    f"text={self.last_ocr_result.text!r}",
+                    flush=True,
+                )
+            qianfan_result = _drain_latest(self.qianfan_output_queue)
+            if isinstance(qianfan_result, QianfanRouteDecision) and self.qianfan_route_state.accept(qianfan_result):
+                print(
+                    f"[QIANFAN] event={qianfan_result.event_id} status={qianfan_result.status} "
+                    f"direction={qianfan_result.direction} attempts={qianfan_result.attempts} "
+                    f"latency={qianfan_result.elapsed_sec:.3f}s answer={qianfan_result.raw_answer!r} "
+                    f"fallback={qianfan_result.fallback}"
+                    + (f" error={qianfan_result.error}" if qianfan_result.error else ""),
+                    flush=True,
+                )
             segmentation_result = self._segment_lane(frame, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             detection_result = self.detector.detect_from_mask(
                 roi_mask,
+                route_direction=self.qianfan_route_state.route_direction,
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
             )
@@ -817,7 +895,7 @@ class UpperMachineApp:
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
             tracked_state = self.tracker.update(
                 detection_result,
-                prefer_current=False,
+                prefer_current=detection_result.fork_result.selected_direction is not None,
             )
             lane_track_time = time.perf_counter()
             self._record_lane_timing(
@@ -844,6 +922,7 @@ class UpperMachineApp:
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
             payload = self._build_payload(control_command, planning_state)
             self.bridge.send(payload)
+            self.qianfan_route_state.observe_fork(detection_result.fork_result)
             fps_value = self.fps_counter.update()
 
             # 第 7 步：把关键数据落盘，方便赛后分析和调参。
@@ -1036,11 +1115,15 @@ class UpperMachineApp:
         self.bridge.close()
         self.stop_event.set()
         _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
+        if self.qianfan_config.enable:
+            _put_latest(self.qianfan_input_queue, None)
         if self.ui_active:
             _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
         for lane_queue in self.lane_input_queues:
             _put_latest(lane_queue, None, release_func=self._release_owned_shared_payload)
         processes = [self.ai_process, *self.lane_processes]
+        if self.qianfan_config.enable:
+            processes.append(self.qianfan_process)
         if self.ui_active:
             processes.append(self.ui_process)
         for process in processes:
@@ -1104,8 +1187,13 @@ class UpperMachineApp:
 
         _ = frame
         _ = roi_rect
-        _ = detection_result
         _ = tracked_state
+        if self.qianfan_route_state.should_stop(detection_result.fork_result):
+            return ModuleHints(
+                stop=True,
+                force_mode="QIANFAN_WAIT",
+                note="waiting for Qianfan route decision or requested branch",
+            )
         if (
             self.last_gold_result is not None
             and self.last_gold_result.active

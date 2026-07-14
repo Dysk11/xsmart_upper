@@ -249,6 +249,7 @@ class LaneDetector:
         mask = np.where(roi_mask > 0, 255, 0).astype(np.uint8)
         return self._detect_from_boundaries(
             mask,
+            route_direction=route_direction,
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
         )
@@ -324,6 +325,7 @@ class LaneDetector:
     def _detect_from_boundaries(
         self,
         mask: np.ndarray,
+        route_direction: str | None,
         segmentation_confidence: float,
         segmentation_status: str,
     ) -> LaneDetectionResult:
@@ -339,13 +341,6 @@ class LaneDetector:
             left_branch_rows,
             right_branch_rows,
         ) = self._extract_row_boundaries(mask)
-        centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
-        fit_coeffs = self._fit_centerline(centerline_points)
-        widths = [right[0] - left[0] for left, right in zip(left_points, right_points) if right[0] > left[0]]
-        lane_width_px = float(np.median(widths)) if widths else self.last_lane_width_px
-        lateral_error_px, heading_error_deg, curvature = self._article_metrics(
-            centerline_points, fit_coeffs, mask.shape
-        )
         fork_result = self._geometric_fork_result(
             left_points,
             right_points,
@@ -354,6 +349,38 @@ class LaneDetector:
             left_branch_rows,
             right_branch_rows,
             mask.shape,
+        )
+        requested_direction = self._normalize_route_direction(route_direction)
+        if requested_direction is not None:
+            fork_result.requested_direction = requested_direction
+            branch_choices_visible = bool(left_branch_rows or right_branch_rows)
+            if fork_result.fork_detected and branch_choices_visible:
+                (
+                    left_points,
+                    right_points,
+                    raw_centers,
+                    left_lost,
+                    right_lost,
+                    selected_mask,
+                    _selected_left_branches,
+                    _selected_right_branches,
+                ) = self._extract_row_boundaries(mask, route_direction=requested_direction)
+                if raw_centers:
+                    fork_result.selected_direction = requested_direction
+                    fork_result.reason = f"selected {requested_direction} branch"
+                else:
+                    fork_result.reason = f"requested {requested_direction} but branch unavailable"
+            elif fork_result.fork_detected:
+                fork_result.reason = f"requested {requested_direction} but branch unavailable"
+            else:
+                fork_result.reason = f"waiting for {requested_direction} fork"
+
+        centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
+        fit_coeffs = self._fit_centerline(centerline_points)
+        widths = [right[0] - left[0] for left, right in zip(left_points, right_points) if right[0] > left[0]]
+        lane_width_px = float(np.median(widths)) if widths else self.last_lane_width_px
+        lateral_error_px, heading_error_deg, curvature = self._article_metrics(
+            centerline_points, fit_coeffs, mask.shape
         )
         confidence = self._estimate_confidence(
             selected_mask,
@@ -389,7 +416,7 @@ class LaneDetector:
             segmentation_status=segmentation_status,
         )
 
-    def _extract_row_boundaries(self, mask: np.ndarray):
+    def _extract_row_boundaries(self, mask: np.ndarray, route_direction: str | None = None):
         """Follow the run nearest the previous center from the vehicle upward."""
 
         height, width = mask.shape[:2]
@@ -417,7 +444,12 @@ class LaneDetector:
 
             single_side_gap = 0
             centers = [0.5 * (left + right) for left, right in runs]
-            chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
+            if route_direction == "left" and len(runs) > 1:
+                chosen_index = min(range(len(runs)), key=lambda index: centers[index])
+            elif route_direction == "right" and len(runs) > 1:
+                chosen_index = max(range(len(runs)), key=lambda index: centers[index])
+            else:
+                chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
             left, right = runs[chosen_index]
             for index, (candidate_left, candidate_right) in enumerate(runs):
                 if index == chosen_index:
