@@ -331,6 +331,7 @@ class LaneDetector:
     ) -> LaneDetectionResult:
         """Build the driving centerline directly from row-wise track boundaries."""
 
+        row_runs = self._build_row_runs(mask)
         (
             left_points,
             right_points,
@@ -340,7 +341,7 @@ class LaneDetector:
             selected_mask,
             left_branch_rows,
             right_branch_rows,
-        ) = self._extract_row_boundaries(mask)
+        ) = self._extract_row_boundaries(mask, row_runs=row_runs)
         fork_result = self._geometric_fork_result(
             left_points,
             right_points,
@@ -364,7 +365,11 @@ class LaneDetector:
                     selected_mask,
                     _selected_left_branches,
                     _selected_right_branches,
-                ) = self._extract_row_boundaries(mask, route_direction=requested_direction)
+                ) = self._extract_row_boundaries(
+                    mask,
+                    route_direction=requested_direction,
+                    row_runs=row_runs,
+                )
                 if raw_centers:
                     fork_result.selected_direction = requested_direction
                     fork_result.reason = f"selected {requested_direction} branch"
@@ -416,10 +421,41 @@ class LaneDetector:
             segmentation_status=segmentation_status,
         )
 
-    def _extract_row_boundaries(self, mask: np.ndarray, route_direction: str | None = None):
+    def _build_row_runs(self, mask: np.ndarray) -> list[list[tuple[int, int]]]:
+        """Precompute valid foreground runs for every row in one NumPy pass."""
+
+        height, width = mask.shape[:2]
+        padded = np.zeros((height, width + 2), dtype=np.uint8)
+        padded[:, 1 : width + 1] = mask > 0
+        transitions = np.diff(padded.astype(np.int8, copy=False), axis=1)
+        start_rows, start_xs = np.nonzero(transitions == 1)
+        end_rows, end_exclusive_xs = np.nonzero(transitions == -1)
+
+        row_runs: list[list[tuple[int, int]]] = [[] for _ in range(height)]
+        for start_row, start_x, end_row, end_exclusive_x in zip(
+            start_rows,
+            start_xs,
+            end_rows,
+            end_exclusive_xs,
+        ):
+            if start_row != end_row:
+                continue
+            if int(end_exclusive_x) - int(start_x) < self.min_run_width_px:
+                continue
+            row_runs[int(start_row)].append((int(start_x), int(end_exclusive_x) - 1))
+        return row_runs
+
+    def _extract_row_boundaries(
+        self,
+        mask: np.ndarray,
+        route_direction: str | None = None,
+        row_runs: Sequence[Sequence[tuple[int, int]]] | None = None,
+    ):
         """Follow the run nearest the previous center from the vehicle upward."""
 
         height, width = mask.shape[:2]
+        if row_runs is None:
+            row_runs = self._build_row_runs(mask)
         selected_mask = np.zeros_like(mask)
         prior_center = float(self.last_centerline_points[0][0]) if self.last_centerline_points else width * 0.5
         prior_width = max(float(self.last_lane_width_px), float(self.min_run_width_px))
@@ -429,12 +465,7 @@ class LaneDetector:
         single_side_gap = 0
 
         for y in range(height - 1, -1, -1):
-            xs = np.flatnonzero(mask[y] > 0)
-            runs: list[tuple[int, int]] = []
-            if xs.size:
-                starts = np.r_[0, np.flatnonzero(np.diff(xs) > 1) + 1]
-                ends = np.r_[starts[1:] - 1, xs.size - 1]
-                runs = [(int(xs[s]), int(xs[e])) for s, e in zip(starts, ends) if xs[e] - xs[s] + 1 >= self.min_run_width_px]
+            runs = row_runs[y]
             if not runs:
                 single_side_gap += 1
                 if single_side_gap <= self.max_single_side_gap_rows and rows:

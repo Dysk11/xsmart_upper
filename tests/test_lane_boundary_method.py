@@ -30,6 +30,22 @@ def test_article_weight_table_has_one_weight_per_source_row() -> None:
     assert ARTICLE_ROW_WEIGHTS[73] == 10
 
 
+def test_vectorized_row_runs_preserve_edges_gaps_and_minimum_width() -> None:
+    mask = np.zeros((4, 12), dtype=np.uint8)
+    mask[0, 0:4] = 255
+    mask[0, 6:12] = 255
+    mask[1, 2:5] = 255
+    mask[2, 3:8] = 255
+    mask[2, 10:12] = 255
+
+    assert _detector()._build_row_runs(mask) == [
+        [(0, 3), (6, 11)],
+        [],
+        [(3, 7)],
+        [],
+    ]
+
+
 def test_straight_lane_center_is_near_zero_error() -> None:
     mask = np.zeros((200, 320), dtype=np.uint8)
     cv2.rectangle(mask, (125, 0), (195, 199), 255, -1)

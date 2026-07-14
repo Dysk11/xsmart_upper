@@ -1,6 +1,6 @@
 app:
   # FPS 数字显示的平滑系数，越大越灵敏，越小越稳定。
-  fps_smoothing_alpha: 0.2
+  fps_smoothing_alpha: 0.1
 
 camera:
   # 图像源模式：camera 表示实时摄像头，video 表示本地视频回放，shared_memory 表示 AR 共享内存。
@@ -86,7 +86,7 @@ rknn_lane_segmenter:
   parallel: true
   worker_count: 3
   worker_core_masks: [NPU_CORE_0, NPU_CORE_1, NPU_CORE_2]
-  max_result_age_frames: 2
+  max_result_age_frames: 4
   drop_stale_results: true
   
 rknn_object_detector:
@@ -192,8 +192,7 @@ visualizer:
   video_name: xsmart.mp4
   video_fourcc: mp4v
   video_fps: 25
-
-  frame_stride: 3
+  frame_stride: 1
 
 extensions:
   ocr:
