@@ -12,6 +12,7 @@ import numpy as np
 from core.planning.avoidance import AvoidanceTargetResult
 from core.object.blocking import BlockingAnalysisResult, DetectedObject
 from core.planning.gold_target import GoldTargetResult
+from core.planning.path_marker_target import PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult
 from core.lane.tracker import TrackedLaneState
 from core.ocr.recognizer import OcrResult
@@ -63,6 +64,7 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        path_marker_result: PathMarkerTargetResult | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> bool:
@@ -91,6 +93,7 @@ class Visualizer:
             avoidance_result=avoidance_result,
             detected_objects=detected_objects,
             gold_result=gold_result,
+            path_marker_result=path_marker_result,
             ocr_result=ocr_result,
             show_ocr_bbox=show_ocr_bbox,
         )
@@ -137,6 +140,7 @@ class Visualizer:
         avoidance_result: AvoidanceTargetResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
+        path_marker_result: PathMarkerTargetResult | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> np.ndarray:
@@ -223,6 +227,31 @@ class Visualizer:
                 color=(255, 255, 0),
                 offset=(x1, y1),
             )
+        if path_marker_result is not None and path_marker_result.active:
+            original_panel = draw_centerline(
+                original_panel,
+                path_marker_result.connected_centerline_points,
+                color=(200, 0, 255),
+                radius=3,
+                thickness=2,
+                offset=(x1, y1),
+            )
+            if path_marker_result.lower_anchor_roi is not None:
+                self._draw_target_point(
+                    original_panel,
+                    path_marker_result.lower_anchor_roi,
+                    offset=(x1, y1),
+                    color=(255, 128, 0),
+                    label="L",
+                )
+            if path_marker_result.upper_anchor_roi is not None:
+                self._draw_target_point(
+                    original_panel,
+                    path_marker_result.upper_anchor_roi,
+                    offset=(x1, y1),
+                    color=(255, 128, 0),
+                    label="U",
+                )
         if target_result is not None:
             self._draw_target_point(
                 original_panel,
@@ -252,6 +281,14 @@ class Visualizer:
                 color=(0, 215, 255),
                 label="G",
             )
+        if path_marker_result is not None and path_marker_result.active:
+            self._draw_target_point(
+                original_panel,
+                path_marker_result.target_point_roi,
+                offset=(x1, y1),
+                color=(200, 0, 255),
+                label="P",
+            )
         if blocking_result is not None and blocking_result.blocking_object is not None:
             self._draw_blocking_debug(
                 original_panel,
@@ -267,6 +304,7 @@ class Visualizer:
                 control_command=control_command,
                 fps_value=fps_value,
                 gold_result=gold_result,
+                path_marker_result=path_marker_result,
                 detection_result=detection_result,
                 ocr_result=ocr_result,
             ) or [
@@ -377,6 +415,7 @@ class Visualizer:
         control_command: ControlCommand,
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
+        path_marker_result: PathMarkerTargetResult | None = None,
         detection_result: LaneDetectionResult | None = None,
         ocr_result: OcrResult | None = None,
     ) -> list[str]:
@@ -384,6 +423,11 @@ class Visualizer:
             return self._ocr_status_lines(ocr_result)
         blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
+        path_marker_reason = (
+            path_marker_result.reason
+            if path_marker_result is not None and path_marker_result.active
+            else "no Go/Stop path marker"
+        )
         fork_reason = "fork: none"
         if detection_result is not None:
             fork_lane = detection_result.fork_result
@@ -393,12 +437,13 @@ class Visualizer:
             )
         lines = [
             "窗口1：原始画面",
-            "绿线=原中心线 青线=避障/coin中心线 N=普通目标 A=最终目标 G=coin",
+            "绿线=原中心线 青线=最终路径 紫线=Go/Stop连接 N=普通 A=最终 G=coin P=路径目标",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
             f"track: {detection_result.segmentation_status} conf={detection_result.segmentation_confidence:.2f}",
             f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
             f"steer_deg: {control_command.steer_deg:.2f}",
             f"{fork_reason}",
+            f"{path_marker_reason}",
             f"{gold_reason}",
             f"{blocking_reason}",
         ]

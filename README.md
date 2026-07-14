@@ -210,7 +210,7 @@ rknn_object_detector:
 当前主逻辑优先级是：
 
 ```text
-car/human 避障 > 吃 coin > 普通巡线
+路牌分析停车等待 > car/human 避障 > Go/Stop 路径 > 吃 coin > 普通巡线
 ```
 
 注意：避障模块会在巡线中心线上加一个平滑偏移，生成新的目标点。最终仍然只发送一组 `lateral_error_px` 和 `steer_deg` 给下位机。
@@ -223,23 +223,33 @@ car/human 避障 > 吃 coin > 普通巡线
 
 当且仅当没有障碍物阻挡时，`GOLD` 模式生效。
 
-## 5. car/human 避障逻辑
+## 5. Go/Stop 断轨连接逻辑
+
+- `Go` 和 `Stop` 都是路径标记，`Stop` 不触发停车。
+- 目标点取检测框几何中心，模式显示为 `PATH_TARGET`，不增加额外限速。
+- 当标记横向切断赛道时，规划层保留下方赛道，通过检测框中心连接到上方赛道；不会修改分割 mask 或岔路检测输入。
+- 连接点在检测框上下各避让 `connection_margin_px`，按 `interpolation_step_px` 生成连续路径；目标短暂漏检时最多保持 `hold_frames` 帧。
+- 标记中心到达 ROI 底部 `release_y_ratio` 后释放，防止车辆驶过后继续向身后目标转向。
+
+调试画面中紫线为 Go/Stop 连接路径，`L/U` 为下方和上方锚点，`P` 为检测框中心目标。
+
+## 6. car/human 避障逻辑
 
 1. `core/object/blocking.py` 判断识别框是否挡住当前航道危险走廊（`corridor_half_width_px`）。
 2. `core/planning/avoidance.py` 根据阻挡位置生成偏移后的目标路线。
 
 避障只对 `car` 和 `human` 生效，`coin` 不会被当作障碍物。
 
-## 6. 主流程顺序
+## 7. 主流程顺序
 
-1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 避障判断 -> 6. 决策规划（避障 > 金币 > 巡线） -> 7. 生成协议帧发送。
+1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 避障判断 -> 6. 决策规划（避障 > Go/Stop 路径 > 金币 > 巡线） -> 7. 生成协议帧发送。
 
-## 7. 如何确认功能正常
+## 8. 如何确认功能正常
 
 1. 终端出现 `RKNN detector loaded`；
-2. 调试画面中出现 `coin/car/human` 目标框；
-3. 画面上 `G` 为 coin 目标点，`A` 为最终控制目标点；
-4. 阻挡时模式显示 `avoid_left/right` 或 `too_close`，吃金币时显示 `GOLD`。
+2. 调试画面中出现 `coin/Go/Stop/car/human` 目标框；
+3. 画面上 `G` 为 coin 目标点，`P` 为 Go/Stop 框中心，`A` 为最终控制目标点；
+4. 阻挡时模式显示 `avoid_left/right` 或 `too_close`，Go/Stop 路径显示 `PATH_TARGET`，吃金币时显示 `GOLD`。
 
 ---
 

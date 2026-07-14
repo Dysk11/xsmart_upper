@@ -132,6 +132,15 @@ gold_target:
   max_above_roi_ratio: 0.8
   aim_at: bottom_center
 
+path_marker_target:
+  enabled: true
+  class_names: [Go, Stop]
+  min_confidence: 0.20
+  hold_frames: 4
+  connection_margin_px: 12
+  interpolation_step_px: 4
+  release_y_ratio: 0.92
+
 blocking_analyzer:
   enabled: true
   allowed_class_names: [car, human]

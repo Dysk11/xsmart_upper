@@ -33,6 +33,7 @@ from core.io.camera import CameraReader
 from core.planning.avoidance import AvoidanceTargetPlanner, AvoidanceTargetResult
 from core.object.blocking import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
+from core.planning.path_marker_target import PathMarkerTargetPlanner, PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult, LaneDetector
 from core.lane.tracker import LaneTracker, TrackedLaneState
 from core.io.logger import CsvLogger
@@ -667,6 +668,9 @@ class UpperMachineApp:
         self.tracker = LaneTracker(config.get("tracker", {}))
         self.target_selector = TargetSelector(config.get("target_selector", {}))
         self.gold_target_planner = GoldTargetPlanner(config.get("gold_target", {}))
+        self.path_marker_target_planner = PathMarkerTargetPlanner(
+            config.get("path_marker_target", {})
+        )
         self.blocking_config = config.get("blocking_analyzer", {})
         self.blocking_class_names = {
             str(name).casefold()
@@ -695,6 +699,7 @@ class UpperMachineApp:
         self.last_avoidance_result: AvoidanceTargetResult | None = None
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
+        self.last_path_marker_result: PathMarkerTargetResult | None = None
         self.last_ocr_result = OcrResult()
         self.last_ocr_attempt = OcrResult()
         self._last_ocr_event_id = 0
@@ -978,6 +983,7 @@ class UpperMachineApp:
                         "avoidance_result": self.last_avoidance_result,
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
+                        "path_marker_result": self.last_path_marker_result,
                         "ocr_result": (
                             self.last_ocr_attempt
                             if self.last_ocr_attempt.frame_id > 0
@@ -1215,6 +1221,16 @@ class UpperMachineApp:
                 note="waiting for road-sign analysis or requested branch",
             )
         if (
+            self.last_path_marker_result is not None
+            and self.last_path_marker_result.active
+            and self.last_avoidance_result is not None
+            and self.last_avoidance_result.mode == "path_marker_target"
+        ):
+            return ModuleHints(
+                force_mode="PATH_TARGET",
+                note=self.last_path_marker_result.reason,
+            )
+        if (
             self.last_gold_result is not None
             and self.last_gold_result.active
             and self.last_avoidance_result is not None
@@ -1273,6 +1289,15 @@ class UpperMachineApp:
             lane_confidence=tracked_state.confidence,
             curvature=tracked_state.curvature,
         )
+        path_marker_result = self.path_marker_target_planner.plan(
+            objects=self.last_detected_objects,
+            centerline_points=detection_result.centerline_points,
+            historical_centerline_points=self.tracker.last_valid_centerline,
+            roi_rect=roi_rect,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
+        self.last_path_marker_result = path_marker_result
         gold_result = self.gold_target_planner.plan(
             objects=self.last_detected_objects,
             roi_rect=roi_rect,
@@ -1314,6 +1339,34 @@ class UpperMachineApp:
                 lateral_error_px=avoidance_result.final_lateral_error_px,
                 heading_error_deg=avoidance_result.final_heading_error_deg,
                 confidence=min(tracked_state.confidence, avoidance_result.confidence),
+            )
+
+        if path_marker_result.active:
+            self.last_target_result = normal_target
+            self.last_blocking_result = blocking_result
+            self.last_avoidance_result = AvoidanceTargetResult(
+                mode="path_marker_target",
+                shifted_centerline_points=path_marker_result.connected_centerline_points,
+                target_point_roi=path_marker_result.target_point_roi,
+                avoid_bias_px=0.0,
+                final_lateral_error_px=path_marker_result.final_lateral_error_px,
+                final_heading_error_deg=path_marker_result.final_heading_error_deg,
+                confidence=path_marker_result.confidence,
+                reason=path_marker_result.reason,
+            )
+            return replace(
+                tracked_state,
+                centerline_points=[
+                    (int(round(x)), int(round(y)))
+                    for x, y in path_marker_result.connected_centerline_points
+                ],
+                lateral_error_px=path_marker_result.final_lateral_error_px,
+                heading_error_deg=path_marker_result.final_heading_error_deg,
+                confidence=max(
+                    tracked_state.confidence,
+                    min(1.0, path_marker_result.confidence),
+                ),
+                is_lane_lost=False,
             )
 
         if gold_result.active:
