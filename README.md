@@ -256,14 +256,14 @@ rknn_object_detector:
 ## 默认协议说明
 
 默认协议位于 `core/io/protocol.py`，使用固定 7 字节二进制帧。高层 payload 仍包含
-`target_speed` 等规划字段，协议层新增 `motion_flag` 并将其写入帧尾状态字节。
+`target_speed` 等规划字段，协议层将其转换为 `speed_state` 并写入帧尾字节的低 2 位。
 
 ## UART 通信协议说明
 
 本项目通过 CH340 串口 USB 转 TTL 模块将树莓派/RK3588 与下位机（如 Arduino 或 TC264）连接。
 
 - **配置**: 115200 8N1 (115200 波特率, 8 数据位, 无校验位, 1 停止位)
-- **帧结构**: 2 字节帧头 + 2 字节误差 (Int16) + 2 字节转向角度 (Int16) + 1 字节运行状态
+- **帧结构**: 2 字节帧头 + 2 字节误差 (Int16) + 2 字节转向角度 (Int16) + 1 字节速度状态
 
 | 字节偏移 | 长度 | 定义 | 说明 |
 | :--- | :--- | :--- | :--- |
@@ -271,7 +271,7 @@ rknn_object_detector:
 | 1 | 1 | 帧头 2 | 固定为 `0x55` |
 | 2 | 2 | 横向误差 | `lateral_error_px` 转为 Int16 (大端序) |
 | 4 | 2 | 转向角度 | `steer_deg` 转为 Int16 (大端序) |
-| 6 | 1 | 运行状态 | bit0：停车为 `0`，不停为 `1`；bit1..bit7 固定为 `0` |
+| 6 | 1 | 速度状态 | 低 2 位：`0x00` 停止、`0x01` 低速、`0x02` 中速、`0x03` 高速；高 6 位固定为 `0` |
 
 示例代码：
 ```python
@@ -279,7 +279,7 @@ data = bytearray([
     0xAA, 0x55,
     (error >> 8) & 0xFF, error & 0xFF,
     (angle >> 8) & 0xFF, angle & 0xFF,
-    motion_flag & 0x01
+    speed_state & 0x03
 ])
 ser.write(data)
 ```

@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.io.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.io.camera import CameraReader
+from core.io.protocol import target_speed_to_speed_state
 from core.planning.avoidance import AvoidanceTargetPlanner, AvoidanceTargetResult
 from core.object.blocking import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
@@ -1181,7 +1182,7 @@ class UpperMachineApp:
             "ts_ms": control_command.ts_ms,
             "mode": control_command.mode,
             "target_speed": control_command.target_speed,
-            "motion_flag": int(control_command.target_speed > 0.0),
+            "speed_state": target_speed_to_speed_state(control_command.target_speed),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
             "heading_error_deg": tracked_state.heading_error_deg,
