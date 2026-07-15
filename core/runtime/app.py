@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from core.io.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.io.camera import CameraReader
-from core.io.protocol import target_speed_to_speed_state
+from core.io.protocol import resolve_configured_speed_state, validate_drive_speed_state
 from core.planning.avoidance import AvoidanceTargetPlanner, AvoidanceTargetResult
 from core.object.blocking import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
@@ -49,7 +49,7 @@ from core.planning.road_sign_analyzer import (
 )
 from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import RknnLaneSegmenter, SegmentationResult
-from core.ocr.road_sign import RoadSignOcrSession
+from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
 from core.visualization.visualizer import Visualizer
 from utils.fps import FPSCounter
@@ -329,13 +329,18 @@ def _ai_inference_worker(
     project_root: str,
     input_queue: Any,
     output_queue: Any,
+    ocr_trigger_queue: Any,
     ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Run object detection and exact-frame road-sign OCR in one AI process."""
 
     detector = RknnObjectDetector(detector_config)
-    ocr_session = RoadSignOcrSession(ocr_config, project_root=Path(project_root))
+    ocr_session = RoadSignOcrSession(
+        ocr_config,
+        project_root=Path(project_root),
+        trigger_callback=ocr_trigger_queue.put,
+    )
     ack_queues = {"ai_frame": ack_queue}
     last_ocr_result: OcrResult | None = None
     last_ocr_attempt: OcrResult | None = None
@@ -683,7 +688,11 @@ class UpperMachineApp:
             target_selector=self.target_selector,
         )
         self.planner = HighLevelPlanner(config.get("planner", {}))
-        self.bridge: BaseVehicleBridge = build_vehicle_bridge(config.get("bridge", {}))
+        bridge_config = config.get("bridge", {})
+        self.drive_speed_state = validate_drive_speed_state(
+            bridge_config.get("drive_speed_state", 0x02)
+        )
+        self.bridge: BaseVehicleBridge = build_vehicle_bridge(bridge_config)
         self.csv_logger = CsvLogger(config.get("logger", {}))
         self.fps_counter = FPSCounter(config.get("app", {}).get("fps_smoothing_alpha", 0.2))
         timing_config = config.get("app", {}).get("lane_timing", {})
@@ -705,6 +714,10 @@ class UpperMachineApp:
         self.last_ocr_attempt = OcrResult()
         self._last_ocr_event_id = 0
         ocr_config = config.get("ocr", {})
+        self.ocr_stop_latch = OcrStopLatch(
+            timeout_sec=float(ocr_config.get("stop_timeout_sec", 20.0))
+        )
+        self.pending_analysis_trigger_id = 0
         self.ocr_bbox_timer = OcrBBoxDisplayTimer(
             hold_seconds=float(ocr_config.get("bbox_display_seconds", 1.0))
         )
@@ -722,6 +735,7 @@ class UpperMachineApp:
         self.stop_event = self.mp_context.Event()
         self.ai_input_queue = self.mp_context.Queue(maxsize=1)
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
+        self.ocr_trigger_queue = self.mp_context.Queue()
         self.road_sign_analysis_input_queue = self.mp_context.Queue(maxsize=1)
         self.road_sign_analysis_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
@@ -770,6 +784,7 @@ class UpperMachineApp:
                 str(project_root),
                 self.ai_input_queue,
                 self.ai_output_queue,
+                self.ocr_trigger_queue,
                 self.ai_ack_queue,
                 self.stop_event,
             ),
@@ -848,6 +863,37 @@ class UpperMachineApp:
                     (self.frame_id, captured_at, ai_frame_payload),
                     release_func=self._release_owned_shared_payload,
                 )
+            now = time.monotonic()
+            while True:
+                try:
+                    ocr_trigger = self.ocr_trigger_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if not isinstance(ocr_trigger, OcrTrigger):
+                    continue
+                if self.ocr_stop_latch.start(
+                    ocr_trigger.trigger_id,
+                    ocr_trigger.started_at,
+                ):
+                    self.road_sign_analysis_state.cancel_pending(reset_decision=True)
+                    self.pending_analysis_trigger_id = 0
+                    print(
+                        f"[OCR] trigger={ocr_trigger.trigger_id} frame={ocr_trigger.frame_id} "
+                        "status=vehicle_stop",
+                        flush=True,
+                    )
+            expired_trigger_id = self.ocr_stop_latch.expire_if_needed(now)
+            if expired_trigger_id is not None:
+                cancelled_event_id = self.road_sign_analysis_state.cancel_pending(
+                    reset_decision=True
+                )
+                self.pending_analysis_trigger_id = 0
+                print(
+                    f"[OCR] trigger={expired_trigger_id} status=wait_timeout "
+                    f"cancelled_event={cancelled_event_id} "
+                    f"direction={self.road_sign_analysis_state.default_direction}",
+                    flush=True,
+                )
             self.last_ocr_result, self._last_ocr_event_id = consume_ocr_event(
                 self.last_ocr_result,
                 self._last_ocr_event_id,
@@ -880,11 +926,26 @@ class UpperMachineApp:
                         assert worker_ocr_attempt is not None
                         self.last_ocr_attempt = worker_ocr_attempt
                         self._print_ocr_attempt(worker_ocr_attempt)
-            if self.last_ocr_result.is_new and self.road_sign_analysis_state.submit(
+            if (
+                self.ocr_stop_latch.owns(self.last_ocr_result.trigger_id)
+                and not self.road_sign_analyzer_config.enable
+            ):
+                self.road_sign_analysis_state.cancel_pending(reset_decision=True)
+                self.ocr_stop_latch.complete(self.last_ocr_result.trigger_id)
+                print(
+                    f"[OCR] trigger={self.last_ocr_result.trigger_id} "
+                    "status=completed_without_api "
+                    f"direction={self.road_sign_analysis_state.default_direction}",
+                    flush=True,
+                )
+            elif self.ocr_stop_latch.owns(
+                self.last_ocr_result.trigger_id
+            ) and self.road_sign_analysis_state.submit(
                 self.last_ocr_result.event_id,
                 self.last_ocr_result.text,
                 self.road_sign_analysis_input_queue,
             ):
+                self.pending_analysis_trigger_id = self.last_ocr_result.trigger_id
                 print(
                     f"[ROAD_SIGN_ANALYZER] event={self.last_ocr_result.event_id} status=pending "
                     f"text={self.last_ocr_result.text!r}",
@@ -892,6 +953,9 @@ class UpperMachineApp:
                 )
             road_sign_analysis_result = _drain_latest(self.road_sign_analysis_output_queue)
             if isinstance(road_sign_analysis_result, RoadSignAnalysisDecision) and self.road_sign_analysis_state.accept(road_sign_analysis_result):
+                completed_trigger_id = self.pending_analysis_trigger_id
+                self.ocr_stop_latch.complete(completed_trigger_id)
+                self.pending_analysis_trigger_id = 0
                 try:
                     self.road_sign_analysis_logger.append_result(
                         road_sign_analysis_result,
@@ -1182,7 +1246,10 @@ class UpperMachineApp:
             "ts_ms": control_command.ts_ms,
             "mode": control_command.mode,
             "target_speed": control_command.target_speed,
-            "speed_state": target_speed_to_speed_state(control_command.target_speed),
+            "speed_state": resolve_configured_speed_state(
+                control_command.target_speed,
+                self.drive_speed_state,
+            ),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
             "heading_error_deg": tracked_state.heading_error_deg,
@@ -1215,6 +1282,12 @@ class UpperMachineApp:
         _ = frame
         _ = roi_rect
         _ = tracked_state
+        if self.ocr_stop_latch.active:
+            return ModuleHints(
+                stop=True,
+                force_mode="ROAD_SIGN_WAIT",
+                note="waiting for OCR and road-sign API decision",
+            )
         if self.road_sign_analysis_state.should_stop(detection_result.fork_result):
             return ModuleHints(
                 stop=True,

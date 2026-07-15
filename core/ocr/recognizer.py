@@ -37,6 +37,7 @@ class OcrResult:
     detection_confidence: float = 0.0
     inference_ms: float = 0.0
     locked: bool = False
+    trigger_id: int = 0
 
 
 class OcrEventLogger:
@@ -53,6 +54,7 @@ class OcrEventLogger:
             self.file_path = self.output_dir / f"ocr_events_{timestamp}.jsonl"
         record = {
             "timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "trigger_id": result.trigger_id,
             "event_id": result.event_id,
             "frame_id": result.frame_id,
             "text": result.text,

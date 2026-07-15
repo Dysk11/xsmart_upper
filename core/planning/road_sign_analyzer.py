@@ -396,6 +396,16 @@ class RoadSignAnalysisState:
         self.decision_expires_at = self.clock() + self.decision_ttl_sec
         return True
 
+    def cancel_pending(self, reset_decision: bool = False) -> int | None:
+        """Cancel an in-flight request so that a late response cannot be accepted."""
+
+        cancelled_event_id = self.pending_event_id
+        self.pending_event_id = None
+        if reset_decision:
+            self.decision = None
+            self.decision_expires_at = 0.0
+        return cancelled_event_id
+
     def should_stop(self, fork_result: Any) -> bool:
         if not bool(getattr(fork_result, "fork_detected", False)):
             return False

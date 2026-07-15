@@ -23,6 +23,61 @@ class RoadSignCrop:
     detection_confidence: float
 
 
+@dataclass(frozen=True)
+class OcrTrigger:
+    """Notification emitted immediately before an OCR recognition cycle starts."""
+
+    trigger_id: int
+    frame_id: int
+    started_at: float
+
+
+class OcrStopLatch:
+    """Latch vehicle stop from OCR start until API completion or total timeout."""
+
+    def __init__(self, timeout_sec: float) -> None:
+        self.timeout_sec = float(timeout_sec)
+        if self.timeout_sec <= 0:
+            raise ValueError("ocr.stop_timeout_sec must be greater than zero")
+        self.active_trigger_id = 0
+        self.started_at = 0.0
+        self.closed_trigger_ids: set[int] = set()
+
+    @property
+    def active(self) -> bool:
+        return self.active_trigger_id > 0
+
+    def start(self, trigger_id: int, now: float) -> bool:
+        trigger_id = int(trigger_id)
+        if trigger_id <= 0 or trigger_id in self.closed_trigger_ids:
+            return False
+        if trigger_id == self.active_trigger_id:
+            return False
+        if self.active_trigger_id > 0:
+            self.closed_trigger_ids.add(self.active_trigger_id)
+        self.active_trigger_id = trigger_id
+        self.started_at = float(now)
+        return True
+
+    def owns(self, trigger_id: int) -> bool:
+        return self.active and int(trigger_id) == self.active_trigger_id
+
+    def complete(self, trigger_id: int) -> bool:
+        if not self.owns(trigger_id):
+            return False
+        self.closed_trigger_ids.add(self.active_trigger_id)
+        self.active_trigger_id = 0
+        self.started_at = 0.0
+        return True
+
+    def expire_if_needed(self, now: float) -> int | None:
+        if not self.active or float(now) - self.started_at < self.timeout_sec:
+            return None
+        expired_trigger_id = self.active_trigger_id
+        self.complete(expired_trigger_id)
+        return expired_trigger_id
+
+
 def select_road_sign_crop(
     frame: np.ndarray,
     detections: Sequence[DetectedObject],
@@ -82,6 +137,7 @@ class RoadSignOcrSession:
         recognizer: Any | None = None,
         event_logger: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
+        trigger_callback: Callable[[OcrTrigger], None] | None = None,
     ) -> None:
         self.config = config
         self.enabled = bool(config.get("enable", False))
@@ -98,6 +154,7 @@ class RoadSignOcrSession:
         if self.cooldown_seconds < 0:
             raise ValueError("ocr.cooldown_seconds must not be negative")
         self.clock = clock
+        self.trigger_callback = trigger_callback
 
         root = project_root or Path.cwd()
         output_dir = Path(str(config.get("output_dir", "outputs/logs")))
@@ -113,6 +170,9 @@ class RoadSignOcrSession:
         self._last_result: OcrResult | None = None
         self.last_attempt: OcrResult | None = None
         self.last_error: str | None = None
+        self._trigger_counter = 0
+        self._active_trigger_id = 0
+        self._cycle_completed = False
 
     def update(
         self,
@@ -130,8 +190,6 @@ class RoadSignOcrSession:
             if now >= self._next_retry_at:
                 self._publish_pending(now)
             return self._last_result
-        if now < self._cooldown_until:
-            return self._last_result
 
         crop = select_road_sign_crop(
             frame,
@@ -142,8 +200,26 @@ class RoadSignOcrSession:
             self.bbox_min_height_px,
             self.bbox_padding_ratio,
         )
-        if crop is None or now < self._next_retry_at:
+        if crop is None:
+            self._active_trigger_id = 0
+            self._cycle_completed = False
             return self._last_result
+        if now < self._cooldown_until or self._cycle_completed:
+            return self._last_result
+        if now < self._next_retry_at:
+            return self._last_result
+
+        if self._active_trigger_id == 0:
+            self._trigger_counter += 1
+            self._active_trigger_id = self._trigger_counter
+            if self.trigger_callback is not None:
+                self.trigger_callback(
+                    OcrTrigger(
+                        trigger_id=self._active_trigger_id,
+                        frame_id=frame_id,
+                        started_at=now,
+                    )
+                )
 
         raw_result = self.recognizer.recognize(crop.image, frame_id)
         candidate = replace(
@@ -153,6 +229,7 @@ class RoadSignOcrSession:
             event_id=0,
             is_new=False,
             locked=False,
+            trigger_id=self._active_trigger_id,
         )
         self.last_attempt = candidate
         if candidate.error or not candidate.text or candidate.confidence < self.accept_score:
@@ -166,6 +243,7 @@ class RoadSignOcrSession:
             event_id=self._event_counter,
             locked=True,
         )
+        self._cycle_completed = True
         self._publish_pending(now)
         return self._last_result
 

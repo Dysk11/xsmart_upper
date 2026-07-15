@@ -1,8 +1,11 @@
 from core.io.protocol import (
     build_packet,
     parse_packet,
+    resolve_configured_speed_state,
     target_speed_to_speed_state,
+    validate_drive_speed_state,
 )
+import pytest
 
 
 def test_target_speed_is_quantized_to_four_states() -> None:
@@ -36,3 +39,15 @@ def test_packet_derives_speed_state_from_target_speed() -> None:
         assert len(packet) == 7
         assert packet[6] == expected_state
         assert packet[6] & 0xFC == 0
+
+
+@pytest.mark.parametrize("configured_state", (0x01, 0x02, 0x03))
+def test_configured_drive_state_is_used_only_while_moving(configured_state: int) -> None:
+    assert resolve_configured_speed_state(1.6, configured_state) == configured_state
+    assert resolve_configured_speed_state(0.0, configured_state) == 0x00
+
+
+@pytest.mark.parametrize("invalid_state", (-1, 0, 4, 255))
+def test_invalid_configured_drive_state_is_rejected(invalid_state: int) -> None:
+    with pytest.raises(ValueError, match="drive_speed_state"):
+        validate_drive_speed_state(invalid_state)

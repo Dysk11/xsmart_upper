@@ -119,6 +119,7 @@ camera:
 ### 5. `bridge`
 
 - `type`: `mock` 或 `serial`
+- `drive_speed_state`: 正常行驶固定档位，`1`=低速、`2`=中速、`3`=高速
 - `serial.port`: 串口名，例如 `/dev/ttyS4`
 - `serial.baudrate`: 波特率
 - `serial.timeout`: 串口超时
@@ -256,7 +257,8 @@ rknn_object_detector:
 ## 默认协议说明
 
 默认协议位于 `core/io/protocol.py`，使用固定 7 字节二进制帧。高层 payload 仍包含
-`target_speed` 等规划字段，协议层将其转换为 `speed_state` 并写入帧尾字节的低 2 位。
+`target_speed` 等规划字段仍用于内部策略与日志；运行时根据
+`bridge.drive_speed_state` 写入帧尾字节的低 2 位，停车命令固定写入 `0x00`。
 
 ## UART 通信协议说明
 
@@ -285,6 +287,10 @@ ser.write(data)
 ```
 
 TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读取会导致后续帧错位。
+
+正常行驶档位通过 `bridge.drive_speed_state` 配置，只允许 `1`（低速）、`2`（中速）
+或 `3`（高速），默认值为 `2`。无论正常档位为何值，只要规划结果要求停车，第 7
+字节都会发送 `0x00`。
 
 ## RKNN 航道分割部署
 
@@ -326,6 +332,11 @@ python3 main.py --mode camera --bridge serial
 置信度达到 `0.60` 的非空文字才写入
 `outputs/logs/ocr/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后按
 `ocr.cooldown_seconds` 配置全局 OCR 冷却时间，默认 20 秒。
+OCR 模型真正开始推理时，主循环立即进入 `ROAD_SIGN_WAIT` 并持续向下位机发送
+`speed_state=0x00`。停车覆盖 OCR 重试和后续千帆 API 请求；API 正常返回或产生
+fallback 决策后恢复配置档位。`ocr.stop_timeout_sec` 控制 OCR/API 总等待上限，默认
+20 秒；超时后取消 pending 请求、忽略迟到结果并恢复默认左行。关闭路牌 API 时，
+OCR 完成后直接恢复默认左行。
 每次 OCR 尝试都会在控制台输出 `[OCR]` 行，并在调试窗口用紫色框标出裁剪区域；
 紫框默认显示 1 秒后清除，最新文字、置信度和耗时继续保留。低分候选只显示，
 不写 JSONL，也不启动冷却。

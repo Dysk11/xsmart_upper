@@ -109,6 +109,7 @@ ocr:
   accept_score: 0.60
   retry_interval_sec: 0.50
   cooldown_seconds: 20.0
+  stop_timeout_sec: 20.0
   bbox_display_seconds: 1.0
   output_dir: outputs/logs/ocr
 
@@ -197,6 +198,7 @@ planner:
 # Communication and output
 bridge:
   type: mock
+  drive_speed_state: 2
   serial:
     port: /dev/ttyUSB0
     baudrate: 115200

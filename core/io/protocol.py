@@ -41,6 +41,24 @@ def target_speed_to_speed_state(target_speed: float) -> int:
     return 0x03
 
 
+def validate_drive_speed_state(value: Any) -> int:
+    """Validate the configured non-stop speed state sent to the vehicle."""
+
+    state = int(value)
+    if state not in (0x01, 0x02, 0x03):
+        raise ValueError("bridge.drive_speed_state must be 1, 2, or 3")
+    return state
+
+
+def resolve_configured_speed_state(target_speed: float, drive_speed_state: Any) -> int:
+    """Return stop for non-positive targets, otherwise the configured drive state."""
+
+    speed = float(target_speed)
+    if not math.isfinite(speed) or speed <= 0.0:
+        return 0x00
+    return validate_drive_speed_state(drive_speed_state)
+
+
 def normalize_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """对通信负载做默认值补全与类型归一化。
 
