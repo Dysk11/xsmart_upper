@@ -26,8 +26,8 @@ class ForkLaneResult:
     fork_detected: bool
     requested_direction: str | None
     selected_direction: str | None
-    left_points: List[Tuple[int, int]]
-    right_points: List[Tuple[int, int]]
+    left_centerline_points: List[Tuple[int, int]]
+    right_centerline_points: List[Tuple[int, int]]
     reason: str
     left_detected: bool = False
     right_detected: bool = False
@@ -131,6 +131,21 @@ class LaneDetector:
         self.min_valid_points = int(self.centerline_config.get("min_valid_points", 8))
         self.min_lane_width_px = float(self.centerline_config.get("min_lane_width_px", 18.0))
         self.default_lane_width_px = float(self.centerline_config.get("default_lane_width_px", 60.0))
+        self.perspective_width_top_px = float(
+            self.centerline_config.get("perspective_width_top_px", 30.0)
+        )
+        self.perspective_width_bottom_px = float(
+            self.centerline_config.get("perspective_width_bottom_px", 60.0)
+        )
+        if self.perspective_width_top_px <= 0.0:
+            raise ValueError("centerline.perspective_width_top_px must be greater than zero")
+        if self.perspective_width_bottom_px <= 0.0:
+            raise ValueError("centerline.perspective_width_bottom_px must be greater than zero")
+        if self.perspective_width_bottom_px < self.perspective_width_top_px:
+            raise ValueError(
+                "centerline.perspective_width_bottom_px must be greater than or equal to "
+                "centerline.perspective_width_top_px"
+            )
         self.single_side_infer_ratio = float(self.centerline_config.get("single_side_infer_ratio", 0.55))
         self.enable_single_side_inference = bool(
             self.centerline_config.get("enable_single_side_inference", False)
@@ -211,6 +226,15 @@ class LaneDetector:
         )
         self.fork_confirm_frames = max(1, int(fork_config.get("confirm_frames", 2)))
         self.fork_release_frames = max(1, int(fork_config.get("release_frames", 3)))
+        self.fork_split_enter_ratio = float(fork_config.get("split_enter_ratio", 0.60))
+        self.fork_split_exit_ratio = float(fork_config.get("split_exit_ratio", 0.35))
+        self.fork_split_min_rows = max(1, int(fork_config.get("split_min_rows", 5)))
+        if self.fork_split_enter_ratio <= 0.0:
+            raise ValueError("fork.split_enter_ratio must be greater than zero")
+        if self.fork_split_exit_ratio < 0.0:
+            raise ValueError("fork.split_exit_ratio must not be negative")
+        if self.fork_split_exit_ratio >= self.fork_split_enter_ratio:
+            raise ValueError("fork.split_exit_ratio must be less than fork.split_enter_ratio")
         self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
         if len(self.temporal_weights) != 3 or sum(self.temporal_weights) <= 0:
             self.temporal_weights = (0.20, 0.50, 0.30)
@@ -218,6 +242,7 @@ class LaneDetector:
         self._left_fork_hits = self._right_fork_hits = 0
         self._left_fork_misses = self._right_fork_misses = 0
         self._left_fork_active = self._right_fork_active = False
+        self._held_fork_direction: str | None = None
 
     def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
@@ -357,33 +382,80 @@ class LaneDetector:
             mask.shape,
         )
         requested_direction = self._normalize_route_direction(route_direction)
-        if requested_direction is not None:
-            fork_result.requested_direction = requested_direction
-            branch_choices_visible = bool(left_branch_rows or right_branch_rows)
-            if fork_result.fork_detected and branch_choices_visible:
-                (
-                    left_points,
-                    right_points,
-                    raw_centers,
-                    left_lost,
-                    right_lost,
-                    selected_mask,
-                    _selected_left_branches,
-                    _selected_right_branches,
-                ) = self._extract_row_boundaries(
-                    mask,
-                    route_direction=requested_direction,
-                    row_runs=row_runs,
-                )
-                if raw_centers:
-                    fork_result.selected_direction = requested_direction
-                    fork_result.reason = f"selected {requested_direction} branch"
-                else:
-                    fork_result.reason = f"requested {requested_direction} but branch unavailable"
-            elif fork_result.fork_detected:
-                fork_result.reason = f"requested {requested_direction} but branch unavailable"
-            else:
+        fork_result.requested_direction = requested_direction
+        display_left_points = left_points
+        display_right_points = right_points
+        if not fork_result.fork_detected:
+            self._held_fork_direction = None
+            if requested_direction is not None:
                 fork_result.reason = f"waiting for {requested_direction} fork"
+        else:
+            (
+                left_candidate_points,
+                right_candidate_points,
+                shared_centerline_points,
+                outer_left_points,
+                outer_right_points,
+            ) = self._build_perspective_fork_centerlines(row_runs, mask.shape)
+            fork_result.left_centerline_points = self._smooth_article_centerline(
+                left_candidate_points, mask.shape[1]
+            )
+            fork_result.right_centerline_points = self._smooth_article_centerline(
+                right_candidate_points, mask.shape[1]
+            )
+            if outer_left_points and outer_right_points:
+                display_left_points = outer_left_points
+                display_right_points = outer_right_points
+
+            if requested_direction is not None:
+                self._held_fork_direction = requested_direction
+            elif (
+                self._held_fork_direction is None
+                and left_candidate_points
+                and right_candidate_points
+            ):
+                self._held_fork_direction = self._choose_current_fork_direction(
+                    raw_centers,
+                    left_candidate_points,
+                    right_candidate_points,
+                )
+
+            selected_direction = self._held_fork_direction
+            fork_result.selected_direction = selected_direction
+            selected_candidates = (
+                left_candidate_points
+                if selected_direction == "left"
+                else right_candidate_points
+                if selected_direction == "right"
+                else []
+            )
+            if selected_candidates:
+                raw_centers = self._merge_fork_centerline(
+                    raw_centers,
+                    shared_centerline_points,
+                    selected_candidates,
+                )
+                selected_mask = self._build_fork_selected_mask(
+                    selected_mask,
+                    row_runs,
+                    selected_candidates,
+                )
+                source = "requested" if requested_direction is not None else "held"
+                fork_result.reason = f"selected {selected_direction} branch ({source})"
+            elif selected_direction is not None:
+                raw_centers = self._merge_fork_centerline(
+                    raw_centers,
+                    shared_centerline_points,
+                    [],
+                )
+                fork_result.reason = f"holding {selected_direction} through shared fork region"
+            else:
+                raw_centers = self._merge_fork_centerline(
+                    raw_centers,
+                    shared_centerline_points,
+                    [],
+                )
+                fork_result.reason = "fork shared region; following normal centerline"
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
         fit_coeffs = self._fit_centerline(centerline_points)
@@ -418,13 +490,167 @@ class LaneDetector:
             valid_row_count=len(raw_centers),
             fit_point_count=len(centerline_points),
             fork_result=fork_result,
-            left_boundary_points=left_points,
-            right_boundary_points=right_points,
+            left_boundary_points=display_left_points,
+            right_boundary_points=display_right_points,
             left_lost_rows=sum(left_lost),
             right_lost_rows=sum(right_lost),
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
         )
+
+    def _perspective_lane_width(self, y: int, height: int) -> float:
+        """Interpolate the configured lane width from ROI top to bottom."""
+
+        ratio = 0.0 if height <= 1 else clamp(float(y) / float(height - 1), 0.0, 1.0)
+        return self.perspective_width_top_px + (
+            self.perspective_width_bottom_px - self.perspective_width_top_px
+        ) * ratio
+
+    def _build_perspective_fork_centerlines(
+        self,
+        row_runs: Sequence[Sequence[tuple[int, int]]],
+        shape: tuple[int, int],
+    ) -> tuple[
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+        list[tuple[int, int]],
+    ]:
+        """Infer left/right branch centerlines from the outermost measured edges."""
+
+        height, _width = shape[:2]
+        samples: list[tuple[int, int, int, int, int, float]] = []
+        for y in range(height - 1, -1, -1):
+            runs = row_runs[y]
+            if not runs:
+                continue
+            outer_left = min(run[0] for run in runs)
+            outer_right = max(run[1] for run in runs)
+            expected_width = self._perspective_lane_width(y, height)
+            half_width = 0.5 * expected_width
+            left_center = int(round(min(float(outer_right), float(outer_left) + half_width)))
+            right_center = int(round(max(float(outer_left), float(outer_right) - half_width)))
+            gap_ratio = max(0.0, float(right_center - left_center)) / max(expected_width, 1.0)
+            samples.append(
+                (y, outer_left, outer_right, left_center, right_center, gap_ratio)
+            )
+
+        split_flags = [False] * len(samples)
+        split_active = False
+        enter_start: int | None = None
+        exit_start: int | None = None
+        for index, sample in enumerate(samples):
+            gap_ratio = sample[5]
+            if not split_active:
+                if gap_ratio >= self.fork_split_enter_ratio:
+                    enter_start = index if enter_start is None else enter_start
+                    if index - enter_start + 1 >= self.fork_split_min_rows:
+                        split_active = True
+                        for buffered_index in range(enter_start, index + 1):
+                            split_flags[buffered_index] = True
+                        enter_start = None
+                else:
+                    enter_start = None
+                continue
+
+            split_flags[index] = True
+            if gap_ratio <= self.fork_split_exit_ratio:
+                exit_start = index if exit_start is None else exit_start
+                if index - exit_start + 1 >= self.fork_split_min_rows:
+                    for buffered_index in range(exit_start, index + 1):
+                        split_flags[buffered_index] = False
+                    split_active = False
+                    exit_start = None
+            else:
+                exit_start = None
+
+        left_candidates = [
+            (sample[3], sample[0])
+            for sample, is_split in zip(samples, split_flags)
+            if is_split
+        ]
+        right_candidates = [
+            (sample[4], sample[0])
+            for sample, is_split in zip(samples, split_flags)
+            if is_split
+        ]
+        shared_centerline_points = [
+            (int(round(0.5 * (sample[1] + sample[2]))), sample[0])
+            for sample, is_split in zip(samples, split_flags)
+            if not is_split
+        ]
+        outer_left_points = [(sample[1], sample[0]) for sample in samples]
+        outer_right_points = [(sample[2], sample[0]) for sample in samples]
+        return (
+            left_candidates,
+            right_candidates,
+            shared_centerline_points,
+            outer_left_points,
+            outer_right_points,
+        )
+
+    def _choose_current_fork_direction(
+        self,
+        ordinary_points: Sequence[Tuple[int, int]],
+        left_candidates: Sequence[Tuple[int, int]],
+        right_candidates: Sequence[Tuple[int, int]],
+    ) -> str:
+        """Choose the candidate closest to the continuity-following first pass."""
+
+        reference_points = list(ordinary_points) or list(self.last_centerline_points)
+        if not reference_points:
+            return "left"
+
+        def mean_distance(points: Sequence[Tuple[int, int]]) -> float:
+            if not points:
+                return float("inf")
+            return float(
+                np.mean([
+                    abs(float(x) - self._sample_centerline_x(reference_points, int(y)))
+                    for x, y in points
+                ])
+            )
+
+        left_score = mean_distance(left_candidates)
+        right_score = mean_distance(right_candidates)
+        return "right" if right_score < left_score else "left"
+
+    @staticmethod
+    def _merge_fork_centerline(
+        ordinary_points: Sequence[Tuple[int, int]],
+        shared_centerline_points: Sequence[Tuple[int, int]],
+        selected_candidates: Sequence[Tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        """Use the outer-edge midpoint on shared rows and the selected split branch."""
+
+        candidate_by_y = {int(y): int(x) for x, y in shared_centerline_points}
+        candidate_by_y.update({int(y): int(x) for x, y in selected_candidates})
+        return [
+            (candidate_by_y.get(int(y), int(x)), int(y))
+            for x, y in ordinary_points
+        ]
+
+    @staticmethod
+    def _build_fork_selected_mask(
+        base_mask: np.ndarray,
+        row_runs: Sequence[Sequence[tuple[int, int]]],
+        selected_candidates: Sequence[Tuple[int, int]],
+    ) -> np.ndarray:
+        """Keep the foreground run nearest the selected branch on separated rows."""
+
+        selected_mask = base_mask.copy()
+        for candidate_x, y in selected_candidates:
+            runs = row_runs[int(y)]
+            if not runs:
+                continue
+            left, right = min(
+                runs,
+                key=lambda run: abs(0.5 * (run[0] + run[1]) - float(candidate_x)),
+            )
+            selected_mask[int(y), :] = 0
+            selected_mask[int(y), int(left) : int(right) + 1] = 255
+        return selected_mask
 
     def _build_row_runs(self, mask: np.ndarray) -> list[list[tuple[int, int]]]:
         """Precompute valid foreground runs for every row in one NumPy pass."""
@@ -615,8 +841,8 @@ class LaneDetector:
             fork_detected=self._left_fork_active or self._right_fork_active,
             requested_direction=None,
             selected_direction=None,
-            left_points=list(left_branch_rows),
-            right_points=list(right_branch_rows),
+            left_centerline_points=[],
+            right_centerline_points=[],
             reason=reason,
             left_detected=self._left_fork_active,
             right_detected=self._right_fork_active,
@@ -1103,8 +1329,8 @@ class LaneDetector:
                 fork_detected=fork_detected,
                 requested_direction=requested,
                 selected_direction=selected_direction,
-                left_points=left_points,
-                right_points=right_points,
+                left_centerline_points=left_points,
+                right_centerline_points=right_points,
                 reason=reason,
             ),
         )
@@ -1841,8 +2067,8 @@ class LaneDetector:
                 fork_detected=False,
                 requested_direction=None,
                 selected_direction=None,
-                left_points=[],
-                right_points=[],
+                left_centerline_points=[],
+                right_centerline_points=[],
                 reason="empty input",
             ),
         )

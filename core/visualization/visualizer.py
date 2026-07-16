@@ -182,20 +182,20 @@ class Visualizer:
             original_panel, detection_result.right_boundary_points,
             color=(80, 80, 255), radius=1, thickness=1, offset=(x1, y1),
         )
-        if fork_lane.left_points:
+        if fork_lane.left_centerline_points:
             original_panel = draw_centerline(
                 original_panel,
-                fork_lane.left_points,
+                fork_lane.left_centerline_points,
                 color=(255, 0, 255),
                 radius=2,
                 thickness=1,
                 offset=(x1, y1),
             )
-        if fork_lane.right_points:
+        if fork_lane.right_centerline_points:
             original_panel = draw_centerline(
                 original_panel,
-                fork_lane.right_points,
-                color=(255, 128, 0),
+                fork_lane.right_centerline_points,
+                color=(0, 128, 255),
                 radius=2,
                 thickness=1,
                 offset=(x1, y1),
@@ -440,6 +440,7 @@ class Visualizer:
         lines = [
             "窗口1：原始画面",
             "绿线=原中心线 青线=最终路径 紫线=Go/Stop连接 N=普通 A=最终 G=coin P=路径目标",
+            "洋红线=左岔中线 橙线=右岔中线 LF/RF=左右岔路拐点",
             f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
             f"track: {detection_result.segmentation_status} conf={detection_result.segmentation_confidence:.2f}",
             f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
