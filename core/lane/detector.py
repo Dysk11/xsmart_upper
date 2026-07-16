@@ -204,6 +204,11 @@ class LaneDetector:
         self.fork_corner_span_rows = int(fork_config.get("corner_span_rows", 10))
         self.fork_outward_jump_ratio = float(fork_config.get("outward_jump_ratio", 0.08))
         self.fork_min_lost_rows = int(fork_config.get("min_lost_rows", 3))
+        self.fork_corner_min_y_ratio = float(fork_config.get("corner_min_y_ratio", 0.05))
+        self.fork_corner_max_y_ratio = float(fork_config.get("corner_max_y_ratio", 0.72))
+        self.fork_corner_side_margin_ratio = float(
+            fork_config.get("corner_side_margin_ratio", 0.02)
+        )
         self.fork_confirm_frames = max(1, int(fork_config.get("confirm_frames", 2)))
         self.fork_release_frames = max(1, int(fork_config.get("release_frames", 3)))
         self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
@@ -567,18 +572,31 @@ class LaneDetector:
         span = max(2, self.fork_corner_span_rows)
         threshold = max(6.0, width * self.fork_outward_jump_ratio)
 
-        def outward_corner(points, side):
+        min_corner_y = int(height * self.fork_corner_min_y_ratio)
+        max_corner_y = int(height * self.fork_corner_max_y_ratio)
+        side_margin = max(2, int(round(width * self.fork_corner_side_margin_ratio)))
+
+        def outward_corner(points, lost_flags, side):
             for index in range(span, len(points) - span):
                 x, y = points[index]
+                # A boundary reconstructed after touching the ROI edge is not a
+                # measured corner.  Using it here creates LF/RF markers at the
+                # lower image edges when the lane leaves the camera view.
+                if lost_flags[index] or lost_flags[index - span] or lost_flags[index + span]:
+                    continue
+                if y < min_corner_y or y > max_corner_y:
+                    continue
+                if x <= side_margin or x >= width - 1 - side_margin:
+                    continue
                 near_x = points[index - span][0]
                 far_x = points[index + span][0]
                 outward = (x < near_x - threshold and x <= far_x + threshold * 0.5) if side == "left" else (x > near_x + threshold and x >= far_x - threshold * 0.5)
-                if outward and y < int(height * 0.8):
+                if outward:
                     return (x, y)
             return None
 
-        left_corner = outward_corner(left_points, "left")
-        right_corner = outward_corner(right_points, "right")
+        left_corner = outward_corner(left_points, left_lost, "left")
+        right_corner = outward_corner(right_points, right_lost, "right")
         min_branch_rows = max(3, self.fork_min_lost_rows)
         left_raw = len(left_branch_rows) >= min_branch_rows or (
             left_corner is not None and sum(left_lost) >= self.fork_min_lost_rows
