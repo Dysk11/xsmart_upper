@@ -39,7 +39,12 @@ from core.lane.detector import LaneDetectionResult, LaneDetector
 from core.lane.tracker import LaneTracker, TrackedLaneState
 from core.io.logger import CsvLogger
 from core.ocr.recognizer import OcrResult
-from core.planning.high_level import ControlCommand, HighLevelPlanner, ModuleHints
+from core.planning.high_level import (
+    ControlCommand,
+    HighLevelPlanner,
+    ModuleHints,
+    build_off_track_stop_hint,
+)
 from core.planning.road_sign_analyzer import (
     RoadSignAnalysisLogger,
     RoadSignAnalyzer,
@@ -353,7 +358,7 @@ def _ai_inference_worker(
             if item is None:
                 break
 
-            frame_id, captured_at, frame_payload = item
+            frame_id, captured_at, frame_payload, allow_ocr_inference = item
             try:
                 frame = (
                     _take_shared_ndarray(frame_payload, ack_queues)
@@ -363,7 +368,12 @@ def _ai_inference_worker(
                 ipc_finished = time.perf_counter()
                 detections = detector.detect(frame)
                 try:
-                    ocr_result = ocr_session.update(frame, frame_id, detections)
+                    ocr_result = ocr_session.update(
+                        frame,
+                        frame_id,
+                        detections,
+                        allow_inference=bool(allow_ocr_inference),
+                    )
                     if (
                         ocr_session.last_attempt is not None
                         and (
@@ -710,6 +720,7 @@ class UpperMachineApp:
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
         self.last_path_marker_result: PathMarkerTargetResult | None = None
+        self.last_confirmed_fork_detected = False
         self.last_ocr_result = OcrResult()
         self.last_ocr_attempt = OcrResult()
         self._last_ocr_event_id = 0
@@ -860,7 +871,12 @@ class UpperMachineApp:
             if ai_frame_payload is not None:
                 _put_latest(
                     self.ai_input_queue,
-                    (self.frame_id, captured_at, ai_frame_payload),
+                    (
+                        self.frame_id,
+                        captured_at,
+                        ai_frame_payload,
+                        self.last_confirmed_fork_detected,
+                    ),
                     release_func=self._release_owned_shared_payload,
                 )
             now = time.monotonic()
@@ -980,6 +996,9 @@ class UpperMachineApp:
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
             )
+            self.last_confirmed_fork_detected = bool(
+                detection_result.fork_result.fork_detected
+            )
             lane_detect_time = time.perf_counter()
 
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
@@ -1005,6 +1024,7 @@ class UpperMachineApp:
                 roi_rect=roi_rect,
                 detection_result=detection_result,
                 tracked_state=planning_state,
+                track_mask_visible=bool(np.any(roi_mask)),
             )
             # 第 5 步：把视觉结果变成“高层目标速度、目标转向”。
             control_command = self.planner.plan(planning_state, module_hints=module_hints)
@@ -1264,6 +1284,7 @@ class UpperMachineApp:
         roi_rect: tuple[int, int, int, int],
         detection_result: Any,
         tracked_state: TrackedLaneState,
+        track_mask_visible: bool = True,
     ) -> ModuleHints:
         """为后续目标检测、OCR、红绿灯和金币规划模块预留提示接口。
 
@@ -1282,17 +1303,14 @@ class UpperMachineApp:
         _ = frame
         _ = roi_rect
         _ = tracked_state
+        off_track_hint = build_off_track_stop_hint(track_mask_visible)
+        if off_track_hint is not None:
+            return off_track_hint
         if self.ocr_stop_latch.active:
             return ModuleHints(
                 stop=True,
                 force_mode="ROAD_SIGN_WAIT",
                 note="waiting for OCR and road-sign API decision",
-            )
-        if self.road_sign_analysis_state.should_stop(detection_result.fork_result):
-            return ModuleHints(
-                stop=True,
-                force_mode="ROAD_SIGN_WAIT",
-                note="waiting for road-sign analysis or requested branch",
             )
         if (
             self.last_path_marker_result is not None

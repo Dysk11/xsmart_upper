@@ -31,6 +31,18 @@ class ModuleHints:
     note: str = ""
 
 
+def build_off_track_stop_hint(track_mask_visible: bool) -> ModuleHints | None:
+    """Return the highest-priority stop hint when segmentation sees no track."""
+
+    if track_mask_visible:
+        return None
+    return ModuleHints(
+        stop=True,
+        force_mode="OFF_TRACK_STOP",
+        note="lane segmentation produced an empty ROI mask",
+    )
+
+
 class HighLevelPlanner:
     """根据巡线状态生成目标速度与目标转向。"""
 

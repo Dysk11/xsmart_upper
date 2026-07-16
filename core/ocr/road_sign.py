@@ -179,6 +179,7 @@ class RoadSignOcrSession:
         frame: np.ndarray,
         frame_id: int,
         detections: Sequence[DetectedObject],
+        allow_inference: bool = True,
     ) -> OcrResult | None:
         """Advance OCR state using detections and pixels from the same frame."""
 
@@ -189,6 +190,12 @@ class RoadSignOcrSession:
         if self._pending_log_result is not None:
             if now >= self._next_retry_at:
                 self._publish_pending(now)
+            return self._last_result
+
+        # A confirmed fork gates only the start of a new OCR cycle. Once a cycle
+        # has started, keep its retries alive even if fork detection flickers so
+        # the vehicle remains stopped until completion or the outer timeout.
+        if not allow_inference and self._active_trigger_id == 0:
             return self._last_result
 
         crop = select_road_sign_crop(
