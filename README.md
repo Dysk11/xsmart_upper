@@ -128,6 +128,7 @@ camera:
 
 - `show_window`: 是否显示调试窗口
 - `save_video`: 是否保存调试视频
+- `record_without_ui`: 是否只把摄像头原始画面写入视频；不影响窗口继续显示完整 UI 标注，缺省为 `false`
 - `save_screenshot`: 是否允许按 `s` 保存截图
 - `save_dir`: 调试视频与截图输出目录
 

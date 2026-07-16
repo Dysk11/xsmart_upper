@@ -37,6 +37,7 @@ class Visualizer:
         self.show_window = bool(config.get("show_window", True))
         self.window_name = str(config.get("window_name", "X-SmartCar Upper"))
         self.save_video = bool(config.get("save_video", False))
+        self.record_without_ui = bool(config.get("record_without_ui", False))
         self.save_screenshot = bool(config.get("save_screenshot", True))
         self.save_dir = Path(str(config.get("save_dir", "outputs/visual")))
         self.video_name = str(config.get("video_name", "debug.mp4"))
@@ -99,7 +100,8 @@ class Visualizer:
         )
 
         if self.save_video:
-            self._write_video(canvas)
+            video_frame = frame if self.record_without_ui else canvas
+            self._write_video(video_frame)
 
         if self.show_window:
             cv2.imshow(self.window_name, canvas)
@@ -461,11 +463,11 @@ class Visualizer:
             f"{ocr_result.inference_ms:.1f}ms: {text}"
         ]
 
-    def _write_video(self, canvas: np.ndarray) -> None:
-        """将调试画面写入视频文件。
+    def _write_video(self, video_frame: np.ndarray) -> None:
+        """将选定的原始画面或调试画面写入视频文件。
 
         输入:
-            canvas: 当前帧调试大图。
+            video_frame: 当前待录制画面。
 
         输出:
             无返回值。
@@ -478,9 +480,9 @@ class Visualizer:
                 str(video_path),
                 fourcc,
                 self.video_fps,
-                (canvas.shape[1], canvas.shape[0]),
+                (video_frame.shape[1], video_frame.shape[0]),
             )
-        self.video_writer.write(canvas)
+        self.video_writer.write(video_frame)
 
     def _save_screenshot(self, canvas: np.ndarray) -> None:
         """将当前调试画面保存为截图文件。
