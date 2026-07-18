@@ -80,7 +80,7 @@ tracker:
 # Object and road-sign perception
 rknn_object_detector:
   enable: true
-  model_path: models/object/rknn_7classes.rknn
+  model_path: models/object/rknn_7classes_0718.rknn
   input_size: [640, 480]
   input_layout: nhwc
   input_color: rgb
