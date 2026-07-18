@@ -151,22 +151,87 @@ def test_close_fork_region_keeps_only_the_normal_centerline() -> None:
     assert sample_x(result.centerline_points, 20) == pytest.approx(CENTER_X, abs=2)
 
 
-def test_current_branch_is_held_until_fork_release_and_explicit_route_can_override() -> None:
+def test_symmetric_fork_does_not_select_a_current_branch() -> None:
+    detector = make_detector()
+
+    result = detector.detect_from_mask(
+        make_fork_mask(),
+        vehicle_center_x=CENTER_X,
+    )
+
+    assert result.fork_result.fork_detected
+    assert result.fork_result.selected_direction is None
+    assert detector._held_fork_direction is None
+    assert "distances too close" in result.fork_result.reason
+
+
+@pytest.mark.parametrize(
+    ("vehicle_center_x", "expected_direction"),
+    [
+        (50.0, "left"),
+        (110.0, "right"),
+    ],
+)
+def test_branch_closest_to_frame_center_is_selected(
+    vehicle_center_x: float,
+    expected_direction: str,
+) -> None:
+    result = make_detector().detect_from_mask(
+        make_fork_mask(),
+        vehicle_center_x=vehicle_center_x,
+    )
+
+    assert result.fork_result.selected_direction == expected_direction
+    assert f"selected {expected_direction} branch by frame center" in result.fork_result.reason
+
+
+def test_frame_center_selection_is_held_until_release_and_explicit_route_can_override() -> None:
     detector = make_detector()
     fork_mask = make_fork_mask()
 
-    first = detector.detect_from_mask(fork_mask)
-    held = detector.detect_from_mask(fork_mask)
-    overridden = detector.detect_from_mask(fork_mask, route_direction="right")
+    first = detector.detect_from_mask(fork_mask, vehicle_center_x=110.0)
+    held = detector.detect_from_mask(fork_mask, vehicle_center_x=50.0)
+    overridden = detector.detect_from_mask(
+        fork_mask,
+        route_direction="left",
+        vehicle_center_x=110.0,
+    )
     released = detector.detect_from_mask(make_normal_mask())
 
-    assert first.fork_result.selected_direction == "left"
-    assert held.fork_result.selected_direction == "left"
-    assert overridden.fork_result.selected_direction == "right"
-    assert sample_x(overridden.centerline_points, 20) > CENTER_X
+    assert first.fork_result.selected_direction == "right"
+    assert held.fork_result.selected_direction == "right"
+    assert overridden.fork_result.selected_direction == "left"
+    assert sample_x(overridden.centerline_points, 20) < CENTER_X
     assert not released.fork_result.fork_detected
     assert released.fork_result.selected_direction is None
     assert detector._held_fork_direction is None
+
+
+def test_frame_center_distance_margin_requires_more_than_one_pixel_difference() -> None:
+    detector = make_detector()
+    left_candidates = [(60, 20), (60, 10)]
+    right_candidates = [(100, 20), (100, 10)]
+
+    tied, left_score, right_score = detector._choose_current_fork_direction(
+        80.5,
+        left_candidates,
+        right_candidates,
+    )
+    right, _, _ = detector._choose_current_fork_direction(
+        80.6,
+        left_candidates,
+        right_candidates,
+    )
+    left, _, _ = detector._choose_current_fork_direction(
+        79.4,
+        left_candidates,
+        right_candidates,
+    )
+
+    assert tied is None
+    assert abs(left_score - right_score) == pytest.approx(1.0)
+    assert right == "right"
+    assert left == "left"
 
 
 def test_isolated_outer_run_does_not_create_a_fork_or_double_centerline() -> None:

@@ -103,6 +103,7 @@ ARTICLE_ROW_WEIGHTS = np.asarray(
     + [5, 5, 5, 5, 4, 4, 3, 3, 3, 3] + [0] * 10,
     dtype=np.float32,
 )
+CURRENT_ROUTE_DISTANCE_MARGIN_PX = 1.0
 
 
 class LaneDetector:
@@ -265,6 +266,7 @@ class LaneDetector:
         self,
         roi_mask: np.ndarray,
         route_direction: str | None = None,
+        vehicle_center_x: float | None = None,
         segmentation_confidence: float = 0.0,
         segmentation_status: str = "ok",
     ) -> LaneDetectionResult:
@@ -280,6 +282,7 @@ class LaneDetector:
         return self._detect_from_boundaries(
             mask,
             route_direction=route_direction,
+            vehicle_center_x=vehicle_center_x,
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
         )
@@ -356,12 +359,18 @@ class LaneDetector:
         self,
         mask: np.ndarray,
         route_direction: str | None,
+        vehicle_center_x: float | None,
         segmentation_confidence: float,
         segmentation_status: str,
     ) -> LaneDetectionResult:
         """Build the driving centerline directly from row-wise track boundaries."""
 
         row_runs = self._build_row_runs(mask)
+        roi_center_x = (
+            0.5 * float(mask.shape[1])
+            if vehicle_center_x is None
+            else clamp(float(vehicle_center_x), 0.0, float(max(0, mask.shape[1] - 1)))
+        )
         (
             left_points,
             right_points,
@@ -407,6 +416,7 @@ class LaneDetector:
                 display_left_points = outer_left_points
                 display_right_points = outer_right_points
 
+            center_distance_scores: tuple[float, float] | None = None
             if requested_direction is not None:
                 self._held_fork_direction = requested_direction
             elif (
@@ -414,11 +424,18 @@ class LaneDetector:
                 and left_candidate_points
                 and right_candidate_points
             ):
-                self._held_fork_direction = self._choose_current_fork_direction(
-                    raw_centers,
+                (
+                    current_direction,
+                    left_center_distance,
+                    right_center_distance,
+                ) = self._choose_current_fork_direction(
+                    roi_center_x,
                     left_candidate_points,
                     right_candidate_points,
                 )
+                center_distance_scores = (left_center_distance, right_center_distance)
+                if current_direction is not None:
+                    self._held_fork_direction = current_direction
 
             selected_direction = self._held_fork_direction
             fork_result.selected_direction = selected_direction
@@ -440,8 +457,16 @@ class LaneDetector:
                     row_runs,
                     selected_candidates,
                 )
-                source = "requested" if requested_direction is not None else "held"
-                fork_result.reason = f"selected {selected_direction} branch ({source})"
+                if requested_direction is not None:
+                    fork_result.reason = f"selected {selected_direction} branch (requested)"
+                elif center_distance_scores is not None:
+                    fork_result.reason = (
+                        f"selected {selected_direction} branch by frame center "
+                        f"left={center_distance_scores[0]:.2f}px "
+                        f"right={center_distance_scores[1]:.2f}px"
+                    )
+                else:
+                    fork_result.reason = f"selected {selected_direction} branch (held)"
             elif selected_direction is not None:
                 raw_centers = self._merge_fork_centerline(
                     raw_centers,
@@ -455,7 +480,15 @@ class LaneDetector:
                     shared_centerline_points,
                     [],
                 )
-                fork_result.reason = "fork shared region; following normal centerline"
+                if center_distance_scores is not None:
+                    fork_result.reason = (
+                        "frame-center distances too close; following normal centerline "
+                        f"left={center_distance_scores[0]:.2f}px "
+                        f"right={center_distance_scores[1]:.2f}px "
+                        f"margin={CURRENT_ROUTE_DISTANCE_MARGIN_PX:.2f}px"
+                    )
+                else:
+                    fork_result.reason = "fork shared region; following normal centerline"
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
         fit_coeffs = self._fit_centerline(centerline_points)
@@ -592,29 +625,28 @@ class LaneDetector:
 
     def _choose_current_fork_direction(
         self,
-        ordinary_points: Sequence[Tuple[int, int]],
+        vehicle_center_x: float,
         left_candidates: Sequence[Tuple[int, int]],
         right_candidates: Sequence[Tuple[int, int]],
-    ) -> str:
-        """Choose the candidate closest to the continuity-following first pass."""
-
-        reference_points = list(ordinary_points) or list(self.last_centerline_points)
-        if not reference_points:
-            return "left"
+    ) -> tuple[str | None, float, float]:
+        """Choose the branch whose average horizontal distance to frame center is shorter."""
 
         def mean_distance(points: Sequence[Tuple[int, int]]) -> float:
             if not points:
                 return float("inf")
             return float(
                 np.mean([
-                    abs(float(x) - self._sample_centerline_x(reference_points, int(y)))
-                    for x, y in points
+                    abs(float(x) - float(vehicle_center_x))
+                    for x, _y in points
                 ])
             )
 
         left_score = mean_distance(left_candidates)
         right_score = mean_distance(right_candidates)
-        return "right" if right_score < left_score else "left"
+        if abs(left_score - right_score) <= CURRENT_ROUTE_DISTANCE_MARGIN_PX:
+            return None, left_score, right_score
+        direction = "left" if left_score < right_score else "right"
+        return direction, left_score, right_score
 
     @staticmethod
     def _merge_fork_centerline(

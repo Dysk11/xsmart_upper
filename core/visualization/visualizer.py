@@ -435,7 +435,8 @@ class Visualizer:
             fork_lane = detection_result.fork_result
             fork_reason = (
                 f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
-                f"confirm={fork_lane.confirm_frames}"
+                f"confirm={fork_lane.confirm_frames} selected={fork_lane.selected_direction} "
+                f"reason={fork_lane.reason}"
             )
         lines = [
             "窗口1：原始画面",
