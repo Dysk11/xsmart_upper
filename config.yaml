@@ -71,6 +71,8 @@ lane_geometry:
     split_enter_ratio: 0.60
     split_exit_ratio: 0.35
     split_min_rows: 5
+    smoothness_residual_threshold_px: 3.0
+    smoothness_tie_margin_px: 0.1
 
 tracker:
   ema_alpha: 0.25

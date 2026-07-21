@@ -34,6 +34,9 @@ class ForkLaneResult:
     left_corner: Tuple[int, int] | None = None
     right_corner: Tuple[int, int] | None = None
     confirm_frames: int = 0
+    left_smoothness_residual_px: float | None = None
+    right_smoothness_residual_px: float | None = None
+    rejected_direction: str | None = None
 
 
 @dataclass
@@ -230,12 +233,32 @@ class LaneDetector:
         self.fork_split_enter_ratio = float(fork_config.get("split_enter_ratio", 0.60))
         self.fork_split_exit_ratio = float(fork_config.get("split_exit_ratio", 0.35))
         self.fork_split_min_rows = max(1, int(fork_config.get("split_min_rows", 5)))
+        self.fork_smoothness_residual_threshold_px = float(
+            fork_config.get("smoothness_residual_threshold_px", 3.0)
+        )
+        self.fork_smoothness_tie_margin_px = float(
+            fork_config.get("smoothness_tie_margin_px", 0.1)
+        )
         if self.fork_split_enter_ratio <= 0.0:
             raise ValueError("fork.split_enter_ratio must be greater than zero")
         if self.fork_split_exit_ratio < 0.0:
             raise ValueError("fork.split_exit_ratio must not be negative")
         if self.fork_split_exit_ratio >= self.fork_split_enter_ratio:
             raise ValueError("fork.split_exit_ratio must be less than fork.split_enter_ratio")
+        if (
+            not math.isfinite(self.fork_smoothness_residual_threshold_px)
+            or self.fork_smoothness_residual_threshold_px <= 0.0
+        ):
+            raise ValueError(
+                "fork.smoothness_residual_threshold_px must be finite and greater than zero"
+            )
+        if (
+            not math.isfinite(self.fork_smoothness_tie_margin_px)
+            or self.fork_smoothness_tie_margin_px < 0.0
+        ):
+            raise ValueError(
+                "fork.smoothness_tie_margin_px must be finite and not negative"
+            )
         self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
         if len(self.temporal_weights) != 3 or sum(self.temporal_weights) <= 0:
             self.temporal_weights = (0.20, 0.50, 0.30)
@@ -412,11 +435,20 @@ class LaneDetector:
             fork_result.right_centerline_points = self._smooth_article_centerline(
                 right_candidate_points, mask.shape[1]
             )
+            left_smoothness_residual = self._fork_smoothness_residual(
+                left_candidate_points
+            )
+            right_smoothness_residual = self._fork_smoothness_residual(
+                right_candidate_points
+            )
+            fork_result.left_smoothness_residual_px = left_smoothness_residual
+            fork_result.right_smoothness_residual_px = right_smoothness_residual
             if outer_left_points and outer_right_points:
                 display_left_points = outer_left_points
                 display_right_points = outer_right_points
 
             center_distance_scores: tuple[float, float] | None = None
+            smoothness_selected_direction: str | None = None
             if requested_direction is not None:
                 self._held_fork_direction = requested_direction
             elif (
@@ -425,17 +457,43 @@ class LaneDetector:
                 and right_candidate_points
             ):
                 (
-                    current_direction,
-                    left_center_distance,
-                    right_center_distance,
-                ) = self._choose_current_fork_direction(
-                    roi_center_x,
-                    left_candidate_points,
-                    right_candidate_points,
+                    smoothness_selected_direction,
+                    rejected_direction,
+                ) = self._choose_fork_direction_by_smoothness(
+                    left_smoothness_residual,
+                    right_smoothness_residual,
                 )
-                center_distance_scores = (left_center_distance, right_center_distance)
-                if current_direction is not None:
-                    self._held_fork_direction = current_direction
+                fork_result.rejected_direction = rejected_direction
+                if rejected_direction == "left":
+                    fork_result.left_centerline_points = []
+                elif rejected_direction == "right":
+                    fork_result.right_centerline_points = []
+
+                if smoothness_selected_direction is not None:
+                    self._held_fork_direction = smoothness_selected_direction
+                else:
+                    (
+                        current_direction,
+                        left_center_distance,
+                        right_center_distance,
+                    ) = self._choose_current_fork_direction(
+                        roi_center_x,
+                        left_candidate_points,
+                        right_candidate_points,
+                    )
+                    center_distance_scores = (left_center_distance, right_center_distance)
+                    if current_direction is not None:
+                        self._held_fork_direction = current_direction
+
+            def format_residual(value: float | None) -> str:
+                return "n/a" if value is None else f"{value:.2f}px"
+
+            smoothness_debug = (
+                f"smoothness left={format_residual(left_smoothness_residual)} "
+                f"right={format_residual(right_smoothness_residual)} "
+                f"threshold={self.fork_smoothness_residual_threshold_px:.2f}px "
+                f"rejected={fork_result.rejected_direction or 'none'}"
+            )
 
             selected_direction = self._held_fork_direction
             fork_result.selected_direction = selected_direction
@@ -458,15 +516,23 @@ class LaneDetector:
                     selected_candidates,
                 )
                 if requested_direction is not None:
-                    fork_result.reason = f"selected {selected_direction} branch (requested)"
+                    fork_result.reason = (
+                        f"selected {selected_direction} branch (requested); {smoothness_debug}"
+                    )
+                elif smoothness_selected_direction is not None:
+                    fork_result.reason = (
+                        f"selected {selected_direction} branch by smoothness; {smoothness_debug}"
+                    )
                 elif center_distance_scores is not None:
                     fork_result.reason = (
                         f"selected {selected_direction} branch by frame center "
                         f"left={center_distance_scores[0]:.2f}px "
-                        f"right={center_distance_scores[1]:.2f}px"
+                        f"right={center_distance_scores[1]:.2f}px; {smoothness_debug}"
                     )
                 else:
-                    fork_result.reason = f"selected {selected_direction} branch (held)"
+                    fork_result.reason = (
+                        f"selected {selected_direction} branch (held); {smoothness_debug}"
+                    )
             elif selected_direction is not None:
                 raw_centers = self._merge_fork_centerline(
                     raw_centers,
@@ -485,10 +551,13 @@ class LaneDetector:
                         "frame-center distances too close; following normal centerline "
                         f"left={center_distance_scores[0]:.2f}px "
                         f"right={center_distance_scores[1]:.2f}px "
-                        f"margin={CURRENT_ROUTE_DISTANCE_MARGIN_PX:.2f}px"
+                        f"margin={CURRENT_ROUTE_DISTANCE_MARGIN_PX:.2f}px; "
+                        f"{smoothness_debug}"
                     )
                 else:
-                    fork_result.reason = "fork shared region; following normal centerline"
+                    fork_result.reason = (
+                        f"fork shared region; following normal centerline; {smoothness_debug}"
+                    )
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
         fit_coeffs = self._fit_centerline(centerline_points)
@@ -647,6 +716,47 @@ class LaneDetector:
             return None, left_score, right_score
         direction = "left" if left_score < right_score else "right"
         return direction, left_score, right_score
+
+    def _fork_smoothness_residual(
+        self,
+        candidate_points: Sequence[Tuple[int, int]],
+    ) -> float | None:
+        """Measure raw candidate roughness as its mean residual from a quadratic fit."""
+
+        if len(candidate_points) < 3:
+            return None
+        x_values = [float(x) for x, _y in candidate_points]
+        y_values = [float(y) for _x, y in candidate_points]
+        fit_coeffs = polyfit_with_fallback(y_values, x_values, degree=2)
+        if fit_coeffs is None:
+            return None
+        residual = mean_abs_residual(fit_coeffs, y_values, x_values)
+        return float(residual) if math.isfinite(residual) else None
+
+    def _choose_fork_direction_by_smoothness(
+        self,
+        left_residual: float | None,
+        right_residual: float | None,
+    ) -> tuple[str | None, str | None]:
+        """Reject a clearly rougher branch before automatic frame-center selection."""
+
+        if left_residual is None or right_residual is None:
+            return None, None
+
+        threshold = self.fork_smoothness_residual_threshold_px
+        left_rough = left_residual > threshold
+        right_rough = right_residual > threshold
+        if left_rough and not right_rough:
+            return "right", "left"
+        if right_rough and not left_rough:
+            return "left", "right"
+        if left_rough and right_rough:
+            if abs(left_residual - right_residual) <= self.fork_smoothness_tie_margin_px:
+                return None, None
+            if left_residual > right_residual:
+                return "right", "left"
+            return "left", "right"
+        return None, None
 
     @staticmethod
     def _merge_fork_centerline(

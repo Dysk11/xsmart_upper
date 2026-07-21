@@ -46,6 +46,8 @@ def make_detector(**overrides) -> LaneDetector:
             "split_enter_ratio": 0.60,
             "split_exit_ratio": 0.35,
             "split_min_rows": 5,
+            "smoothness_residual_threshold_px": 3.0,
+            "smoothness_tie_margin_px": 0.1,
         },
     }
     for section, values in overrides.items():
@@ -95,6 +97,24 @@ def make_close_fork_mask(split_y: int = 40) -> np.ndarray:
     return mask
 
 
+def make_rough_fork_mask(
+    left_amplitude: float = 0.0,
+    right_amplitude: float = 0.0,
+    split_y: int = 40,
+) -> np.ndarray:
+    mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    for y in range(HEIGHT):
+        width = perspective_width(y)
+        if y >= split_y:
+            fill_run(mask, y, CENTER_X, width)
+            continue
+        half_separation = 0.70 * width
+        sign = 1.0 if (y // 2) % 2 else -1.0
+        fill_run(mask, y, CENTER_X - half_separation + sign * left_amplitude, width)
+        fill_run(mask, y, CENTER_X + half_separation + sign * right_amplitude, width)
+    return mask
+
+
 def sample_x(points, y: int) -> float:
     point = min(points, key=lambda value: abs(value[1] - y))
     return float(point[0])
@@ -122,6 +142,32 @@ def test_fixed_perspective_width_interpolates_top_middle_and_bottom() -> None:
 def test_rejects_invalid_perspective_width_config(centerline, message) -> None:
     with pytest.raises(ValueError, match=message):
         make_detector(centerline=centerline)
+
+
+@pytest.mark.parametrize(
+    ("fork", "message"),
+    [
+        ({"smoothness_residual_threshold_px": 0.0}, "threshold_px"),
+        ({"smoothness_residual_threshold_px": float("inf")}, "threshold_px"),
+        ({"smoothness_tie_margin_px": -0.1}, "tie_margin_px"),
+        ({"smoothness_tie_margin_px": float("nan")}, "tie_margin_px"),
+    ],
+)
+def test_rejects_invalid_fork_smoothness_config(fork, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        make_detector(fork=fork)
+
+
+def test_raw_candidate_residual_distinguishes_smooth_curves_from_jagged_lines() -> None:
+    detector = make_detector()
+    straight = [(50, y) for y in range(40)]
+    quadratic = [(int(round(50.0 + 0.02 * (y - 20) ** 2)), y) for y in range(40)]
+    jagged = [(50 + (4 if (y // 2) % 2 else -4), y) for y in range(40)]
+
+    assert detector._fork_smoothness_residual(straight) == pytest.approx(0.0)
+    assert detector._fork_smoothness_residual(quadratic) < 1.0
+    assert detector._fork_smoothness_residual(jagged) > 3.0
+    assert detector._fork_smoothness_residual([(50, 1), (50, 0)]) is None
 
 
 def test_explicit_direction_selects_inferred_left_or_right_centerline() -> None:
@@ -183,6 +229,106 @@ def test_branch_closest_to_frame_center_is_selected(
 
     assert result.fork_result.selected_direction == expected_direction
     assert f"selected {expected_direction} branch by frame center" in result.fork_result.reason
+
+
+@pytest.mark.parametrize(
+    ("left_amplitude", "right_amplitude", "vehicle_center_x", "expected_direction"),
+    [
+        (4.0, 0.0, 40.0, "right"),
+        (0.0, 4.0, 120.0, "left"),
+    ],
+)
+def test_single_rough_branch_is_hidden_and_smoother_branch_is_selected(
+    left_amplitude: float,
+    right_amplitude: float,
+    vehicle_center_x: float,
+    expected_direction: str,
+) -> None:
+    result = make_detector().detect_from_mask(
+        make_rough_fork_mask(left_amplitude, right_amplitude),
+        vehicle_center_x=vehicle_center_x,
+    )
+    fork = result.fork_result
+    rejected_direction = "right" if expected_direction == "left" else "left"
+
+    assert fork.selected_direction == expected_direction
+    assert fork.rejected_direction == rejected_direction
+    assert getattr(fork, f"{rejected_direction}_centerline_points") == []
+    assert getattr(fork, f"{expected_direction}_centerline_points")
+    assert "branch by smoothness" in fork.reason
+    assert f"rejected={rejected_direction}" in fork.reason
+
+
+def test_two_rough_branches_discard_the_one_with_larger_residual() -> None:
+    result = make_detector().detect_from_mask(
+        make_rough_fork_mask(left_amplitude=8.0, right_amplitude=4.0),
+        vehicle_center_x=40.0,
+    )
+    fork = result.fork_result
+
+    assert fork.left_smoothness_residual_px > fork.right_smoothness_residual_px > 3.0
+    assert fork.selected_direction == "right"
+    assert fork.rejected_direction == "left"
+    assert fork.left_centerline_points == []
+    assert fork.right_centerline_points
+
+
+def test_similarly_rough_branches_fall_back_to_frame_center_selection() -> None:
+    result = make_detector().detect_from_mask(
+        make_rough_fork_mask(left_amplitude=4.0, right_amplitude=4.0),
+        vehicle_center_x=40.0,
+    )
+    fork = result.fork_result
+
+    assert fork.left_smoothness_residual_px > 3.0
+    assert fork.right_smoothness_residual_px > 3.0
+    assert abs(
+        fork.left_smoothness_residual_px - fork.right_smoothness_residual_px
+    ) <= 0.1
+    assert fork.selected_direction == "left"
+    assert fork.rejected_direction is None
+    assert fork.left_centerline_points
+    assert fork.right_centerline_points
+    assert "branch by frame center" in fork.reason
+
+
+def test_threshold_is_strictly_greater_and_invalid_scores_fall_back() -> None:
+    detector = make_detector()
+
+    assert detector._choose_fork_direction_by_smoothness(3.0, 0.0) == (None, None)
+    assert detector._choose_fork_direction_by_smoothness(None, 4.0) == (None, None)
+
+
+def test_requested_rough_branch_is_not_filtered() -> None:
+    result = make_detector().detect_from_mask(
+        make_rough_fork_mask(left_amplitude=4.0),
+        route_direction="left",
+        vehicle_center_x=120.0,
+    )
+    fork = result.fork_result
+
+    assert fork.left_smoothness_residual_px > 3.0
+    assert fork.selected_direction == "left"
+    assert fork.rejected_direction is None
+    assert fork.left_centerline_points
+    assert "branch (requested)" in fork.reason
+
+
+def test_held_branch_is_not_reconsidered_by_smoothness() -> None:
+    detector = make_detector()
+
+    first = detector.detect_from_mask(make_fork_mask(), vehicle_center_x=40.0)
+    held = detector.detect_from_mask(
+        make_rough_fork_mask(left_amplitude=4.0),
+        vehicle_center_x=120.0,
+    )
+
+    assert first.fork_result.selected_direction == "left"
+    assert held.fork_result.left_smoothness_residual_px > 3.0
+    assert held.fork_result.selected_direction == "left"
+    assert held.fork_result.rejected_direction is None
+    assert held.fork_result.left_centerline_points
+    assert "branch (held)" in held.fork_result.reason
 
 
 def test_frame_center_selection_is_held_until_release_and_explicit_route_can_override() -> None:
