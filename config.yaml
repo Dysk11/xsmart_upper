@@ -37,10 +37,10 @@ rknn_lane_segmenter:
 
 lane_geometry:
   roi:
-    top_ratio: 0.585
+    top_ratio: 0.54
     bottom_ratio: 1.0
-    left_ratio: 0.05
-    right_ratio: 0.95
+    left_ratio: 0.01
+    right_ratio: 0.99
   boundary:
     gradient_jump_ratio: 0.05
     gradient_step_ratio: 0.025
@@ -64,8 +64,20 @@ lane_geometry:
     corner_min_y_ratio: 0.05
     corner_max_y_ratio: 0.72
     corner_side_margin_ratio: 0.02
+    feature_span_rows: 10
+    feature_prominence_ratio: 0.025
+    feature_min_y_ratio: 0.05
+    feature_max_y_ratio: 0.85
+    feature_side_margin_ratio: 0.02
+    orientation_min_rows: 3
+    orientation_vote_ratio: 0.65
+    ap_min_distance_ratio: 0.04
+    ap_max_distance_ratio: 0.75
+    break_jump_ratio: 0.05
     confirm_frames: 2
     release_frames: 3
+    recovery_confirm_frames: 5
+    return_release_frames: 3
 
 tracker:
   ema_alpha: 0.25

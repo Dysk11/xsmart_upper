@@ -34,6 +34,34 @@ class ForkLaneResult:
     left_corner: Tuple[int, int] | None = None
     right_corner: Tuple[int, int] | None = None
     confirm_frames: int = 0
+    state: str = "MAIN"
+    junction_kind: str | None = None
+    a_point: Tuple[int, int] | None = None
+    p_point: Tuple[int, int] | None = None
+    break_point: Tuple[int, int] | None = None
+    patch_line: Tuple[Tuple[int, int], Tuple[int, int]] | None = None
+    path_overridden: bool = False
+
+
+@dataclass(frozen=True)
+class RightForkObservation:
+    """Measured right-fork features before temporal state handling."""
+
+    a_point: Tuple[int, int] | None = None
+    p_point: Tuple[int, int] | None = None
+    junction_kind: str | None = None
+    break_point: Tuple[int, int] | None = None
+    right_branch_points: Tuple[Tuple[int, int], ...] = ()
+    boundaries_valid: bool = False
+
+
+@dataclass(frozen=True)
+class RightForkDecision:
+    """State-machine output consumed by the row-boundary path builder."""
+
+    result: ForkLaneResult
+    patch_kind: str | None = None
+    base_route_direction: str | None = None
 
 
 @dataclass
@@ -211,6 +239,42 @@ class LaneDetector:
         )
         self.fork_confirm_frames = max(1, int(fork_config.get("confirm_frames", 2)))
         self.fork_release_frames = max(1, int(fork_config.get("release_frames", 3)))
+        self.fork_feature_span_rows = max(
+            2, int(fork_config.get("feature_span_rows", self.fork_corner_span_rows))
+        )
+        self.fork_feature_prominence_ratio = float(
+            fork_config.get("feature_prominence_ratio", 0.025)
+        )
+        self.fork_feature_min_y_ratio = float(
+            fork_config.get("feature_min_y_ratio", self.fork_corner_min_y_ratio)
+        )
+        self.fork_feature_max_y_ratio = float(
+            fork_config.get("feature_max_y_ratio", 0.85)
+        )
+        self.fork_feature_side_margin_ratio = float(
+            fork_config.get("feature_side_margin_ratio", self.fork_corner_side_margin_ratio)
+        )
+        self.fork_orientation_min_rows = max(
+            1, int(fork_config.get("orientation_min_rows", 3))
+        )
+        self.fork_orientation_vote_ratio = float(
+            fork_config.get("orientation_vote_ratio", 0.65)
+        )
+        self.fork_ap_min_distance_ratio = float(
+            fork_config.get("ap_min_distance_ratio", 0.04)
+        )
+        self.fork_ap_max_distance_ratio = float(
+            fork_config.get("ap_max_distance_ratio", 0.75)
+        )
+        self.fork_break_jump_ratio = float(
+            fork_config.get("break_jump_ratio", 0.05)
+        )
+        self.fork_recovery_confirm_frames = max(
+            1, int(fork_config.get("recovery_confirm_frames", 5))
+        )
+        self.fork_return_release_frames = max(
+            1, int(fork_config.get("return_release_frames", 3))
+        )
         self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
         if len(self.temporal_weights) != 3 or sum(self.temporal_weights) <= 0:
             self.temporal_weights = (0.20, 0.50, 0.30)
@@ -218,6 +282,17 @@ class LaneDetector:
         self._left_fork_hits = self._right_fork_hits = 0
         self._left_fork_misses = self._right_fork_misses = 0
         self._left_fork_active = self._right_fork_active = False
+        self._fork_state = "MAIN"
+        self._fork_junction_kind: str | None = None
+        self._fork_junction_hits = 0
+        self._fork_junction_misses = 0
+        self._fork_right_latched = False
+        self._fork_last_a_point: Tuple[int, int] | None = None
+        self._fork_last_p_point: Tuple[int, int] | None = None
+        self._fork_break_hits = 0
+        self._fork_recovery_hits = 0
+        self._fork_return_clear_hits = 0
+        self._fork_last_break_point: Tuple[int, int] | None = None
 
     def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
@@ -347,43 +422,79 @@ class LaneDetector:
             left_branch_rows,
             right_branch_rows,
         ) = self._extract_row_boundaries(mask, row_runs=row_runs)
-        fork_result = self._geometric_fork_result(
+        observation = self._observe_right_fork(
+            mask,
+            row_runs,
             left_points,
             right_points,
             left_lost,
             right_lost,
-            left_branch_rows,
             right_branch_rows,
-            mask.shape,
         )
-        requested_direction = self._normalize_route_direction(route_direction)
-        if requested_direction is not None:
-            fork_result.requested_direction = requested_direction
-            branch_choices_visible = bool(left_branch_rows or right_branch_rows)
-            if fork_result.fork_detected and branch_choices_visible:
-                (
-                    left_points,
-                    right_points,
-                    raw_centers,
-                    left_lost,
-                    right_lost,
-                    selected_mask,
-                    _selected_left_branches,
-                    _selected_right_branches,
-                ) = self._extract_row_boundaries(
-                    mask,
-                    route_direction=requested_direction,
-                    row_runs=row_runs,
-                )
-                if raw_centers:
-                    fork_result.selected_direction = requested_direction
-                    fork_result.reason = f"selected {requested_direction} branch"
-                else:
-                    fork_result.reason = f"requested {requested_direction} but branch unavailable"
-            elif fork_result.fork_detected:
-                fork_result.reason = f"requested {requested_direction} but branch unavailable"
-            else:
-                fork_result.reason = f"waiting for {requested_direction} fork"
+        fork_decision = self._update_right_fork_state(
+            observation,
+            route_direction=route_direction,
+            shape=mask.shape,
+        )
+        fork_result = fork_decision.result
+
+        if fork_decision.base_route_direction is not None:
+            (
+                left_points,
+                right_points,
+                raw_centers,
+                left_lost,
+                right_lost,
+                selected_mask,
+                _selected_left_branches,
+                _selected_right_branches,
+            ) = self._extract_row_boundaries(
+                mask,
+                route_direction=fork_decision.base_route_direction,
+                row_runs=row_runs,
+            )
+
+        # Keep the segmentation evidence separate from the virtual corridor.
+        # Boundary repair is allowed to guide control, but must not manufacture
+        # confidence by painting pixels into the raw model output.
+        evidence_mask = selected_mask.copy()
+        raw_left_lost_rows = sum(left_lost)
+        raw_right_lost_rows = sum(right_lost)
+        patch_side: str | None = None
+        patch_start: Tuple[int, int] | None = None
+        patch_end: Tuple[int, int] | None = None
+        if fork_decision.patch_kind == "main_ap":
+            patch_side = "right"
+            patch_start = fork_result.a_point
+            patch_end = fork_result.p_point
+        elif fork_decision.patch_kind == "enter_branch":
+            bottom_left = self._lowest_valid_boundary_point(left_points, left_lost)
+            if bottom_left is not None and fork_result.p_point is not None:
+                patch_side = "left"
+                patch_start = bottom_left
+                patch_end = fork_result.p_point
+        elif fork_decision.patch_kind == "return_to_main":
+            if fork_result.break_point is not None:
+                patch_side = "left"
+                patch_start = fork_result.break_point
+                patch_end = (mask.shape[1] - 1, 0)
+
+        if patch_side is not None and patch_start is not None and patch_end is not None:
+            (
+                left_points,
+                right_points,
+                raw_centers,
+                selected_mask,
+            ) = self._apply_virtual_boundary_patch(
+                left_points=left_points,
+                right_points=right_points,
+                side=patch_side,
+                start=patch_start,
+                end=patch_end,
+                shape=mask.shape,
+            )
+            fork_result.patch_line = (patch_start, patch_end)
+            fork_result.path_overridden = True
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
         fit_coeffs = self._fit_centerline(centerline_points)
@@ -393,7 +504,7 @@ class LaneDetector:
             centerline_points, fit_coeffs, mask.shape
         )
         confidence = self._estimate_confidence(
-            selected_mask,
+            evidence_mask,
             centerline_points,
             fit_coeffs,
             lane_width_px,
@@ -420,8 +531,8 @@ class LaneDetector:
             fork_result=fork_result,
             left_boundary_points=left_points,
             right_boundary_points=right_points,
-            left_lost_rows=sum(left_lost),
-            right_lost_rows=sum(right_lost),
+            left_lost_rows=raw_left_lost_rows,
+            right_lost_rows=raw_right_lost_rows,
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
         )
@@ -513,6 +624,399 @@ class LaneDetector:
         left_lost = [left_lost for _y, _left, _right, left_lost, _right_lost in rows]
         right_lost = [right_lost for _y, _left, _right, _left_lost, right_lost in rows]
         return left_points, right_points, centers, left_lost, right_lost, selected_mask, left_branch_rows, right_branch_rows
+
+    def _observe_right_fork(
+        self,
+        mask: np.ndarray,
+        row_runs: Sequence[Sequence[tuple[int, int]]],
+        left_points: Sequence[Tuple[int, int]],
+        right_points: Sequence[Tuple[int, int]],
+        left_lost: Sequence[bool],
+        right_lost: Sequence[bool],
+        right_branch_rows: Sequence[Tuple[int, int]],
+    ) -> RightForkObservation:
+        """Measure A/P points and the branch-return break without changing state."""
+
+        _ = row_runs
+        a_point, p_point = self._find_right_fork_ap_pair(
+            mask,
+            right_points=right_points,
+            right_lost=right_lost,
+        )
+        junction_kind = self._classify_right_junction(a_point, right_branch_rows)
+        if junction_kind is None:
+            a_point = None
+            p_point = None
+
+        break_point = self._find_left_boundary_break(
+            left_points,
+            left_lost,
+            mask.shape,
+        )
+        boundaries_valid = bool(left_points and right_points) and (
+            sum(left_lost) < self.fork_min_lost_rows
+            and sum(right_lost) < self.fork_min_lost_rows
+        )
+        return RightForkObservation(
+            a_point=a_point,
+            p_point=p_point,
+            junction_kind=junction_kind,
+            break_point=break_point,
+            right_branch_points=tuple(right_branch_rows),
+            boundaries_valid=boundaries_valid,
+        )
+
+    def _find_right_fork_ap_pair(
+        self,
+        mask: np.ndarray,
+        right_points: Sequence[Tuple[int, int]],
+        right_lost: Sequence[bool],
+    ) -> tuple[Tuple[int, int] | None, Tuple[int, int] | None]:
+        """Find a concave A point and an outward P point on the right boundary."""
+
+        height, width = mask.shape[:2]
+        prominence = max(6.0, width * self.fork_feature_prominence_ratio)
+        min_y = int(round(height * self.fork_feature_min_y_ratio))
+        max_y = int(round(height * self.fork_feature_max_y_ratio))
+        side_margin = max(2, int(round(width * self.fork_feature_side_margin_ratio)))
+        diagonal = math.hypot(width, height)
+        min_distance = diagonal * self.fork_ap_min_distance_ratio
+        max_distance = diagonal * self.fork_ap_max_distance_ratio
+
+        p_candidates: list[tuple[Tuple[int, int], float]] = []
+        span = min(
+            self.fork_feature_span_rows,
+            max(2, (len(right_points) - 1) // 2),
+        )
+        if len(right_points) >= span * 2 + 1:
+            for index in range(span, len(right_points) - span):
+                if (
+                    right_lost[index]
+                    or right_lost[index - span]
+                    or right_lost[index + span]
+                ):
+                    continue
+                x, y = right_points[index]
+                if y < min_y or y > max_y or x >= width - 1 - side_margin:
+                    continue
+                neighbor_x = max(
+                    right_points[index - span][0],
+                    right_points[index + span][0],
+                )
+                outward = float(x - neighbor_x)
+                if outward >= prominence:
+                    p_candidates.append(((int(x), int(y)), outward))
+        if not p_candidates:
+            return None, None
+
+        contours, _hierarchy = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE,
+        )
+        if not contours:
+            return None, None
+        bottom_limit = int(round(height * 0.55))
+        bottom_contours = [
+            contour
+            for contour in contours
+            if cv2.boundingRect(contour)[1] + cv2.boundingRect(contour)[3] >= bottom_limit
+        ]
+        contour = max(bottom_contours or contours, key=cv2.contourArea)
+        if len(contour) < 4:
+            return None, None
+        hull = cv2.convexHull(contour, returnPoints=False)
+        if hull is None or len(hull) < 4:
+            return None, None
+        defects = cv2.convexityDefects(contour, hull)
+        if defects is None:
+            return None, None
+
+        best: tuple[float, Tuple[int, int], Tuple[int, int]] | None = None
+        right_side_min_x = int(round(width * 0.35))
+        for defect in defects[:, 0, :]:
+            _start_index, _end_index, far_index, raw_depth = [int(value) for value in defect]
+            depth = raw_depth / 256.0
+            if depth < prominence:
+                continue
+            a_x, a_y = [int(value) for value in contour[far_index][0]]
+            if (
+                a_x < right_side_min_x
+                or a_x <= side_margin
+                or a_x >= width - 1 - side_margin
+                or a_y < min_y
+                or a_y > max_y
+            ):
+                continue
+            for p_point, p_prominence in p_candidates:
+                p_x, p_y = p_point
+                if p_x <= a_x:
+                    continue
+                distance = math.hypot(p_x - a_x, p_y - a_y)
+                if distance < min_distance or distance > max_distance:
+                    continue
+                score = depth + p_prominence - 0.05 * distance
+                if best is None or score > best[0]:
+                    best = (score, (a_x, a_y), p_point)
+        if best is None:
+            return None, None
+        return best[1], best[2]
+
+    def _classify_right_junction(
+        self,
+        a_point: Tuple[int, int] | None,
+        right_branch_rows: Sequence[Tuple[int, int]],
+    ) -> str | None:
+        """Classify split/merge from the branch rows above or below A."""
+
+        if a_point is None:
+            return None
+        a_y = int(a_point[1])
+        above = sum(1 for _x, y in right_branch_rows if y < a_y - 1)
+        below = sum(1 for _x, y in right_branch_rows if y > a_y + 1)
+        total = above + below
+        if total < self.fork_orientation_min_rows:
+            return None
+        if above >= self.fork_orientation_min_rows and above / total >= self.fork_orientation_vote_ratio:
+            return "split"
+        if below >= self.fork_orientation_min_rows and below / total >= self.fork_orientation_vote_ratio:
+            return "merge"
+        return None
+
+    def _find_left_boundary_break(
+        self,
+        left_points: Sequence[Tuple[int, int]],
+        left_lost: Sequence[bool],
+        shape: Tuple[int, int],
+    ) -> Tuple[int, int] | None:
+        """Return the strongest measured internal jump on the left boundary."""
+
+        height, width = shape[:2]
+        threshold = max(8.0, width * self.fork_break_jump_ratio)
+        min_y = int(round(height * self.fork_feature_min_y_ratio))
+        max_y = int(round(height * self.fork_feature_max_y_ratio))
+        side_margin = max(2, int(round(width * self.fork_feature_side_margin_ratio)))
+        best: tuple[float, Tuple[int, int]] | None = None
+        for index in range(len(left_points) - 1):
+            if left_lost[index] or left_lost[index + 1]:
+                continue
+            near_x, near_y = left_points[index]
+            far_x, far_y = left_points[index + 1]
+            if abs(near_y - far_y) > 2:
+                continue
+            if near_y < min_y or near_y > max_y:
+                continue
+            if near_x <= side_margin or near_x >= width - 1 - side_margin:
+                continue
+            jump = abs(float(far_x - near_x))
+            if jump >= threshold and (best is None or jump > best[0]):
+                best = (jump, (int(near_x), int(near_y)))
+        return None if best is None else best[1]
+
+    def _update_right_fork_state(
+        self,
+        observation: RightForkObservation,
+        route_direction: str | None,
+        shape: Tuple[int, int],
+    ) -> RightForkDecision:
+        """Advance MAIN/JUNCTION/BRANCH/RETURNING in strict order."""
+
+        _ = shape
+        requested = self._normalize_route_direction(route_direction)
+        has_junction = bool(
+            observation.a_point is not None
+            and observation.p_point is not None
+            and observation.junction_kind in {"merge", "split"}
+        )
+
+        if self._fork_state == "MAIN":
+            if has_junction:
+                if self._fork_junction_kind != observation.junction_kind:
+                    self._fork_junction_hits = 0
+                self._fork_junction_kind = observation.junction_kind
+                self._fork_junction_hits += 1
+                self._fork_last_a_point = observation.a_point
+                self._fork_last_p_point = observation.p_point
+                self._fork_recovery_hits = 0
+                if self._fork_junction_hits >= self.fork_confirm_frames:
+                    self._fork_state = "JUNCTION"
+                    self._fork_junction_misses = 0
+                    self._fork_right_latched = False
+            else:
+                self._fork_junction_hits = 0
+                self._fork_junction_kind = None
+                if observation.break_point is not None:
+                    self._fork_recovery_hits += 1
+                    self._fork_last_break_point = observation.break_point
+                    if self._fork_recovery_hits >= self.fork_recovery_confirm_frames:
+                        self._fork_state = "RETURNING"
+                        self._fork_return_clear_hits = 0
+                else:
+                    self._fork_recovery_hits = 0
+
+        if self._fork_state == "JUNCTION":
+            if has_junction and observation.junction_kind == self._fork_junction_kind:
+                self._fork_junction_misses = 0
+                self._fork_last_a_point = observation.a_point
+                self._fork_last_p_point = observation.p_point
+            else:
+                self._fork_junction_misses += 1
+            if self._fork_junction_kind == "split" and requested == "right":
+                self._fork_right_latched = True
+            if self._fork_junction_misses >= self.fork_release_frames:
+                enter_branch = (
+                    self._fork_junction_kind == "split" and self._fork_right_latched
+                )
+                self._fork_state = "BRANCH" if enter_branch else "MAIN"
+                self._clear_junction_memory()
+
+        elif self._fork_state == "BRANCH":
+            if observation.break_point is not None:
+                self._fork_break_hits += 1
+                self._fork_last_break_point = observation.break_point
+                if self._fork_break_hits >= self.fork_confirm_frames:
+                    self._fork_state = "RETURNING"
+                    self._fork_return_clear_hits = 0
+            else:
+                self._fork_break_hits = 0
+
+        elif self._fork_state == "RETURNING":
+            if observation.break_point is not None:
+                self._fork_last_break_point = observation.break_point
+                self._fork_return_clear_hits = 0
+            elif observation.boundaries_valid:
+                self._fork_return_clear_hits += 1
+                if self._fork_return_clear_hits >= self.fork_return_release_frames:
+                    self._fork_state = "MAIN"
+                    self._fork_last_break_point = None
+                    self._fork_break_hits = 0
+                    self._fork_recovery_hits = 0
+                    self._fork_return_clear_hits = 0
+            else:
+                self._fork_return_clear_hits = 0
+
+        state = self._fork_state
+        junction_kind = self._fork_junction_kind if state == "JUNCTION" else None
+        selected_direction: str | None = None
+        patch_kind: str | None = None
+        base_route_direction: str | None = None
+        reason = f"state={state.lower()}"
+        if state == "JUNCTION":
+            if junction_kind == "merge":
+                selected_direction = "left"
+                patch_kind = "main_ap"
+                reason = "right branch merges; keep main with A-P"
+            elif junction_kind == "split" and self._fork_right_latched:
+                selected_direction = "right"
+                patch_kind = "enter_branch"
+                base_route_direction = "right"
+                reason = "right split selected; connect bottom-left to P"
+            elif junction_kind == "split":
+                selected_direction = "left"
+                patch_kind = "main_ap"
+                reason = "right split visible; keep main with A-P"
+        elif state == "BRANCH":
+            reason = "right branch locked; waiting for left-boundary break"
+        elif state == "RETURNING":
+            patch_kind = "return_to_main"
+            reason = "return break; connect B to ROI top-right"
+
+        a_point = self._fork_last_a_point if state == "JUNCTION" else None
+        p_point = self._fork_last_p_point if state == "JUNCTION" else None
+        break_point = self._fork_last_break_point if state == "RETURNING" else None
+        result = ForkLaneResult(
+            fork_detected=state == "JUNCTION" and junction_kind == "split",
+            requested_direction=requested,
+            selected_direction=selected_direction,
+            left_points=[],
+            right_points=list(observation.right_branch_points),
+            reason=reason,
+            left_detected=False,
+            right_detected=state == "JUNCTION",
+            left_corner=None,
+            right_corner=p_point,
+            confirm_frames=self._fork_junction_hits,
+            state=state,
+            junction_kind=junction_kind,
+            a_point=a_point,
+            p_point=p_point,
+            break_point=break_point,
+        )
+        return RightForkDecision(
+            result=result,
+            patch_kind=patch_kind,
+            base_route_direction=base_route_direction,
+        )
+
+    def _clear_junction_memory(self) -> None:
+        self._fork_junction_kind = None
+        self._fork_junction_hits = 0
+        self._fork_junction_misses = 0
+        self._fork_right_latched = False
+        self._fork_last_a_point = None
+        self._fork_last_p_point = None
+
+    @staticmethod
+    def _lowest_valid_boundary_point(
+        points: Sequence[Tuple[int, int]],
+        lost_flags: Sequence[bool],
+    ) -> Tuple[int, int] | None:
+        valid = [
+            (int(x), int(y))
+            for (x, y), lost in zip(points, lost_flags)
+            if not lost
+        ]
+        return max(valid, key=lambda point: point[1]) if valid else None
+
+    def _apply_virtual_boundary_patch(
+        self,
+        left_points: Sequence[Tuple[int, int]],
+        right_points: Sequence[Tuple[int, int]],
+        side: str,
+        start: Tuple[int, int],
+        end: Tuple[int, int],
+        shape: Tuple[int, int],
+    ) -> tuple[
+        List[Tuple[int, int]],
+        List[Tuple[int, int]],
+        List[Tuple[int, int]],
+        np.ndarray,
+    ]:
+        """Replace one boundary with a two-point virtual line, row by row."""
+
+        height, width = shape[:2]
+        left_by_y = {int(y): int(x) for x, y in left_points}
+        right_by_y = {int(y): int(x) for x, y in right_points}
+        y_start, y_end = int(start[1]), int(end[1])
+        y_min, y_max = sorted((y_start, y_end))
+        denominator = float(y_end - y_start)
+        if abs(denominator) < 1.0:
+            denominator = 1.0
+        for y in sorted(set(left_by_y).intersection(right_by_y)):
+            if y < y_min or y > y_max:
+                continue
+            ratio = (float(y) - float(y_start)) / denominator
+            x = int(round(float(start[0]) + ratio * (float(end[0]) - float(start[0]))))
+            if side == "left":
+                left_by_y[y] = int(clamp(x, 0, max(0, right_by_y[y] - self.min_run_width_px)))
+            elif side == "right":
+                right_by_y[y] = int(clamp(x, left_by_y[y] + self.min_run_width_px, width - 1))
+            else:
+                raise ValueError(f"unsupported virtual boundary side: {side}")
+
+        rows: list[tuple[int, int, int]] = []
+        selected_mask = np.zeros((height, width), dtype=np.uint8)
+        for y in sorted(set(left_by_y).intersection(right_by_y), reverse=True):
+            left = int(clamp(left_by_y[y], 0, width - 1))
+            right = int(clamp(right_by_y[y], left + 1, width - 1))
+            if right <= left:
+                continue
+            rows.append((y, left, right))
+            selected_mask[y, left : right + 1] = 255
+        patched_left = [(left, y) for y, left, _right in rows]
+        patched_right = [(right, y) for y, _left, right in rows]
+        centers = [(int(round((left + right) * 0.5)), y) for y, left, right in rows]
+        return patched_left, patched_right, centers, selected_mask
 
     def _smooth_article_centerline(
         self, raw_points: Sequence[Tuple[int, int]], width: int

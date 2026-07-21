@@ -200,10 +200,27 @@ class Visualizer:
                 thickness=1,
                 offset=(x1, y1),
             )
-        for corner, color, label in (
-            (fork_lane.left_corner, (255, 0, 255), "LF"),
-            (fork_lane.right_corner, (0, 128, 255), "RF"),
-        ):
+        if fork_lane.patch_line is not None:
+            patch_start, patch_end = fork_lane.patch_line
+            cv2.line(
+                original_panel,
+                (int(patch_start[0] + x1), int(patch_start[1] + y1)),
+                (int(patch_end[0] + x1), int(patch_end[1] + y1)),
+                (255, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        feature_markers = (
+            (fork_lane.a_point, (0, 255, 255), "A"),
+            (fork_lane.p_point, (0, 128, 255), "P"),
+            (fork_lane.break_point, (255, 0, 255), "B"),
+        )
+        if not any(point is not None for point, _color, _label in feature_markers):
+            feature_markers = (
+                (fork_lane.left_corner, (255, 0, 255), "LF"),
+                (fork_lane.right_corner, (0, 128, 255), "RF"),
+            )
+        for corner, color, label in feature_markers:
             if corner is not None:
                 point = (int(corner[0] + x1), int(corner[1] + y1))
                 cv2.rectangle(
@@ -434,8 +451,10 @@ class Visualizer:
         if detection_result is not None:
             fork_lane = detection_result.fork_result
             fork_reason = (
-                f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
-                f"confirm={fork_lane.confirm_frames}"
+                f"fork: state={fork_lane.state} kind={fork_lane.junction_kind or '-'} "
+                f"request={fork_lane.requested_direction or '-'} "
+                f"selected={fork_lane.selected_direction or '-'} "
+                f"confirm={fork_lane.confirm_frames} reason={fork_lane.reason}"
             )
         lines = [
             "窗口1：原始画面",

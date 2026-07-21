@@ -1004,7 +1004,10 @@ class UpperMachineApp:
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
             tracked_state = self.tracker.update(
                 detection_result,
-                prefer_current=detection_result.fork_result.selected_direction is not None,
+                prefer_current=(
+                    detection_result.fork_result.path_overridden
+                    or detection_result.fork_result.selected_direction is not None
+                ),
             )
             lane_track_time = time.perf_counter()
             self._record_lane_timing(
