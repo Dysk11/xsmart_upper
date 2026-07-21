@@ -790,7 +790,7 @@ class LaneDetector:
         points: Sequence[Tuple[int, int]],
         lost_flags: Sequence[bool],
     ) -> float | None:
-        """Measure only real boundary samples, excluding reconstructed edge rows."""
+        """Measure only real boundary samples, excluding inferred gap rows."""
 
         measured = [
             (int(x), int(y))
@@ -1014,7 +1014,6 @@ class LaneDetector:
             row_runs = self._build_row_runs(mask)
         selected_mask = np.zeros_like(mask)
         prior_center = float(self.last_centerline_points[0][0]) if self.last_centerline_points else width * 0.5
-        prior_width = max(float(self.last_lane_width_px), float(self.min_run_width_px))
         rows: list[tuple[int, int, int, bool, bool]] = []
         left_branch_rows: list[tuple[int, int]] = []
         right_branch_rows: list[tuple[int, int]] = []
@@ -1047,16 +1046,12 @@ class LaneDetector:
                 else:
                     right_branch_rows.append((int(candidate_center), y))
 
-            left_missing = left <= 1
-            right_missing = right >= width - 2
-            if left_missing and not right_missing:
-                left = max(0, int(round(right - prior_width)))
-            elif right_missing and not left_missing:
-                right = min(width - 1, int(round(left + prior_width)))
-            rows.append((y, left, right, left_missing, right_missing))
+            # A foreground run that reaches an ROI edge still has a valid
+            # boundary for this row.  Keep the measured endpoint instead of
+            # rebuilding it inward from the historical lane width.
+            rows.append((y, left, right, False, False))
             selected_mask[y, left : right + 1] = 255
             prior_center = 0.65 * prior_center + 0.35 * (0.5 * (left + right))
-            prior_width = 0.8 * prior_width + 0.2 * max(1, right - left)
 
         left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
         right_points = [(right, y) for y, _left, right, _ll, _rl in rows]
@@ -1130,9 +1125,8 @@ class LaneDetector:
         def outward_corner(points, lost_flags, side):
             for index in range(span, len(points) - span):
                 x, y = points[index]
-                # A boundary reconstructed after touching the ROI edge is not a
-                # measured corner.  Using it here creates LF/RF markers at the
-                # lower image edges when the lane leaves the camera view.
+                # A boundary copied across a missing-mask gap is not a measured
+                # corner and must not produce an LF/RF marker.
                 if lost_flags[index] or lost_flags[index - span] or lost_flags[index + span]:
                     continue
                 if y < min_corner_y or y > max_corner_y:
