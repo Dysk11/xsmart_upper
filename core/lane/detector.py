@@ -157,6 +157,37 @@ class LaneDetector:
         self.single_side_edge_margin_px = int(
             self.centerline_config.get("single_side_edge_margin_px", 28)
         )
+        self.enable_boundary_smoothness_fallback = bool(
+            self.centerline_config.get("enable_boundary_smoothness_fallback", False)
+        )
+        self.boundary_smoothness_residual_threshold_px = float(
+            self.centerline_config.get("boundary_smoothness_residual_threshold_px", 3.0)
+        )
+        self.boundary_smoothness_tie_margin_px = float(
+            self.centerline_config.get("boundary_smoothness_tie_margin_px", 0.1)
+        )
+        self.boundary_smoothness_confirm_frames = int(
+            self.centerline_config.get("boundary_smoothness_confirm_frames", 2)
+        )
+        if (
+            not math.isfinite(self.boundary_smoothness_residual_threshold_px)
+            or self.boundary_smoothness_residual_threshold_px <= 0.0
+        ):
+            raise ValueError(
+                "centerline.boundary_smoothness_residual_threshold_px must be finite "
+                "and greater than zero"
+            )
+        if (
+            not math.isfinite(self.boundary_smoothness_tie_margin_px)
+            or self.boundary_smoothness_tie_margin_px < 0.0
+        ):
+            raise ValueError(
+                "centerline.boundary_smoothness_tie_margin_px must be finite and not negative"
+            )
+        if self.boundary_smoothness_confirm_frames < 1:
+            raise ValueError(
+                "centerline.boundary_smoothness_confirm_frames must be at least one"
+            )
         self.prediction_blend = float(self.centerline_config.get("prediction_blend", 0.2))
         self.distance_weight = float(self.centerline_config.get("distance_weight", 0.12))
         self.center_bias = float(self.centerline_config.get("center_bias", 0.02))
@@ -267,6 +298,9 @@ class LaneDetector:
         self._left_fork_misses = self._right_fork_misses = 0
         self._left_fork_active = self._right_fork_active = False
         self._held_fork_direction: str | None = None
+        self._normal_centerline_mode = "normal"
+        self._pending_normal_centerline_mode: str | None = None
+        self._pending_normal_centerline_hits = 0
 
     def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
@@ -419,9 +453,18 @@ class LaneDetector:
         display_right_points = right_points
         if not fork_result.fork_detected:
             self._held_fork_direction = None
+            raw_centers = self._apply_boundary_smoothness_fallback(
+                left_points=left_points,
+                right_points=right_points,
+                raw_centers=raw_centers,
+                left_lost=left_lost,
+                right_lost=right_lost,
+                shape=mask.shape,
+            )
             if requested_direction is not None:
                 fork_result.reason = f"waiting for {requested_direction} fork"
         else:
+            self._reset_normal_centerline_mode()
             (
                 left_candidate_points,
                 right_candidate_points,
@@ -723,15 +766,155 @@ class LaneDetector:
     ) -> float | None:
         """Measure raw candidate roughness as its mean residual from a quadratic fit."""
 
-        if len(candidate_points) < 3:
+        return self._polyline_smoothness_residual(candidate_points, min_points=3)
+
+    def _polyline_smoothness_residual(
+        self,
+        points: Sequence[Tuple[int, int]],
+        min_points: int,
+    ) -> float | None:
+        """Return quadratic mean absolute residual for a sufficiently long polyline."""
+
+        if len(points) < max(3, int(min_points)):
             return None
-        x_values = [float(x) for x, _y in candidate_points]
-        y_values = [float(y) for _x, y in candidate_points]
+        x_values = [float(x) for x, _y in points]
+        y_values = [float(y) for _x, y in points]
         fit_coeffs = polyfit_with_fallback(y_values, x_values, degree=2)
         if fit_coeffs is None:
             return None
         residual = mean_abs_residual(fit_coeffs, y_values, x_values)
         return float(residual) if math.isfinite(residual) else None
+
+    def _boundary_smoothness_residual(
+        self,
+        points: Sequence[Tuple[int, int]],
+        lost_flags: Sequence[bool],
+    ) -> float | None:
+        """Measure only real boundary samples, excluding reconstructed edge rows."""
+
+        measured = [
+            (int(x), int(y))
+            for (x, y), lost in zip(points, lost_flags)
+            if not lost
+        ]
+        return self._polyline_smoothness_residual(
+            measured,
+            min_points=self.min_valid_points,
+        )
+
+    def _choose_normal_centerline_mode(
+        self,
+        left_residual: float | None,
+        right_residual: float | None,
+    ) -> str:
+        """Choose a reliable boundary for normal-lane centerline reconstruction."""
+
+        if left_residual is None or right_residual is None:
+            return "normal"
+
+        threshold = self.boundary_smoothness_residual_threshold_px
+        left_rough = left_residual > threshold
+        right_rough = right_residual > threshold
+        if left_rough and not right_rough:
+            return "right"
+        if right_rough and not left_rough:
+            return "left"
+        if left_rough and right_rough:
+            if abs(left_residual - right_residual) <= self.boundary_smoothness_tie_margin_px:
+                return "normal"
+            return "left" if left_residual < right_residual else "right"
+        return "normal"
+
+    def _update_normal_centerline_mode(
+        self,
+        desired_mode: str,
+        left_residual: float | None,
+        right_residual: float | None,
+    ) -> str:
+        """Debounce normal/left/right switching and return the safe mode for this frame."""
+
+        if desired_mode == self._normal_centerline_mode:
+            self._pending_normal_centerline_mode = None
+            self._pending_normal_centerline_hits = 0
+            return self._normal_centerline_mode
+
+        if desired_mode != self._pending_normal_centerline_mode:
+            self._pending_normal_centerline_mode = desired_mode
+            self._pending_normal_centerline_hits = 1
+        else:
+            self._pending_normal_centerline_hits += 1
+
+        if self._pending_normal_centerline_hits >= self.boundary_smoothness_confirm_frames:
+            self._normal_centerline_mode = desired_mode
+            self._pending_normal_centerline_mode = None
+            self._pending_normal_centerline_hits = 0
+            return self._normal_centerline_mode
+
+        active_residual = (
+            left_residual
+            if self._normal_centerline_mode == "left"
+            else right_residual
+            if self._normal_centerline_mode == "right"
+            else None
+        )
+        if (
+            active_residual is not None
+            and active_residual <= self.boundary_smoothness_residual_threshold_px
+        ):
+            return self._normal_centerline_mode
+        return "normal"
+
+    def _apply_boundary_smoothness_fallback(
+        self,
+        left_points: Sequence[Tuple[int, int]],
+        right_points: Sequence[Tuple[int, int]],
+        raw_centers: Sequence[Tuple[int, int]],
+        left_lost: Sequence[bool],
+        right_lost: Sequence[bool],
+        shape: tuple[int, int],
+    ) -> list[tuple[int, int]]:
+        """Rebuild normal-lane centers from the smoother measured boundary."""
+
+        if not self.enable_boundary_smoothness_fallback:
+            self._reset_normal_centerline_mode()
+            return [(int(x), int(y)) for x, y in raw_centers]
+
+        left_residual = self._boundary_smoothness_residual(left_points, left_lost)
+        right_residual = self._boundary_smoothness_residual(right_points, right_lost)
+        desired_mode = self._choose_normal_centerline_mode(left_residual, right_residual)
+        active_mode = self._update_normal_centerline_mode(
+            desired_mode,
+            left_residual,
+            right_residual,
+        )
+        if active_mode == "normal":
+            return [(int(x), int(y)) for x, y in raw_centers]
+
+        _height, width = shape[:2]
+        rebuilt: list[tuple[int, int]] = []
+        for index, ((left_x, y), (right_x, _right_y), (center_x, _center_y)) in enumerate(
+            zip(left_points, right_points, raw_centers)
+        ):
+            use_left = active_mode == "left" and not left_lost[index]
+            use_right = active_mode == "right" and not right_lost[index]
+            if use_left:
+                candidate_x = float(left_x) + 0.5 * self._perspective_lane_width(y, _height)
+            elif use_right:
+                candidate_x = float(right_x) - 0.5 * self._perspective_lane_width(y, _height)
+            else:
+                candidate_x = float(center_x)
+            rebuilt.append(
+                (
+                    int(round(clamp(candidate_x, 0.0, float(max(0, width - 1))))),
+                    int(y),
+                )
+            )
+        return rebuilt
+
+    def _reset_normal_centerline_mode(self) -> None:
+        self._normal_centerline_mode = "normal"
+        self._pending_normal_centerline_mode = None
+        self._pending_normal_centerline_hits = 0
 
     def _choose_fork_direction_by_smoothness(
         self,
