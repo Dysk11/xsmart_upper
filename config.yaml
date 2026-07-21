@@ -52,8 +52,8 @@ lane_geometry:
     scan_step: 4
     min_valid_points: 6
     default_lane_width_px: 60
-    perspective_width_top_px: 30
-    perspective_width_bottom_px: 60
+    perspective_width_top_px: 74
+    perspective_width_bottom_px: 250
     lookahead_ratio: 0.45
   confidence:
     lost_threshold: 0.22
@@ -68,8 +68,8 @@ lane_geometry:
     corner_side_margin_ratio: 0.02
     confirm_frames: 2
     release_frames: 3
-    split_enter_ratio: 0.60
-    split_exit_ratio: 0.35
+    split_enter_ratio: 0.15
+    split_exit_ratio: 0.10
     split_min_rows: 5
     smoothness_residual_threshold_px: 3.0
     smoothness_tie_margin_px: 0.1
@@ -125,12 +125,7 @@ ocr:
 
 # Planning
 target_selector:
-  base_lookahead_px: 120
-  min_lookahead_px: 70
-  max_lookahead_px: 180
-  curvature_gain: 80
-  low_confidence_lookahead_px: 80
-  low_confidence_threshold: 0.45
+  fixed_target_y: 80
 
 gold_target:
   enabled: true
@@ -171,7 +166,6 @@ avoidance_target_planner:
   clear_frames: 8
   front_margin_px: 45
   rear_margin_px: 35
-  target_front_margin_px: 35
   min_lane_confidence_to_start_avoid: 0.45
   max_target_jump_px: 50
 
