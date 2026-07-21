@@ -85,6 +85,15 @@ def make_fork_mask(split_y: int = 40) -> np.ndarray:
     return mask
 
 
+def make_fork_mask_with_bottom_decoy() -> np.ndarray:
+    """Pad the fork rightward and add a bottom run nearest frame center."""
+
+    mask = np.zeros((HEIGHT, 240), dtype=np.uint8)
+    mask[:, 40:200] = make_fork_mask()
+    mask[70:HEIGHT, 55:66] = 255
+    return mask
+
+
 def make_close_fork_mask(split_y: int = 40) -> np.ndarray:
     mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
     for y in range(HEIGHT):
@@ -185,6 +194,22 @@ def test_explicit_direction_selects_inferred_left_or_right_centerline() -> None:
     assert sample_x(right_result.centerline_points, 20) > CENTER_X
     assert sample_x(left_result.centerline_points, 70) == pytest.approx(CENTER_X, abs=2)
     assert sample_x(right_result.centerline_points, 70) == pytest.approx(CENTER_X, abs=2)
+
+
+@pytest.mark.parametrize("route_direction", ["left", "right"])
+def test_confirmed_fork_direction_overrides_bottom_run_selection(
+    route_direction: str,
+) -> None:
+    result = make_detector().detect_from_mask(
+        make_fork_mask_with_bottom_decoy(),
+        route_direction=route_direction,
+        vehicle_center_x=60.0,
+    )
+
+    assert result.fork_result.fork_detected
+    assert result.fork_result.selected_direction == route_direction
+    branch_x = sample_x(result.centerline_points, 20)
+    assert branch_x < 120 if route_direction == "left" else branch_x > 120
 
 
 def test_close_fork_region_keeps_only_the_normal_centerline() -> None:
