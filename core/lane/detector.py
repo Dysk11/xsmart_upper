@@ -452,24 +452,6 @@ class LaneDetector:
         display_left_points = left_points
         display_right_points = right_points
         if not fork_result.fork_detected:
-            bottom_runs = next((runs for runs in reversed(row_runs) if runs), ())
-            if len(bottom_runs) > 1:
-                (
-                    left_points,
-                    right_points,
-                    raw_centers,
-                    left_lost,
-                    right_lost,
-                    selected_mask,
-                    left_branch_rows,
-                    right_branch_rows,
-                ) = self._extract_row_boundaries(
-                    mask,
-                    row_runs=row_runs,
-                    bottom_center_x=roi_center_x,
-                )
-                display_left_points = left_points
-                display_right_points = right_points
             self._held_fork_direction = None
             raw_centers = self._apply_boundary_smoothness_fallback(
                 left_points=left_points,
@@ -1024,26 +1006,14 @@ class LaneDetector:
         mask: np.ndarray,
         route_direction: str | None = None,
         row_runs: Sequence[Sequence[tuple[int, int]]] | None = None,
-        bottom_center_x: float | None = None,
     ):
-        """Choose the bottom run near frame center, then follow it upward."""
+        """Follow the run nearest the previous center from the vehicle upward."""
 
         height, width = mask.shape[:2]
         if row_runs is None:
             row_runs = self._build_row_runs(mask)
         selected_mask = np.zeros_like(mask)
-        historical_center = (
-            float(self.last_centerline_points[0][0])
-            if self.last_centerline_points
-            else width * 0.5
-        )
-        prior_center = historical_center
-        mapped_bottom_center = (
-            None
-            if bottom_center_x is None
-            else clamp(float(bottom_center_x), 0.0, float(max(0, width - 1)))
-        )
-        first_valid_row = True
+        prior_center = float(self.last_centerline_points[0][0]) if self.last_centerline_points else width * 0.5
         rows: list[tuple[int, int, int, bool, bool]] = []
         left_branch_rows: list[tuple[int, int]] = []
         right_branch_rows: list[tuple[int, int]] = []
@@ -1060,30 +1030,13 @@ class LaneDetector:
 
             single_side_gap = 0
             centers = [0.5 * (left + right) for left, right in runs]
-            is_bottom_row = first_valid_row
-            selected_from_bottom_center = (
-                route_direction not in {"left", "right"}
-                and first_valid_row
-                and len(runs) > 1
-                and mapped_bottom_center is not None
-            )
             if route_direction == "left" and len(runs) > 1:
                 chosen_index = min(range(len(runs)), key=lambda index: centers[index])
             elif route_direction == "right" and len(runs) > 1:
                 chosen_index = max(range(len(runs)), key=lambda index: centers[index])
-            elif selected_from_bottom_center:
-                chosen_index = min(
-                    range(len(runs)),
-                    key=lambda index: (
-                        abs(centers[index] - mapped_bottom_center),
-                        abs(centers[index] - historical_center),
-                        index,
-                    ),
-                )
             else:
                 chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
             left, right = runs[chosen_index]
-            first_valid_row = False
             for index, (candidate_left, candidate_right) in enumerate(runs):
                 if index == chosen_index:
                     continue
@@ -1098,11 +1051,7 @@ class LaneDetector:
             # rebuilding it inward from the historical lane width.
             rows.append((y, left, right, False, False))
             selected_mask[y, left : right + 1] = 255
-            chosen_center = 0.5 * (left + right)
-            if is_bottom_row and selected_from_bottom_center:
-                prior_center = chosen_center
-            else:
-                prior_center = 0.65 * prior_center + 0.35 * chosen_center
+            prior_center = 0.65 * prior_center + 0.35 * (0.5 * (left + right))
 
         left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
         right_points = [(right, y) for y, _left, right, _ll, _rl in rows]
