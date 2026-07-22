@@ -55,6 +55,7 @@ from core.planning.road_sign_analyzer import (
 from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import RknnLaneSegmenter, SegmentationResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
+from core.native import NativePerceptionBackend, NativeRoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
 from core.visualization.visualizer import Visualizer
 from utils.fps import FPSCounter
@@ -665,7 +666,24 @@ class UpperMachineApp:
         self.config = config
         self.project_root = project_root
 
-        self.camera = CameraReader(config.get("camera", {}))
+        native_config = config.get("native_perception", {})
+        self.native_perception_enabled = bool(native_config.get("enable", False))
+        visualizer_config = config.get("visualizer", {})
+        native_want_bgr = bool(
+            visualizer_config.get("show_window", True)
+            or visualizer_config.get("save_video", False)
+            or visualizer_config.get("save_screenshot", False)
+        )
+        self.native_backend: NativePerceptionBackend | None = None
+        if self.native_perception_enabled:
+            self.native_backend = NativePerceptionBackend(
+                config,
+                project_root,
+                want_bgr=native_want_bgr,
+            )
+            self.camera = self.native_backend
+        else:
+            self.camera = CameraReader(config.get("camera", {}))
         self.lane_geometry_config = config.get("lane_geometry", {})
         self.roi_config = self.lane_geometry_config.get("roi", {})
         self.detector = LaneDetector(self.lane_geometry_config)
@@ -673,8 +691,16 @@ class UpperMachineApp:
         worker_core_masks = list(lane_config.get("worker_core_masks", []))
         configured_worker_count = int(lane_config.get("worker_count", len(worker_core_masks)))
         worker_core_masks = worker_core_masks[: max(0, configured_worker_count)]
-        self.lane_parallel_enabled = bool(lane_config.get("parallel", False) and worker_core_masks)
-        self.lane_segmenter = None if self.lane_parallel_enabled else RknnLaneSegmenter(lane_config)
+        self.lane_parallel_enabled = bool(
+            not self.native_perception_enabled
+            and lane_config.get("parallel", False)
+            and worker_core_masks
+        )
+        self.lane_segmenter = (
+            None
+            if self.native_perception_enabled or self.lane_parallel_enabled
+            else RknnLaneSegmenter(lane_config)
+        )
         self.lane_max_result_age_frames = max(0, int(lane_config.get("max_result_age_frames", 2)))
         self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
         ai_config = config.get("rknn_object_detector", {})
@@ -787,20 +813,31 @@ class UpperMachineApp:
                 self.lane_processes.append(process)
                 self.lane_worker_busy.append(False)
                 self.shared_pools[pool_id] = frame_pool
-        self.ai_process = self.mp_context.Process(
-            target=_ai_inference_worker,
-            args=(
-                config.get("rknn_object_detector", {}),
-                config.get("ocr", {}),
-                str(project_root),
-                self.ai_input_queue,
-                self.ai_output_queue,
-                self.ocr_trigger_queue,
-                self.ai_ack_queue,
-                self.stop_event,
-            ),
-            name="xsmart-ai-inference",
-        )
+        self.native_ocr_session: NativeRoadSignOcrSession | None = None
+        if self.native_perception_enabled:
+            assert self.native_backend is not None
+            self.native_ocr_session = NativeRoadSignOcrSession(
+                ocr_config,
+                self.native_backend,
+                project_root,
+                trigger_callback=self.ocr_trigger_queue.put,
+            )
+            self.ai_process = None
+        else:
+            self.ai_process = self.mp_context.Process(
+                target=_ai_inference_worker,
+                args=(
+                    config.get("rknn_object_detector", {}),
+                    config.get("ocr", {}),
+                    str(project_root),
+                    self.ai_input_queue,
+                    self.ai_output_queue,
+                    self.ocr_trigger_queue,
+                    self.ai_ack_queue,
+                    self.stop_event,
+                ),
+                name="xsmart-ai-inference",
+            )
         self.road_sign_analyzer_process = self.mp_context.Process(
             target=_road_sign_analyzer_worker,
             args=(
@@ -821,7 +858,6 @@ class UpperMachineApp:
             ),
             name="xsmart-ui",
         )
-        visualizer_config = config.get("visualizer", {})
         self.ui_active = bool(
             visualizer_config.get("show_window", True)
             or visualizer_config.get("save_video", False)
@@ -842,7 +878,8 @@ class UpperMachineApp:
         self.camera.open()
         self.bridge.connect()
         self.csv_logger.open()
-        self.ai_process.start()
+        if self.ai_process is not None:
+            self.ai_process.start()
         if self.road_sign_analyzer_config.enable:
             self.road_sign_analyzer_process.start()
         for process in self.lane_processes:
@@ -851,7 +888,12 @@ class UpperMachineApp:
             self.ui_process.start()
 
         while not self.stop_event.is_set():
-            success, frame = self.camera.read()
+            try:
+                success, frame = self.camera.read()
+            except Exception:
+                if self.native_perception_enabled:
+                    self._send_native_failure_stop()
+                raise
             if not success or frame is None:
                 if self.camera.mode == "video" and not self.camera.loop_video:
                     print("视频读取结束，主循环退出。")
@@ -861,12 +903,23 @@ class UpperMachineApp:
 
             # 第 1 步：先预处理，再用 YOLO 读取 coin、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
-            captured_at = lane_start_time
+            captured_at = (
+                self.native_backend.captured_at
+                if self.native_backend is not None
+                else lane_start_time
+            )
             roi_rect = self._compute_roi_rect(frame)
             lane_roi_time = time.perf_counter()
-            self.frame_id += 1
+            if self.native_backend is not None:
+                self.frame_id = self.native_backend.frame_id
+                self.last_detected_objects = self.native_backend.last_detections
+            else:
+                self.frame_id += 1
             ai_frame_payload = None
-            if self.frame_id % self.ai_inference_stride == 0:
+            if (
+                not self.native_perception_enabled
+                and self.frame_id % self.ai_inference_stride == 0
+            ):
                 ai_frame_payload = self.ai_frame_pool.write(frame)
             if ai_frame_payload is not None:
                 _put_latest(
@@ -1008,6 +1061,40 @@ class UpperMachineApp:
             self.last_confirmed_fork_detected = bool(
                 detection_result.fork_result.fork_detected
             )
+            if self.native_ocr_session is not None:
+                native_ocr_result = self.native_ocr_session.update(
+                    tuple(frame.shape[:2]),
+                    self.frame_id,
+                    self.last_detected_objects,
+                    allow_inference=self.last_confirmed_fork_detected,
+                )
+                while True:
+                    try:
+                        native_trigger = self.ocr_trigger_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(native_trigger, OcrTrigger) and self.ocr_stop_latch.start(
+                        native_trigger.trigger_id,
+                        native_trigger.started_at,
+                    ):
+                        self.road_sign_analysis_state.cancel_pending(reset_decision=True)
+                        self.pending_analysis_trigger_id = 0
+                        print(
+                            f"[OCR] trigger={native_trigger.trigger_id} "
+                            f"frame={native_trigger.frame_id} status=vehicle_stop",
+                            flush=True,
+                        )
+                if self.native_ocr_session.last_attempt is not None and self.ocr_bbox_timer.observe(
+                    self.native_ocr_session.last_attempt,
+                    time.monotonic(),
+                ):
+                    self.last_ocr_attempt = self.native_ocr_session.last_attempt
+                    self._print_ocr_attempt(self.last_ocr_attempt)
+                self.last_ocr_result, self._last_ocr_event_id = consume_ocr_event(
+                    self.last_ocr_result,
+                    self._last_ocr_event_id,
+                    native_ocr_result,
+                )
             lane_detect_time = time.perf_counter()
 
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
@@ -1119,6 +1206,9 @@ class UpperMachineApp:
 
     def _segment_lane(self, frame: np.ndarray, captured_at: float | None = None) -> SegmentationResult:
         """Segment synchronously or through the configured low-latency worker pool."""
+
+        if self.native_backend is not None:
+            return self.native_backend.last_segmentation
 
         if not self.lane_parallel_enabled:
             assert self.lane_segmenter is not None
@@ -1233,14 +1323,17 @@ class UpperMachineApp:
             self.lane_segmenter.close()
         self.bridge.close()
         self.stop_event.set()
-        _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
+        if self.ai_process is not None:
+            _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
         if self.road_sign_analyzer_config.enable:
             _put_latest(self.road_sign_analysis_input_queue, None)
         if self.ui_active:
             _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
         for lane_queue in self.lane_input_queues:
             _put_latest(lane_queue, None, release_func=self._release_owned_shared_payload)
-        processes = [self.ai_process, *self.lane_processes]
+        processes = [*self.lane_processes]
+        if self.ai_process is not None:
+            processes.insert(0, self.ai_process)
         if self.road_sign_analyzer_config.enable:
             processes.append(self.road_sign_analyzer_process)
         if self.ui_active:
@@ -1286,6 +1379,31 @@ class UpperMachineApp:
             "confidence": tracked_state.confidence,
             "is_lane_lost": tracked_state.is_lane_lost,
         }
+
+    def _send_native_failure_stop(self) -> None:
+        """Issue one zero-speed command before propagating a native perception failure."""
+
+        try:
+            self.bridge.send(
+                {
+                    "ts_ms": int(time.time() * 1000),
+                    "mode": "NATIVE_PERCEPTION_FAILURE",
+                    "target_speed": 0.0,
+                    "speed_state": 0,
+                    "steer_deg": 0.0,
+                    "lateral_error_px": 0.0,
+                    "heading_error_deg": 0.0,
+                    "curvature": 0.0,
+                    "confidence": 0.0,
+                    "is_lane_lost": True,
+                }
+            )
+        except Exception as exc:
+            print(
+                f"[SAFETY] failed to send native perception stop: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
 
     def _collect_future_module_hints(
         self,

@@ -1,5 +1,29 @@
 # X-SmartCar 上位机视觉巡线项目
 
+## RK3588 原生感知层
+
+默认配置启用基于 RKNNRT C API 的原生感知后端，Python 继续负责规划、控制和 UI：
+
+- NPU0：赛道分割；
+- NPU1：目标检测；
+- NPU2：OCR 检测与识别；
+- 赛道分割与目标检测对同一 RGB 帧并发执行；
+- 共享内存输入保持 RGB888，推理支路不再做 RGB→BGR→RGB 往返转换；
+- 只有检测到 `road_sign` 且赛道分支已确认时，才把对应帧提交给 OCR。
+
+在 RK3588 上构建扩展：
+
+```bash
+python3 -m pip install --target .build-deps pybind11 setuptools wheel
+PYTHONPATH=.build-deps python3 setup.py build_ext --inplace
+```
+
+无 UI、无车辆输出的性能测试：
+
+```bash
+python3 tools/benchmark_native.py --video /absolute/path/to/video.mp4
+```
+
 ## 项目用途
 
 这是一个面向“全国大学生智能汽车竞赛 X-SmartCar 人工智能模型组”的 Python 上位机项目，运行平台为 RK3588S Linux + Python 3.10+。

@@ -18,6 +18,11 @@ camera:
   reconnect_interval_sec: 0.5
   max_reconnect_attempts: 5
 
+# RK3588 native capture + RKNNRT C API perception. No RKNNLite fallback.
+native_perception:
+  enable: true
+  ring_buffer_size: 3
+
 # Lane perception
 rknn_lane_segmenter:
   enable: true
@@ -27,11 +32,11 @@ rknn_lane_segmenter:
   nms_threshold: 0.45
   mask_threshold: 0.5
   max_instances: 3
-  runtime_backend: lite2
+  runtime_backend: native
   core_mask: NPU_CORE_0
-  parallel: true
-  worker_count: 3
-  worker_core_masks: [NPU_CORE_0, NPU_CORE_1, NPU_CORE_2]
+  parallel: false
+  worker_count: 1
+  worker_core_masks: [NPU_CORE_0]
   max_result_age_frames: 4
   drop_stale_results: true
 
@@ -95,7 +100,7 @@ tracker:
 # Object and road-sign perception
 rknn_object_detector:
   enable: true
-  model_path: models/object/rknn_7classes_0718_0718.rknn
+  model_path: models/object/rknn_7classes_0718.rknn
   input_size: [640, 480]
   input_layout: nhwc
   input_color: rgb
@@ -103,8 +108,8 @@ rknn_object_detector:
   score_threshold: 0.50
   nms_threshold: 0.45
   max_detections: 30
-  runtime_backend: lite2
-  inference_stride: 2
+  runtime_backend: native
+  inference_stride: 1
   max_result_age_frames: 12
   drop_stale_results: true
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
@@ -114,8 +119,9 @@ ocr:
   enable: true
   det_model_path: models/ocr/ppocrv4_det.rknn
   rec_model_path: models/ocr/ppocrv4_rec.rknn
+  character_dict_path: models/ocr/ppocr_keys_v1.txt
   target: rk3588
-  core_mask: NPU_CORE_1
+  core_mask: NPU_CORE_2
   class_names: [road_sign]
   bbox_min_confidence: 0.50
   bbox_min_width_px: 100
