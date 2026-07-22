@@ -79,7 +79,7 @@ class MockBridge(BaseVehicleBridge):
         # Mock 模式不接触真实硬件，只把将要发送的数据打印出来。
         packet_bytes = build_packet(payload)
         packet_hex = " ".join(f"{b:02X}" for b in packet_bytes)
-        print(f"[MockBridge] {packet_hex} | payload: {payload}")
+        # print(f"[MockBridge] {packet_hex} | payload: {payload}")
 
     def close(self) -> None:
         """关闭 Mock 桥接层。

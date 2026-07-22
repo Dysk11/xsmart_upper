@@ -822,6 +822,10 @@ class UpperMachineApp:
         self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
+        self.lane_timing_camera_wait_ms = 0.0
+        self.lane_timing_segmentation_wait_ms = 0.0
+        self.lane_timing_geometry_ms = 0.0
+        self.lane_timing_bridge_ms = 0.0
         self.lane_timing_max_ms = 0.0
         self.last_target_result: TargetPointResult | None = None
         self.last_blocking_result: BlockingAnalysisResult | None = None
@@ -977,7 +981,9 @@ class UpperMachineApp:
             self.ui_process.start()
 
         while not self.stop_event.is_set():
+            camera_wait_started = time.perf_counter()
             success, captured_frame = self.camera.read()
+            camera_wait_ms = (time.perf_counter() - camera_wait_started) * 1000.0
             if not success or captured_frame is None:
                 if self.camera.mode == "video" and not self.camera.loop_video:
                     print("视频读取结束，主循环退出。")
@@ -1124,7 +1130,11 @@ class UpperMachineApp:
                     + (f" error={road_sign_analysis_result.error}" if road_sign_analysis_result.error else ""),
                     flush=True,
                 )
+            segmentation_wait_started = time.perf_counter()
             segmentation_result = self._segment_lane(frame_rgb, captured_at)
+            segmentation_wait_ms = (
+                time.perf_counter() - segmentation_wait_started
+            ) * 1000.0
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             vehicle_center_x = max(
@@ -1134,6 +1144,7 @@ class UpperMachineApp:
                     0.5 * float(frame_bgr.shape[1]) - float(roi_x1),
                 ),
             )
+            geometry_started = time.perf_counter()
             detection_result = self.detector.detect_from_mask(
                 roi_mask,
                 route_direction=self.road_sign_analysis_state.route_direction,
@@ -1142,6 +1153,7 @@ class UpperMachineApp:
                 segmentation_status=segmentation_result.status,
                 segmentation_instance_count=len(segmentation_result.instances),
             )
+            geometry_ms = (time.perf_counter() - geometry_started) * 1000.0
             self.last_confirmed_fork_detected = bool(
                 detection_result.fork_result.fork_detected
             )
@@ -1153,12 +1165,6 @@ class UpperMachineApp:
                 prefer_current=detection_result.fork_result.selected_direction is not None,
             )
             lane_track_time = time.perf_counter()
-            self._record_lane_timing(
-                total_ms=(lane_track_time - lane_start_time) * 1000.0,
-                roi_ms=(lane_roi_time - lane_start_time) * 1000.0,
-                detect_ms=(lane_detect_time - lane_roi_time) * 1000.0,
-                track_ms=(lane_track_time - lane_detect_time) * 1000.0,
-            )
             planning_state = self._build_planning_state(
                 roi_rect=roi_rect,
                 detection_result=detection_result,
@@ -1177,7 +1183,19 @@ class UpperMachineApp:
 
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
             payload = self._build_payload(control_command, planning_state)
+            bridge_started = time.perf_counter()
             self.bridge.send(payload)
+            bridge_ms = (time.perf_counter() - bridge_started) * 1000.0
+            self._record_lane_timing(
+                total_ms=(lane_track_time - lane_start_time) * 1000.0,
+                roi_ms=(lane_roi_time - lane_start_time) * 1000.0,
+                detect_ms=(lane_detect_time - lane_roi_time) * 1000.0,
+                track_ms=(lane_track_time - lane_detect_time) * 1000.0,
+                camera_wait_ms=camera_wait_ms,
+                segmentation_wait_ms=segmentation_wait_ms,
+                geometry_ms=geometry_ms,
+                bridge_ms=bridge_ms,
+            )
             fps_value = self.fps_counter.update()
 
             # 第 7 步：把关键数据落盘，方便赛后分析和调参。
@@ -1351,6 +1369,10 @@ class UpperMachineApp:
         roi_ms: float,
         detect_ms: float,
         track_ms: float,
+        camera_wait_ms: float,
+        segmentation_wait_ms: float,
+        geometry_ms: float,
+        bridge_ms: float,
     ) -> None:
         """Collect lane timing stats and print a low-frequency summary."""
 
@@ -1362,6 +1384,10 @@ class UpperMachineApp:
         self.lane_timing_roi_ms += roi_ms
         self.lane_timing_detect_ms += detect_ms
         self.lane_timing_track_ms += track_ms
+        self.lane_timing_camera_wait_ms += camera_wait_ms
+        self.lane_timing_segmentation_wait_ms += segmentation_wait_ms
+        self.lane_timing_geometry_ms += geometry_ms
+        self.lane_timing_bridge_ms += bridge_ms
         self.lane_timing_max_ms = max(self.lane_timing_max_ms, total_ms)
 
         if self.lane_timing_count < self.lane_timing_interval:
@@ -1374,7 +1400,11 @@ class UpperMachineApp:
             f"max={self.lane_timing_max_ms:.2f} ms, "
             f"roi={self.lane_timing_roi_ms / count:.2f} ms, "
             f"detect={self.lane_timing_detect_ms / count:.2f} ms, "
-            f"track={self.lane_timing_track_ms / count:.2f} ms"
+            f"track={self.lane_timing_track_ms / count:.2f} ms, "
+            f"camera_wait_ms={self.lane_timing_camera_wait_ms / count:.2f}, "
+            f"segmentation_wait_ms={self.lane_timing_segmentation_wait_ms / count:.2f}, "
+            f"geometry_ms={self.lane_timing_geometry_ms / count:.2f}, "
+            f"bridge_ms={self.lane_timing_bridge_ms / count:.2f}"
         )
 
         conversion_count = self.camera.color_conversion_count
@@ -1395,6 +1425,10 @@ class UpperMachineApp:
         self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
+        self.lane_timing_camera_wait_ms = 0.0
+        self.lane_timing_segmentation_wait_ms = 0.0
+        self.lane_timing_geometry_ms = 0.0
+        self.lane_timing_bridge_ms = 0.0
         self.lane_timing_max_ms = 0.0
 
     def close(self) -> None:

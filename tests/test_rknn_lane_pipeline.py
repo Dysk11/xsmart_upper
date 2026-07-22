@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 
@@ -118,3 +120,46 @@ def test_worker_timing_accumulator_ignores_non_numeric_values() -> None:
     )
 
     assert totals == {"inference_ms": 7.5, "postprocess_ms": 2.0}
+
+
+def test_lane_timing_summary_includes_wait_geometry_and_bridge(capsys) -> None:
+    app = UpperMachineApp.__new__(UpperMachineApp)
+    app.lane_timing_enabled = True
+    app.lane_timing_interval = 1
+    app.lane_timing_count = 0
+    app.lane_timing_total_ms = 0.0
+    app.lane_timing_roi_ms = 0.0
+    app.lane_timing_detect_ms = 0.0
+    app.lane_timing_track_ms = 0.0
+    app.lane_timing_camera_wait_ms = 0.0
+    app.lane_timing_segmentation_wait_ms = 0.0
+    app.lane_timing_geometry_ms = 0.0
+    app.lane_timing_bridge_ms = 0.0
+    app.lane_timing_max_ms = 0.0
+    app.camera = SimpleNamespace(
+        color_conversion_count=1,
+        color_conversion_total_ms=0.5,
+        last_color_conversion_ms=0.5,
+    )
+
+    app._record_lane_timing(
+        total_ms=20.0,
+        roi_ms=1.0,
+        detect_ms=17.0,
+        track_ms=2.0,
+        camera_wait_ms=3.0,
+        segmentation_wait_ms=8.0,
+        geometry_ms=6.0,
+        bridge_ms=4.0,
+    )
+
+    output = capsys.readouterr().out
+    assert "camera_wait_ms=3.00" in output
+    assert "segmentation_wait_ms=8.00" in output
+    assert "geometry_ms=6.00" in output
+    assert "bridge_ms=4.00" in output
+    assert app.lane_timing_count == 0
+    assert app.lane_timing_camera_wait_ms == 0.0
+    assert app.lane_timing_segmentation_wait_ms == 0.0
+    assert app.lane_timing_geometry_ms == 0.0
+    assert app.lane_timing_bridge_ms == 0.0
