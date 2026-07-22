@@ -55,10 +55,6 @@ lane_geometry:
     default_lane_width_px: 60
     perspective_width_top_px: 75
     perspective_width_bottom_px: 260
-    enable_boundary_smoothness_fallback: true
-    boundary_smoothness_residual_threshold_px: 2.0
-    boundary_smoothness_tie_margin_px: 0.1
-    boundary_smoothness_confirm_frames: 2
     lookahead_ratio: 0.45
   track_selection:
     switch_threshold_px: 80
