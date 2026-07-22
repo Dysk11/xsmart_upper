@@ -5,12 +5,24 @@ from __future__ import annotations
 import threading
 import time
 import struct
+from dataclasses import dataclass
 from multiprocessing import resource_tracker, shared_memory
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+@dataclass(frozen=True)
+class CapturedFrame:
+    """One captured image exposed in both model-RGB and OpenCV-BGR order."""
+
+    rgb: np.ndarray
+    bgr: np.ndarray
+    captured_at: float
+    source_frame_id: int
+    color_conversion_ms: float
 
 
 class CameraReader:
@@ -49,6 +61,10 @@ class CameraReader:
         self._latest_frame_id = 0
         self._last_returned_frame_id = 0
         self._reader_failed = False
+        self._captured_frame_id = 0
+        self.color_conversion_count = 0
+        self.color_conversion_total_ms = 0.0
+        self.last_color_conversion_ms = 0.0
 
     def open(self) -> None:
         """打开摄像头或视频文件，并设置基础属性。
@@ -74,7 +90,7 @@ class CameraReader:
         if self._uses_latest_frame_worker():
             self._start_latest_frame_worker()
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def read(self) -> Tuple[bool, Optional[CapturedFrame]]:
         """读取一帧图像，并在失败时自动尝试重连。
 
         输入:
@@ -82,7 +98,7 @@ class CameraReader:
 
         输出:
             返回二元组 (success, frame)。
-            当 success 为 True 时，frame 为一帧 BGR 图像；
+            当 success 为 True 时，frame 同时包含对齐的 RGB 与 BGR 图像；
             当 success 为 False 时，frame 为 None。
         """
 
@@ -101,7 +117,7 @@ class CameraReader:
         if success and frame is not None:
             if self.mirror:
                 frame = cv2.flip(frame, 1)
-            return True, frame
+            return True, self._from_bgr(frame)
 
         if self.mode == "video" and self.loop_video and self.capture is not None:
             self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -109,7 +125,7 @@ class CameraReader:
             if success and frame is not None:
                 if self.mirror:
                     frame = cv2.flip(frame, 1)
-                return True, frame
+                return True, self._from_bgr(frame)
             return False, None
 
         if self.mode == "video" and not self.loop_video:
@@ -122,7 +138,7 @@ class CameraReader:
         success, frame = self.capture.read()
         if success and frame is not None and self.mirror:
             frame = cv2.flip(frame, 1)
-        return success, frame
+        return (True, self._from_bgr(frame)) if success and frame is not None else (False, None)
 
     def release(self) -> None:
         """释放当前图像源资源。
@@ -145,6 +161,10 @@ class CameraReader:
             self._last_returned_frame_id = 0
             self._reader_failed = False
         self._shared_memory_last_frame_id = 0
+        self._captured_frame_id = 0
+        self.color_conversion_count = 0
+        self.color_conversion_total_ms = 0.0
+        self.last_color_conversion_ms = 0.0
 
     def _build_source(self) -> Any:
         """根据模式构建 OpenCV VideoCapture 的输入源。
@@ -239,8 +259,8 @@ class CameraReader:
         finally:
             self._shared_memory = None
 
-    def _read_shared_memory(self, reconnect_on_timeout: bool = True) -> Tuple[bool, Optional[np.ndarray]]:
-        """读取一致的 RGB888 新帧并转换为下游统一使用的 BGR。"""
+    def _read_shared_memory(self, reconnect_on_timeout: bool = True) -> Tuple[bool, Optional[CapturedFrame]]:
+        """读取一致的 RGB888 新帧并生成一次可复用的 BGR 对应帧。"""
 
         if self._shared_memory is None:
             if not self._attempt_reconnect():
@@ -282,10 +302,9 @@ class CameraReader:
                     continue
 
                 self._shared_memory_last_frame_id = frame_id
-                frame = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
                 if self.mirror:
-                    frame = cv2.flip(frame, 1)
-                return True, frame
+                    rgb_frame = cv2.flip(rgb_frame, 1)
+                return True, self._from_rgb(rgb_frame, source_frame_id=int(frame_id))
             except (BufferError, TypeError, ValueError, struct.error):
                 break
 
@@ -344,7 +363,7 @@ class CameraReader:
                 self._latest_frame = frame
                 self._latest_frame_id += 1
 
-    def _read_latest_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
+    def _read_latest_frame(self) -> Tuple[bool, Optional[CapturedFrame]]:
         """Return the next new cached realtime frame, reconnecting if capture failed."""
 
         if self.capture is None or not self.capture.isOpened():
@@ -360,9 +379,11 @@ class CameraReader:
                 )
                 if has_new_frame:
                     frame = self._latest_frame.copy()
-                    self._last_returned_frame_id = self._latest_frame_id
+                    source_frame_id = self._latest_frame_id
+                    self._last_returned_frame_id = source_frame_id
                 else:
                     frame = None
+                    source_frame_id = 0
                 reader_failed = self._reader_failed
 
             if reader_failed:
@@ -370,10 +391,74 @@ class CameraReader:
                     return False, None
                 continue
             if frame is not None:
-                return True, frame
+                return True, self._from_bgr(frame, source_frame_id=source_frame_id)
             time.sleep(0.001)
 
         return False, None
+
+    def _from_rgb(
+        self,
+        frame_rgb: np.ndarray,
+        source_frame_id: int | None = None,
+    ) -> CapturedFrame:
+        """Keep the source RGB frame and create its single reusable BGR peer."""
+
+        captured_at = time.perf_counter()
+        started = time.perf_counter()
+        frame_rgb = np.ascontiguousarray(frame_rgb)
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        conversion_ms = (time.perf_counter() - started) * 1000.0
+        return self._finish_capture(
+            frame_rgb,
+            frame_bgr,
+            captured_at,
+            source_frame_id,
+            conversion_ms,
+        )
+
+    def _from_bgr(
+        self,
+        frame_bgr: np.ndarray,
+        source_frame_id: int | None = None,
+    ) -> CapturedFrame:
+        """Keep the OpenCV BGR frame and create its single reusable RGB peer."""
+
+        captured_at = time.perf_counter()
+        started = time.perf_counter()
+        frame_bgr = np.ascontiguousarray(frame_bgr)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        conversion_ms = (time.perf_counter() - started) * 1000.0
+        return self._finish_capture(
+            frame_rgb,
+            frame_bgr,
+            captured_at,
+            source_frame_id,
+            conversion_ms,
+        )
+
+    def _finish_capture(
+        self,
+        frame_rgb: np.ndarray,
+        frame_bgr: np.ndarray,
+        captured_at: float,
+        source_frame_id: int | None,
+        conversion_ms: float,
+    ) -> CapturedFrame:
+        if source_frame_id is None:
+            self._captured_frame_id += 1
+            source_frame_id = self._captured_frame_id
+        else:
+            self._captured_frame_id = max(self._captured_frame_id, int(source_frame_id))
+        self.color_conversion_count += 1
+        self.color_conversion_total_ms += conversion_ms
+        self.last_color_conversion_ms = conversion_ms
+        return CapturedFrame(
+            rgb=frame_rgb,
+            bgr=frame_bgr,
+            captured_at=captured_at,
+            source_frame_id=int(source_frame_id),
+            color_conversion_ms=conversion_ms,
+        )
 
     def _attempt_reconnect(self) -> bool:
         """在读取失败后尝试重新连接图像源。

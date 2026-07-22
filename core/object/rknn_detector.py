@@ -33,6 +33,11 @@ class RknnObjectDetector:
         self.input_height = int(input_size[1])
         self.input_layout = str(config.get("input_layout", "nhwc")).lower()
         self.input_color = str(config.get("input_color", "rgb")).lower()
+        if self.input_color != "rgb":
+            raise ValueError(
+                "rknn_object_detector.input_color must be 'rgb'; "
+                "the runtime inference branch now supplies RGB frames"
+            )
         self.input_dtype = str(config.get("input_dtype", "uint8")).lower()
         self.score_threshold = float(config.get("score_threshold", 0.35))
         self.nms_threshold = float(config.get("nms_threshold", 0.45))
@@ -56,25 +61,24 @@ class RknnObjectDetector:
         self._warned_class_count = False
         self.last_timing: dict[str, float] = {}
         self._canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
-        self._rgb_canvas = np.empty_like(self._canvas)
 
-    def detect(self, frame_bgr: np.ndarray) -> list[DetectedObject]:
+    def detect(self, frame_rgb: np.ndarray) -> list[DetectedObject]:
         if not self.enabled:
             return []
-        if frame_bgr.size == 0:
+        if frame_rgb.size == 0:
             return []
         if not self._ensure_runtime():
             return []
 
         started = time.perf_counter()
-        input_tensor, letterbox = self._preprocess(frame_bgr)
+        input_tensor, letterbox = self._preprocess(frame_rgb)
         preprocessed = time.perf_counter()
         outputs = self._rknn.inference(inputs=[input_tensor])
         inferred = time.perf_counter()
         if outputs is None:
             return []
 
-        detections = self._postprocess(outputs, letterbox, frame_bgr.shape[:2])
+        detections = self._postprocess(outputs, letterbox, frame_rgb.shape[:2])
         finished = time.perf_counter()
         self.last_timing = {
             "preprocess_ms": (preprocessed - started) * 1000.0,
@@ -141,10 +145,8 @@ class RknnObjectDetector:
             print(f"[RknnObjectDetector] {message}")
             self._warned_unavailable = True
 
-    def _preprocess(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
-        resized, info = self._letterbox(frame_bgr)
-        if self.input_color == "rgb":
-            resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB, dst=self._rgb_canvas)
+    def _preprocess(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
+        resized, info = self._letterbox(frame_rgb)
 
         if self.input_dtype == "float32":
             tensor = resized.astype(np.float32) / 255.0
@@ -156,12 +158,12 @@ class RknnObjectDetector:
         tensor = np.expand_dims(tensor, axis=0)
         return tensor, info
 
-    def _letterbox(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
-        frame_height, frame_width = frame_bgr.shape[:2]
+    def _letterbox(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
+        frame_height, frame_width = frame_rgb.shape[:2]
         scale = min(self.input_width / frame_width, self.input_height / frame_height)
         new_width = int(round(frame_width * scale))
         new_height = int(round(frame_height * scale))
-        resized = cv2.resize(frame_bgr, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(frame_rgb, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
 
         canvas = self._canvas
         canvas.fill(114)

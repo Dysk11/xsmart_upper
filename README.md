@@ -91,7 +91,7 @@ camera:
   max_reconnect_attempts: 5
 ```
 
-共享内存使用 16 字节原生 `QII` 头部（帧号、宽、高），后接连续 RGB888 图像。接收端会转换为项目下游统一使用的 BGR 图像。
+共享内存使用 16 字节原生 `QII` 头部（帧号、宽、高），后接连续 RGB888 图像。接收端保留原始 RGB 供 RKNN 推理，同时只转换一次并缓存对应 BGR，供 OCR、可视化和录像直接复用。`video/camera` 则保留 OpenCV 原始 BGR，并只生成一次供两个模型共享的 RGB 推理画面。
 
 ### 2. `lane_geometry`
 

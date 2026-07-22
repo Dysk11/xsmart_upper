@@ -89,29 +89,28 @@ class RknnLaneSegmenter:
         self._warned: set[str] = set()
         self.last_timing: dict[str, float] = {}
         self._canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
-        self._rgb_canvas = np.empty_like(self._canvas)
         self._grids: dict[tuple[int, int], np.ndarray] = {}
 
-    def segment(self, frame_bgr: np.ndarray) -> SegmentationResult:
-        inference = self.infer(frame_bgr)
+    def segment(self, frame_rgb: np.ndarray) -> SegmentationResult:
+        inference = self.infer(frame_rgb)
         result, timing = self.complete(inference)
         self.last_timing = timing
         return result
 
-    def infer(self, frame_bgr: np.ndarray) -> LaneInference:
+    def infer(self, frame_rgb: np.ndarray) -> LaneInference:
         """Run preprocessing and synchronous RKNN inference only."""
 
         started = time.perf_counter()
-        shape = tuple(frame_bgr.shape[:2]) if frame_bgr.ndim >= 2 else (1, 1)
+        shape = tuple(frame_rgb.shape[:2]) if frame_rgb.ndim >= 2 else (1, 1)
         if not self.enabled:
             return LaneInference(shape, started, started, started, status="disabled")
-        if frame_bgr.size == 0:
+        if frame_rgb.size == 0:
             return LaneInference(shape, started, started, started, status="empty_frame")
         if not self._ensure_runtime():
             return LaneInference(shape, started, started, started, status="runtime_unavailable")
 
         try:
-            input_tensor, letterbox = self._preprocess(frame_bgr)
+            input_tensor, letterbox = self._preprocess(frame_rgb)
             preprocessed = time.perf_counter()
             outputs = self._rknn.inference(inputs=[input_tensor])
             inferred = time.perf_counter()
@@ -197,19 +196,18 @@ class RknnLaneSegmenter:
         print(f"RKNN lane segmenter loaded: {self.model_path}")
         return True
 
-    def _preprocess(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
-        height, width = frame_bgr.shape[:2]
+    def _preprocess(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, LetterboxInfo]:
+        height, width = frame_rgb.shape[:2]
         scale = min(self.input_width / width, self.input_height / height)
         resized_width = int(round(width * scale))
         resized_height = int(round(height * scale))
-        resized = cv2.resize(frame_bgr, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(frame_rgb, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
         canvas = self._canvas
         canvas.fill(114)
         pad_x = (self.input_width - resized_width) // 2
         pad_y = (self.input_height - resized_height) // 2
         canvas[pad_y : pad_y + resized_height, pad_x : pad_x + resized_width] = resized
-        rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB, dst=self._rgb_canvas)
-        return rgb[None, ...], LetterboxInfo(
+        return canvas[None, ...], LetterboxInfo(
             scale, pad_x, pad_y, resized_width, resized_height, width, height
         )
 

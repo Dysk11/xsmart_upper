@@ -264,6 +264,62 @@ def _share_ui_frame(
         raise
 
 
+def _share_ai_frames(
+    frame_rgb: np.ndarray,
+    frame_bgr: np.ndarray,
+    frame_id: int,
+    source_frame_id: int,
+    rgb_pool: SharedArrayPool,
+    bgr_pool: SharedArrayPool,
+) -> Dict[str, Any] | None:
+    """Copy one aligned RGB/BGR pair into the AI shared-memory pools."""
+
+    descriptor: Dict[str, Any] = {
+        "frame_id": int(frame_id),
+        "source_frame_id": int(source_frame_id),
+    }
+    pools = {rgb_pool.pool_id: rgb_pool, bgr_pool.pool_id: bgr_pool}
+    try:
+        descriptor["rgb"] = rgb_pool.write(frame_rgb)
+        if descriptor["rgb"] is None:
+            return None
+        descriptor["bgr"] = bgr_pool.write(frame_bgr)
+        if descriptor["bgr"] is None:
+            _release_shared_payload(descriptor, pools)
+            return None
+        return descriptor
+    except Exception:
+        _release_shared_payload(descriptor, pools)
+        raise
+
+
+def _take_shared_ai_frames(
+    descriptor: Dict[str, Any],
+    ack_queues: Dict[str, Any],
+    expected_frame_id: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rebuild one aligned RGB/BGR pair for object inference and OCR."""
+
+    remaining = dict(descriptor)
+    try:
+        descriptor_frame_id = int(remaining.pop("frame_id"))
+        remaining.pop("source_frame_id")
+        if descriptor_frame_id != int(expected_frame_id):
+            raise ValueError(
+                f"AI RGB/BGR packet frame mismatch: {descriptor_frame_id} != {expected_frame_id}"
+            )
+        frame_rgb = _take_shared_ndarray(remaining.pop("rgb"), ack_queues)
+        frame_bgr = _take_shared_ndarray(remaining.pop("bgr"), ack_queues)
+        if frame_rgb.shape != frame_bgr.shape:
+            raise ValueError(
+                f"AI RGB/BGR frame shape mismatch: {frame_rgb.shape} != {frame_bgr.shape}"
+            )
+        return frame_rgb, frame_bgr
+    except Exception:
+        _ack_shared_payload(remaining, ack_queues)
+        raise
+
+
 def _take_shared_ui_frame(
     descriptor: Dict[str, Any],
     ack_queues: Dict[str, Any],
@@ -336,7 +392,8 @@ def _ai_inference_worker(
     input_queue: Any,
     output_queue: Any,
     ocr_trigger_queue: Any,
-    ack_queue: Any,
+    rgb_ack_queue: Any,
+    bgr_ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Run object detection and exact-frame road-sign OCR in one AI process."""
@@ -347,7 +404,10 @@ def _ai_inference_worker(
         project_root=Path(project_root),
         trigger_callback=ocr_trigger_queue.put,
     )
-    ack_queues = {"ai_frame": ack_queue}
+    ack_queues = {
+        "ai_rgb_frame": rgb_ack_queue,
+        "ai_bgr_frame": bgr_ack_queue,
+    }
     last_ocr_result: OcrResult | None = None
     last_ocr_attempt: OcrResult | None = None
     try:
@@ -361,16 +421,16 @@ def _ai_inference_worker(
 
             frame_id, captured_at, frame_payload, allow_ocr_inference = item
             try:
-                frame = (
-                    _take_shared_ndarray(frame_payload, ack_queues)
-                    if _is_shared_array_descriptor(frame_payload)
-                    else frame_payload
+                frame_rgb, frame_bgr = _take_shared_ai_frames(
+                    frame_payload,
+                    ack_queues,
+                    expected_frame_id=int(frame_id),
                 )
                 ipc_finished = time.perf_counter()
-                detections = detector.detect(frame)
+                detections = detector.detect(frame_rgb)
                 try:
                     ocr_result = ocr_session.update(
-                        frame,
+                        frame_bgr,
                         frame_id,
                         detections,
                         allow_inference=bool(allow_ocr_inference),
@@ -799,7 +859,8 @@ class UpperMachineApp:
         self.road_sign_analysis_input_queue = self.mp_context.Queue(maxsize=1)
         self.road_sign_analysis_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
-        self.ai_ack_queue = self.mp_context.Queue()
+        self.ai_rgb_ack_queue = self.mp_context.Queue()
+        self.ai_bgr_ack_queue = self.mp_context.Queue()
         self.lane_output_queue = self.mp_context.Queue(
             maxsize=max(2, len(worker_core_masks) * self.lane_pipeline_depth)
         )
@@ -820,10 +881,12 @@ class UpperMachineApp:
         self.ai_completed_count = 0
         self.ai_timing_totals: dict[str, float] = {}
         self.ui_frame_ack_queue = self.mp_context.Queue()
-        self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
+        self.ai_rgb_frame_pool = SharedArrayPool("ai_rgb_frame", self.ai_rgb_ack_queue)
+        self.ai_bgr_frame_pool = SharedArrayPool("ai_bgr_frame", self.ai_bgr_ack_queue)
         self.ui_frame_pool = SharedArrayPool("ui_frame", self.ui_frame_ack_queue)
         self.shared_pools = {
-            self.ai_frame_pool.pool_id: self.ai_frame_pool,
+            self.ai_rgb_frame_pool.pool_id: self.ai_rgb_frame_pool,
+            self.ai_bgr_frame_pool.pool_id: self.ai_bgr_frame_pool,
             self.ui_frame_pool.pool_id: self.ui_frame_pool,
         }
         if self.lane_parallel_enabled:
@@ -858,7 +921,8 @@ class UpperMachineApp:
                 self.ai_input_queue,
                 self.ai_output_queue,
                 self.ocr_trigger_queue,
-                self.ai_ack_queue,
+                self.ai_rgb_ack_queue,
+                self.ai_bgr_ack_queue,
                 self.stop_event,
             ),
             name="xsmart-ai-inference",
@@ -913,8 +977,8 @@ class UpperMachineApp:
             self.ui_process.start()
 
         while not self.stop_event.is_set():
-            success, frame = self.camera.read()
-            if not success or frame is None:
+            success, captured_frame = self.camera.read()
+            if not success or captured_frame is None:
                 if self.camera.mode == "video" and not self.camera.loop_video:
                     print("视频读取结束，主循环退出。")
                     break
@@ -923,13 +987,22 @@ class UpperMachineApp:
 
             # 第 1 步：先预处理，再用 YOLO 读取 coin、障碍物和岔路标志。
             lane_start_time = time.perf_counter()
-            captured_at = lane_start_time
-            roi_rect = self._compute_roi_rect(frame)
+            captured_at = captured_frame.captured_at
+            frame_rgb = captured_frame.rgb
+            frame_bgr = captured_frame.bgr
+            roi_rect = self._compute_roi_rect(frame_bgr)
             lane_roi_time = time.perf_counter()
             self.frame_id += 1
             ai_frame_payload = None
             if self.frame_id % self.ai_inference_stride == 0:
-                ai_frame_payload = self.ai_frame_pool.write(frame)
+                ai_frame_payload = _share_ai_frames(
+                    frame_rgb,
+                    frame_bgr,
+                    self.frame_id,
+                    captured_frame.source_frame_id,
+                    self.ai_rgb_frame_pool,
+                    self.ai_bgr_frame_pool,
+                )
             if ai_frame_payload is not None:
                 _put_latest(
                     self.ai_input_queue,
@@ -1051,14 +1124,14 @@ class UpperMachineApp:
                     + (f" error={road_sign_analysis_result.error}" if road_sign_analysis_result.error else ""),
                     flush=True,
                 )
-            segmentation_result = self._segment_lane(frame, captured_at)
+            segmentation_result = self._segment_lane(frame_rgb, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
             vehicle_center_x = max(
                 0.0,
                 min(
                     float(max(0, roi_x2 - roi_x1 - 1)),
-                    0.5 * float(frame.shape[1]) - float(roi_x1),
+                    0.5 * float(frame_bgr.shape[1]) - float(roi_x1),
                 ),
             )
             detection_result = self.detector.detect_from_mask(
@@ -1093,7 +1166,7 @@ class UpperMachineApp:
             )
             # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
             module_hints = self._collect_future_module_hints(
-                frame=frame,
+                frame=frame_bgr,
                 roi_rect=roi_rect,
                 detection_result=detection_result,
                 tracked_state=planning_state,
@@ -1125,7 +1198,7 @@ class UpperMachineApp:
             ui_frame_payload = None
             should_render_ui = self.ui_active and self.frame_id % self.ui_frame_stride == 0
             if should_render_ui:
-                ui_frame_payload = _share_ui_frame(frame, roi_rect, self.ui_frame_pool)
+                ui_frame_payload = _share_ui_frame(frame_bgr, roi_rect, self.ui_frame_pool)
             if should_render_ui and ui_frame_payload is not None:
                 _put_latest(
                     self.ui_queue,
@@ -1302,6 +1375,19 @@ class UpperMachineApp:
             f"roi={self.lane_timing_roi_ms / count:.2f} ms, "
             f"detect={self.lane_timing_detect_ms / count:.2f} ms, "
             f"track={self.lane_timing_track_ms / count:.2f} ms"
+        )
+
+        conversion_count = self.camera.color_conversion_count
+        conversion_avg_ms = (
+            self.camera.color_conversion_total_ms / conversion_count
+            if conversion_count > 0
+            else 0.0
+        )
+        print(
+            "Color conversion: "
+            f"count={conversion_count}, "
+            f"avg={conversion_avg_ms:.3f} ms, "
+            f"last={self.camera.last_color_conversion_ms:.3f} ms"
         )
 
         self.lane_timing_count = 0
