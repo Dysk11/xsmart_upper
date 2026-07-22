@@ -11,6 +11,7 @@ for _thread_env in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"
 
 import argparse
 import copy
+from concurrent.futures import Future, ThreadPoolExecutor
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import queue
@@ -53,7 +54,7 @@ from core.planning.road_sign_analyzer import (
     RoadSignAnalysisState,
 )
 from core.object.rknn_detector import RknnObjectDetector
-from core.lane.rknn_segmenter import RknnLaneSegmenter, SegmentationResult
+from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
 from core.visualization.visualizer import Visualizer
@@ -463,46 +464,90 @@ def _lane_inference_worker(
     pool_id: str,
     stop_event: Any,
 ) -> None:
-    """Run one lane-segmentation runtime on its configured NPU core."""
+    """Pipeline RKNN inference with CPU post-processing on one NPU core."""
 
     segmenter = RknnLaneSegmenter(segmenter_config)
     ack_queues = {pool_id: ack_queue}
+    postprocess_executor = ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix=f"lane-post-{worker_index}",
+    )
+    pending: Future[Any] | None = None
+
+    def finish_inference(
+        frame_id: int,
+        captured_at: float,
+        ipc_finished: float,
+        inference: Any,
+    ) -> tuple[Any, ...]:
+        result, timing = segmenter.complete(inference)
+        packed_mask = np.packbits(result.mask.reshape(-1), bitorder="little")
+        return (
+            frame_id,
+            captured_at,
+            time.perf_counter(),
+            ipc_finished,
+            timing,
+            worker_index,
+            tuple(result.mask.shape),
+            packed_mask,
+            result.instances,
+            result.confidence,
+            result.status,
+        )
+
+    def publish_pending(block: bool) -> bool:
+        nonlocal pending
+        if pending is None or (not block and not pending.done()):
+            return False
+        output_queue.put(pending.result())
+        pending = None
+        return True
+
     try:
         while not stop_event.is_set():
+            publish_pending(block=False)
             try:
-                item = input_queue.get(timeout=0.1)
+                item = input_queue.get(timeout=0.02 if pending is not None else 0.1)
             except queue.Empty:
                 continue
             if item is None:
                 break
 
             frame_id, captured_at, frame_payload = item
+            ipc_finished = time.perf_counter()
             try:
                 frame = _take_shared_ndarray(frame_payload, ack_queues)
                 ipc_finished = time.perf_counter()
-                result = segmenter.segment(frame)
+                inference = segmenter.infer(frame)
             except Exception:
                 traceback.print_exc()
                 shape = tuple(frame.shape[:2]) if "frame" in locals() else (1, 1)
-                result = SegmentationResult(np.zeros(shape, dtype=np.uint8), [], 0.0, "worker_error")
-            packed_mask = np.packbits(result.mask.reshape(-1), bitorder="little")
-            output_queue.put(
-                (
-                    frame_id,
-                    captured_at,
-                    time.perf_counter(),
-                    ipc_finished,
-                    segmenter.last_timing,
-                    worker_index,
-                    tuple(result.mask.shape),
-                    packed_mask,
-                    result.instances,
-                    result.confidence,
-                    result.status,
+                started = time.perf_counter()
+                inference = LaneInference(
+                    shape,
+                    started,
+                    started,
+                    started,
+                    status="worker_error",
                 )
+
+            # Keep at most one CPU post-process task outstanding. In the common
+            # case it finishes while the next RKNN inference is running.
+            publish_pending(block=True)
+            pending = postprocess_executor.submit(
+                finish_inference,
+                int(frame_id),
+                float(captured_at),
+                ipc_finished,
+                inference,
             )
     finally:
-        segmenter.close()
+        try:
+            publish_pending(block=True)
+        finally:
+            postprocess_executor.shutdown(wait=True, cancel_futures=False)
+            segmenter.close()
 
 
 def _ui_worker(
@@ -674,6 +719,10 @@ class UpperMachineApp:
         configured_worker_count = int(lane_config.get("worker_count", len(worker_core_masks)))
         worker_core_masks = worker_core_masks[: max(0, configured_worker_count)]
         self.lane_parallel_enabled = bool(lane_config.get("parallel", False) and worker_core_masks)
+        self.lane_pipeline_depth = min(
+            3,
+            max(1, int(lane_config.get("pipeline_depth", 3))),
+        )
         self.lane_segmenter = None if self.lane_parallel_enabled else RknnLaneSegmenter(lane_config)
         self.lane_max_result_age_frames = max(0, int(lane_config.get("max_result_age_frames", 2)))
         self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
@@ -751,16 +800,25 @@ class UpperMachineApp:
         self.road_sign_analysis_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
         self.ai_ack_queue = self.mp_context.Queue()
-        self.lane_output_queue = self.mp_context.Queue(maxsize=max(2, len(worker_core_masks) * 2))
+        self.lane_output_queue = self.mp_context.Queue(
+            maxsize=max(2, len(worker_core_masks) * self.lane_pipeline_depth)
+        )
         self.lane_input_queues: list[Any] = []
         self.lane_ack_queues: list[Any] = []
         self.lane_frame_pools: list[SharedArrayPool] = []
         self.lane_processes: list[Any] = []
-        self.lane_worker_busy: list[bool] = []
+        self.lane_worker_inflight: list[int] = []
+        self.lane_worker_completed = [0 for _ in worker_core_masks]
+        self.lane_worker_timing_totals: list[dict[str, float]] = [
+            {} for _ in worker_core_masks
+        ]
+        self.next_lane_worker_index = 0
         self.last_segmentation_result: SegmentationResult | None = None
         self.last_segmentation_frame_id = -1
         self.last_segmentation_captured_at = 0.0
         self.last_ai_frame_id = -1
+        self.ai_completed_count = 0
+        self.ai_timing_totals: dict[str, float] = {}
         self.ui_frame_ack_queue = self.mp_context.Queue()
         self.ai_frame_pool = SharedArrayPool("ai_frame", self.ai_ack_queue)
         self.ui_frame_pool = SharedArrayPool("ui_frame", self.ui_frame_ack_queue)
@@ -773,7 +831,11 @@ class UpperMachineApp:
                 input_queue = self.mp_context.Queue(maxsize=1)
                 ack_queue = self.mp_context.Queue()
                 pool_id = f"lane_frame_{worker_index}"
-                frame_pool = SharedArrayPool(pool_id, ack_queue, slot_count=2)
+                frame_pool = SharedArrayPool(
+                    pool_id,
+                    ack_queue,
+                    slot_count=self.lane_pipeline_depth,
+                )
                 worker_config = copy.deepcopy(lane_config)
                 worker_config["core_mask"] = str(core_mask)
                 process = self.mp_context.Process(
@@ -785,7 +847,7 @@ class UpperMachineApp:
                 self.lane_ack_queues.append(ack_queue)
                 self.lane_frame_pools.append(frame_pool)
                 self.lane_processes.append(process)
-                self.lane_worker_busy.append(False)
+                self.lane_worker_inflight.append(0)
                 self.shared_pools[pool_id] = frame_pool
         self.ai_process = self.mp_context.Process(
             target=_ai_inference_worker,
@@ -927,6 +989,8 @@ class UpperMachineApp:
                     worker_ocr_result,
                     worker_ocr_attempt,
                 ) = latest_ai_result
+                self.ai_completed_count += 1
+                self._accumulate_timing(self.ai_timing_totals, _timing)
                 result_age = self.frame_id - int(ai_frame_id)
                 if int(ai_frame_id) > self.last_ai_frame_id and (
                     not self.drop_stale_ai_results or result_age <= self.ai_max_result_age_frames
@@ -1126,13 +1190,13 @@ class UpperMachineApp:
 
         while self._receive_lane_result(block=False):
             pass
-        free_worker = next((i for i, busy in enumerate(self.lane_worker_busy) if not busy), None)
+        free_worker = self._next_available_lane_worker()
 
         if free_worker is not None:
             descriptor = self.lane_frame_pools[free_worker].write(frame)
             if descriptor is not None:
                 self.lane_input_queues[free_worker].put((self.frame_id, captured_at or time.perf_counter(), descriptor))
-                self.lane_worker_busy[free_worker] = True
+                self.lane_worker_inflight[free_worker] += 1
 
         if self.last_segmentation_result is None:
             self._receive_lane_result(block=True)
@@ -1163,7 +1227,13 @@ class UpperMachineApp:
             confidence,
             status,
         ) = item
-        self.lane_worker_busy[int(worker_index)] = False
+        worker_index = int(worker_index)
+        self.lane_worker_completed[worker_index] += 1
+        self._accumulate_timing(self.lane_worker_timing_totals[worker_index], _timing)
+        self.lane_worker_inflight[worker_index] = max(
+            0,
+            self.lane_worker_inflight[worker_index] - 1,
+        )
         if int(frame_id) > self.last_segmentation_frame_id:
             mask_size = int(mask_shape[0]) * int(mask_shape[1])
             mask = np.unpackbits(packed_mask, count=mask_size, bitorder="little").reshape(mask_shape)
@@ -1173,6 +1243,29 @@ class UpperMachineApp:
             self.last_segmentation_captured_at = float(captured_at)
             self.last_segmentation_result = result
         return True
+
+    @staticmethod
+    def _accumulate_timing(totals: dict[str, float], timing: Any) -> None:
+        """Accumulate numeric worker timing fields for diagnostics."""
+
+        if not isinstance(timing, dict):
+            return
+        for key, value in timing.items():
+            if isinstance(value, (int, float)):
+                totals[str(key)] = totals.get(str(key), 0.0) + float(value)
+
+    def _next_available_lane_worker(self) -> int | None:
+        """Return an available lane worker using round-robin fairness."""
+
+        worker_count = len(self.lane_worker_inflight)
+        if worker_count == 0:
+            return None
+        for offset in range(worker_count):
+            worker_index = (self.next_lane_worker_index + offset) % worker_count
+            if self.lane_worker_inflight[worker_index] < self.lane_pipeline_depth:
+                self.next_lane_worker_index = (worker_index + 1) % worker_count
+                return worker_index
+        return None
 
     def _release_owned_shared_payload(self, value: Any) -> None:
         """Release queued shared-memory slots owned by this app instance."""

@@ -30,8 +30,9 @@ rknn_lane_segmenter:
   runtime_backend: lite2
   core_mask: NPU_CORE_0
   parallel: true
-  worker_count: 3
-  worker_core_masks: [NPU_CORE_0, NPU_CORE_1, NPU_CORE_2]
+  worker_count: 2
+  worker_core_masks: [NPU_CORE_0, NPU_CORE_2]
+  pipeline_depth: 3
   max_result_age_frames: 4
   drop_stale_results: true
 
@@ -95,7 +96,7 @@ tracker:
 # Object and road-sign perception
 rknn_object_detector:
   enable: true
-  model_path: models/object/rknn_7classes_0718_0718.rknn
+  model_path: models/object/rknn_7classes_0718.rknn
   input_size: [640, 480]
   input_layout: nhwc
   input_color: rgb

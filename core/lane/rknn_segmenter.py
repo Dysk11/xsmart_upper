@@ -56,6 +56,19 @@ class SegmentationResult:
     status: str
 
 
+@dataclass
+class LaneInference:
+    """RKNN outputs and timing state awaiting CPU post-processing."""
+
+    source_shape: tuple[int, int]
+    started_at: float
+    preprocessed_at: float
+    inferred_at: float
+    outputs: list[np.ndarray] | None = None
+    letterbox: LetterboxInfo | None = None
+    status: str = "ok"
+
+
 class RknnLaneSegmenter:
     """Load a split-head YOLOv5n-seg RKNN model and reconstruct track masks."""
 
@@ -80,34 +93,67 @@ class RknnLaneSegmenter:
         self._grids: dict[tuple[int, int], np.ndarray] = {}
 
     def segment(self, frame_bgr: np.ndarray) -> SegmentationResult:
-        shape = frame_bgr.shape[:2] if frame_bgr.ndim >= 2 else (1, 1)
-        if not self.enabled:
-            return self._empty(shape, "disabled")
-        if frame_bgr.size == 0:
-            return self._empty(shape, "empty_frame")
-        if not self._ensure_runtime():
-            return self._empty(shape, "runtime_unavailable")
+        inference = self.infer(frame_bgr)
+        result, timing = self.complete(inference)
+        self.last_timing = timing
+        return result
+
+    def infer(self, frame_bgr: np.ndarray) -> LaneInference:
+        """Run preprocessing and synchronous RKNN inference only."""
 
         started = time.perf_counter()
-        input_tensor, letterbox = self._preprocess(frame_bgr)
-        preprocessed = time.perf_counter()
+        shape = tuple(frame_bgr.shape[:2]) if frame_bgr.ndim >= 2 else (1, 1)
+        if not self.enabled:
+            return LaneInference(shape, started, started, started, status="disabled")
+        if frame_bgr.size == 0:
+            return LaneInference(shape, started, started, started, status="empty_frame")
+        if not self._ensure_runtime():
+            return LaneInference(shape, started, started, started, status="runtime_unavailable")
+
         try:
+            input_tensor, letterbox = self._preprocess(frame_bgr)
+            preprocessed = time.perf_counter()
             outputs = self._rknn.inference(inputs=[input_tensor])
             inferred = time.perf_counter()
             if outputs is None:
                 raise RuntimeError("RKNN inference returned no outputs")
-            result = self.postprocess(outputs, letterbox)
-            finished = time.perf_counter()
-            self.last_timing = {
-                "preprocess_ms": (preprocessed - started) * 1000.0,
-                "inference_ms": (inferred - preprocessed) * 1000.0,
-                "postprocess_ms": (finished - inferred) * 1000.0,
-                "total_ms": (finished - started) * 1000.0,
-            }
-            return result
+            return LaneInference(
+                source_shape=shape,
+                started_at=started,
+                preprocessed_at=preprocessed,
+                inferred_at=inferred,
+                outputs=list(outputs),
+                letterbox=letterbox,
+            )
         except Exception as error:
             self._warn_once("inference", f"RKNN lane segmentation failed: {error}")
-            return self._empty(shape, "inference_error")
+            failed_at = time.perf_counter()
+            return LaneInference(shape, started, failed_at, failed_at, status="inference_error")
+
+    def complete(self, inference: LaneInference) -> tuple[SegmentationResult, dict[str, float]]:
+        """Post-process one completed inference without touching the RKNN runtime."""
+
+        postprocess_started = time.perf_counter()
+        if inference.outputs is None or inference.letterbox is None:
+            result = self._empty(inference.source_shape, inference.status)
+            finished = time.perf_counter()
+        else:
+            try:
+                result = self.postprocess(inference.outputs, inference.letterbox)
+            except Exception as error:
+                self._warn_once("postprocess", f"RKNN lane post-processing failed: {error}")
+                result = self._empty(inference.source_shape, "postprocess_error")
+            finished = time.perf_counter()
+
+        timing = {
+            "preprocess_ms": (inference.preprocessed_at - inference.started_at) * 1000.0,
+            "inference_ms": (inference.inferred_at - inference.preprocessed_at) * 1000.0,
+            "postprocess_queue_ms": (postprocess_started - inference.inferred_at) * 1000.0,
+            "postprocess_ms": (finished - postprocess_started) * 1000.0,
+            "total_ms": (finished - inference.started_at) * 1000.0,
+        }
+        self.last_timing = timing
+        return result, timing
 
     def close(self) -> None:
         if self._rknn is not None:
@@ -205,18 +251,26 @@ class RknnLaneSegmenter:
         proto = prototypes[0].reshape(32, -1)
         threshold = min(max(self.mask_threshold, 1e-6), 1.0 - 1e-6)
         logit_threshold = float(np.log(threshold / (1.0 - threshold)))
+        selected_array = np.asarray(selected, dtype=np.intp)
+        selected_logits = candidates[selected_array, 6:] @ proto
+        selected_logits = selected_logits.reshape(
+            len(selected), prototypes.shape[2], prototypes.shape[3]
+        )
+        resized_logits = cv2.resize(
+            np.moveaxis(selected_logits, 0, -1),
+            (self.input_width, self.input_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        if resized_logits.ndim == 2:
+            resized_logits = resized_logits[:, :, None]
+        selected_masks = resized_logits >= logit_threshold
         instances: list[SegmentationInstance] = []
-        for index in selected:
+        for mask_index, index in enumerate(selected):
             box = boxes[index]
-            logits = candidates[index, 6:] @ proto
-            logits = logits.reshape(prototypes.shape[2], prototypes.shape[3])
-            logits = cv2.resize(logits, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
-            instance_mask = logits >= logit_threshold
             x1, y1, x2, y2 = self._clip_box(box)
-            cropped = np.zeros_like(instance_mask)
             if x2 > x1 and y2 > y1:
-                cropped[y1:y2, x1:x2] = instance_mask[y1:y2, x1:x2]
-            union_input[cropped] = 255
+                crop = selected_masks[y1:y2, x1:x2, mask_index]
+                union_input[y1:y2, x1:x2][crop] = 255
             instances.append(
                 SegmentationInstance(self._restore_box(box, info), float(scores[index]))
             )
