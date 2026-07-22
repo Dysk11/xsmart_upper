@@ -220,6 +220,7 @@ visualizer:
   window_name: X-SmartCar Upper
   font_path: "C:/Windows/Fonts/msyh.ttc"
   font_size: 22
+  debug_panel_font_size: 18
   mask_alpha: 0.35
   mask_color: [0, 180, 255]
   save_video: true
