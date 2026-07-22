@@ -73,6 +73,61 @@ def test_both_roi_edges_are_valid_boundaries() -> None:
     assert right_lost == [False]
 
 
+def test_left_roi_edge_remains_measured_while_tracing_upward() -> None:
+    mask = np.zeros((6, WIDTH), dtype=np.uint8)
+    mask[:, 0:13] = 255
+
+    left, right, _centers, left_lost, right_lost = extract(
+        make_detector(), mask
+    )
+
+    assert left == [(0, y) for y in range(5, -1, -1)]
+    assert right == [(12, y) for y in range(5, -1, -1)]
+    assert not any(left_lost)
+    assert not any(right_lost)
+
+
+def test_right_roi_edge_remains_measured_while_tracing_upward() -> None:
+    mask = np.zeros((6, WIDTH), dtype=np.uint8)
+    mask[:, 7:WIDTH] = 255
+
+    left, right, _centers, left_lost, right_lost = extract(
+        make_detector(), mask
+    )
+
+    assert left == [(7, y) for y in range(5, -1, -1)]
+    assert right == [(WIDTH - 1, y) for y in range(5, -1, -1)]
+    assert not any(left_lost)
+    assert not any(right_lost)
+
+
+def test_both_roi_edges_remain_measured_while_tracing_upward() -> None:
+    mask = np.full((6, WIDTH), 255, dtype=np.uint8)
+
+    left, right, _centers, left_lost, right_lost = extract(
+        make_detector(), mask
+    )
+
+    assert left == [(0, y) for y in range(5, -1, -1)]
+    assert right == [(WIDTH - 1, y) for y in range(5, -1, -1)]
+    assert not any(left_lost)
+    assert not any(right_lost)
+
+
+def test_boundary_can_reach_roi_edge_and_continue_upward() -> None:
+    mask = np.zeros((6, WIDTH), dtype=np.uint8)
+    expected_left = {5: 3, 4: 2, 3: 1, 2: 0, 1: 0, 0: 0}
+    for y, left_x in expected_left.items():
+        mask[y, left_x : left_x + 11] = 255
+
+    left, _right, _centers, left_lost, _right_lost = extract(
+        make_detector(), mask
+    )
+
+    assert left == [(expected_left[y], y) for y in range(5, -1, -1)]
+    assert not any(left_lost)
+
+
 def test_empty_row_reuses_boundaries_and_marks_both_sides_lost() -> None:
     mask = np.zeros((3, WIDTH), dtype=np.uint8)
     mask[2, 0:13] = 255

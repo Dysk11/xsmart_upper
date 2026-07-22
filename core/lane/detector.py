@@ -1007,7 +1007,7 @@ class LaneDetector:
         return selected_mask
 
     def _build_row_runs(self, mask: np.ndarray) -> list[list[tuple[int, int]]]:
-        """Precompute valid foreground runs for every row in one NumPy pass."""
+        """Precompute foreground runs retained by the existing fork logic."""
 
         height, width = mask.shape[:2]
         padded = np.zeros((height, width + 2), dtype=np.uint8)
@@ -1030,19 +1030,167 @@ class LaneDetector:
             row_runs[int(start_row)].append((int(start_x), int(end_exclusive_x) - 1))
         return row_runs
 
-    def _extract_row_boundaries(
+    def _scan_foreground_runs(self, row: np.ndarray) -> list[tuple[int, int]]:
+        """Return valid foreground runs in one row without selecting boundaries."""
+
+        width = int(row.shape[0])
+        padded = np.zeros(width + 2, dtype=np.uint8)
+        padded[1 : width + 1] = row > 0
+        transitions = np.diff(padded.astype(np.int8, copy=False))
+        starts = np.flatnonzero(transitions == 1)
+        ends = np.flatnonzero(transitions == -1)
+        return [
+            (int(start), int(end) - 1)
+            for start, end in zip(starts, ends)
+            if int(end) - int(start) >= self.min_run_width_px
+        ]
+
+    def _find_eight_neighbor_seeds(
         self,
         mask: np.ndarray,
-        route_direction: str | None = None,
-        row_runs: Sequence[Sequence[tuple[int, int]]] | None = None,
-        bottom_center_x: float | None = None,
-    ):
-        """Choose the bottom run nearest vehicle center, then follow it upward."""
+        route_direction: str | None,
+        bottom_center_x: float | None,
+    ) -> tuple[tuple[int, int], tuple[int, int]] | None:
+        """Find the lowest usable track span and return its two boundary seeds."""
 
         height, width = mask.shape[:2]
-        if row_runs is None:
-            row_runs = self._build_row_runs(mask)
-        selected_mask = np.zeros_like(mask)
+        mapped_center = (
+            width * 0.5
+            if bottom_center_x is None
+            else clamp(float(bottom_center_x), 0.0, float(max(0, width - 1)))
+        )
+        for y in range(height - 1, -1, -1):
+            runs = self._scan_foreground_runs(mask[y])
+            if not runs:
+                continue
+            if route_direction == "left" and len(runs) > 1:
+                left, right = min(runs, key=lambda run: 0.5 * (run[0] + run[1]))
+            elif route_direction == "right" and len(runs) > 1:
+                left, right = max(runs, key=lambda run: 0.5 * (run[0] + run[1]))
+            else:
+                left, right = min(
+                    runs,
+                    key=lambda run: (
+                        abs(0.5 * (run[0] + run[1]) - mapped_center),
+                        -(run[1] - run[0] + 1),
+                        abs(0.5 * (run[0] + run[1]) - width * 0.5),
+                        run[0],
+                    ),
+                )
+            return (int(left), y), (int(right), y)
+        return None
+
+    @staticmethod
+    def _is_eight_neighbor_boundary(
+        padded_mask: np.ndarray,
+        x: int,
+        y: int,
+        side: str,
+    ) -> bool:
+        """Return whether a foreground pixel is the requested side boundary."""
+
+        py = int(y) + 1
+        px = int(x) + 1
+        if padded_mask[py, px] == 0:
+            return False
+        outside_x = px - 1 if side == "left" else px + 1
+        return bool(padded_mask[py, outside_x] == 0)
+
+    def _resume_eight_neighbor_seed(
+        self,
+        mask: np.ndarray,
+        current: tuple[int, int],
+        side: str,
+    ) -> tuple[int, int] | None:
+        """Resume above a short empty gap while keeping the same boundary side."""
+
+        current_x, current_y = current
+        width = int(mask.shape[1])
+        max_jump_per_row = max(2.0, width * self.gradient_jump_ratio)
+        for gap_rows in range(1, self.max_single_side_gap_rows + 2):
+            y = current_y - gap_rows
+            if y < 0:
+                break
+            runs = self._scan_foreground_runs(mask[y])
+            if not runs:
+                continue
+            candidates = [run[0] if side == "left" else run[1] for run in runs]
+            candidate_x = min(candidates, key=lambda value: abs(value - current_x))
+            if abs(candidate_x - current_x) <= max_jump_per_row * gap_rows:
+                return int(candidate_x), int(y)
+        return None
+
+    def _trace_eight_neighbor_boundary(
+        self,
+        mask: np.ndarray,
+        padded_mask: np.ndarray,
+        seed: tuple[int, int],
+        side: str,
+    ) -> list[tuple[int, int]]:
+        """Trace one measured track boundary upward using eight-neighbor growth."""
+
+        if side == "left":
+            offsets = (
+                (0, 1), (-1, 1), (-1, 0), (-1, -1),
+                (0, -1), (1, -1), (1, 0), (1, 1),
+            )
+        else:
+            offsets = (
+                (0, 1), (1, 1), (1, 0), (1, -1),
+                (0, -1), (-1, -1), (-1, 0), (-1, 1),
+            )
+
+        height, width = mask.shape[:2]
+        max_steps = max(1, height * 3)
+        points = [(int(seed[0]), int(seed[1]))]
+        visited = {points[0]}
+        current = points[0]
+
+        while len(points) < max_steps and current[1] > 0:
+            candidates: list[tuple[int, int, int]] = []
+            for order, (dx, dy) in enumerate(offsets):
+                candidate = (current[0] + dx, current[1] + dy)
+                x, y = candidate
+                if x < 0 or x >= width or y < 0 or y >= height:
+                    continue
+                if y > current[1] or candidate in visited:
+                    continue
+                if self._is_eight_neighbor_boundary(padded_mask, x, y, side):
+                    candidates.append((y, order, x))
+
+            if candidates:
+                next_y, _order, next_x = min(candidates)
+                current = (int(next_x), int(next_y))
+                points.append(current)
+                visited.add(current)
+                continue
+
+            same_row_xs = [x for x, y in points if y == current[1]]
+            resume_x = (
+                min(same_row_xs) if side == "left" else max(same_row_xs)
+            )
+            resumed = self._resume_eight_neighbor_seed(
+                mask,
+                (int(resume_x), current[1]),
+                side,
+            )
+            if resumed is None or resumed in visited:
+                break
+            current = resumed
+            points.append(current)
+            visited.add(current)
+
+        return points
+
+    def _collect_fork_branch_rows(
+        self,
+        row_runs: Sequence[Sequence[tuple[int, int]]],
+        route_direction: str | None,
+        bottom_center_x: float | None,
+        width: int,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        """Preserve the previous row-run branch evidence used by fork detection."""
+
         historical_center = (
             float(self.last_centerline_points[0][0])
             if self.last_centerline_points
@@ -1055,21 +1203,13 @@ class LaneDetector:
             else clamp(float(bottom_center_x), 0.0, float(max(0, width - 1)))
         )
         first_valid_row = True
-        rows: list[tuple[int, int, int, bool, bool]] = []
         left_branch_rows: list[tuple[int, int]] = []
         right_branch_rows: list[tuple[int, int]] = []
-        single_side_gap = 0
 
-        for y in range(height - 1, -1, -1):
+        for y in range(len(row_runs) - 1, -1, -1):
             runs = row_runs[y]
             if not runs:
-                single_side_gap += 1
-                if single_side_gap <= self.max_single_side_gap_rows and rows:
-                    last_left, last_right = rows[-1][1], rows[-1][2]
-                    rows.append((y, last_left, last_right, True, True))
                 continue
-
-            single_side_gap = 0
             centers = [0.5 * (left + right) for left, right in runs]
             select_from_vehicle_center = (
                 first_valid_row
@@ -1091,8 +1231,10 @@ class LaneDetector:
                     ),
                 )
             else:
-                chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
-            left, right = runs[chosen_index]
+                chosen_index = min(
+                    range(len(runs)),
+                    key=lambda index: abs(centers[index] - prior_center),
+                )
             first_valid_row = False
             for index, (candidate_left, candidate_right) in enumerate(runs):
                 if index == chosen_index:
@@ -1102,24 +1244,104 @@ class LaneDetector:
                     left_branch_rows.append((int(candidate_center), y))
                 else:
                     right_branch_rows.append((int(candidate_center), y))
-
-            # A foreground run that reaches an ROI edge still has a valid
-            # boundary for this row.  Keep the measured endpoint instead of
-            # rebuilding it inward from the historical lane width.
-            rows.append((y, left, right, False, False))
-            selected_mask[y, left : right + 1] = 255
-            chosen_center = 0.5 * (left + right)
+            chosen_center = centers[chosen_index]
             if select_from_vehicle_center:
                 prior_center = chosen_center
             else:
                 prior_center = 0.65 * prior_center + 0.35 * chosen_center
+
+        return left_branch_rows, right_branch_rows
+
+    def _extract_row_boundaries(
+        self,
+        mask: np.ndarray,
+        route_direction: str | None = None,
+        row_runs: Sequence[Sequence[tuple[int, int]]] | None = None,
+        bottom_center_x: float | None = None,
+    ):
+        """Trace measured left/right boundaries upward with eight neighbors."""
+
+        height, width = mask.shape[:2]
+        if row_runs is None:
+            row_runs = self._build_row_runs(mask)
+        branch_rows = self._collect_fork_branch_rows(
+            row_runs,
+            route_direction=route_direction,
+            bottom_center_x=bottom_center_x,
+            width=width,
+        )
+        seeds = self._find_eight_neighbor_seeds(
+            mask,
+            route_direction=route_direction,
+            bottom_center_x=bottom_center_x,
+        )
+        selected_mask = np.zeros_like(mask)
+        if seeds is None:
+            return [], [], [], [], [], selected_mask, branch_rows[0], branch_rows[1]
+
+        padded_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+        padded_mask[1 : height + 1, 1 : width + 1] = mask > 0
+        left_trace = self._trace_eight_neighbor_boundary(
+            mask, padded_mask, seeds[0], "left"
+        )
+        right_trace = self._trace_eight_neighbor_boundary(
+            mask, padded_mask, seeds[1], "right"
+        )
+        left_by_y: dict[int, int] = {}
+        right_by_y: dict[int, int] = {}
+        for x, y in left_trace:
+            left_by_y[y] = min(x, left_by_y.get(y, x))
+        for x, y in right_trace:
+            right_by_y[y] = max(x, right_by_y.get(y, x))
+
+        top_y = max(min(left_by_y), min(right_by_y))
+        bottom_y = min(max(left_by_y), max(right_by_y))
+        rows: list[tuple[int, int, int, bool, bool]] = []
+        last_left: int | None = None
+        last_right: int | None = None
+        left_gap = right_gap = 0
+        for y in range(bottom_y, top_y - 1, -1):
+            measured_left = left_by_y.get(y)
+            measured_right = right_by_y.get(y)
+            if measured_left is not None:
+                last_left = measured_left
+                left_gap = 0
+                left_lost = False
+            else:
+                left_gap += 1
+                left_lost = True
+            if measured_right is not None:
+                last_right = measured_right
+                right_gap = 0
+                right_lost = False
+            else:
+                right_gap += 1
+                right_lost = True
+
+            left_valid = last_left is not None and left_gap <= self.max_single_side_gap_rows
+            right_valid = last_right is not None and right_gap <= self.max_single_side_gap_rows
+            if not left_valid or not right_valid or last_left > last_right:
+                continue
+            rows.append((y, last_left, last_right, left_lost, right_lost))
+            selected_mask[y, last_left : last_right + 1] = mask[
+                y, last_left : last_right + 1
+            ]
 
         left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
         right_points = [(right, y) for y, _left, right, _ll, _rl in rows]
         centers = [(int(round((left + right) * 0.5)), y) for y, left, right, _ll, _rl in rows]
         left_lost = [left_lost for _y, _left, _right, left_lost, _right_lost in rows]
         right_lost = [right_lost for _y, _left, _right, _left_lost, right_lost in rows]
-        return left_points, right_points, centers, left_lost, right_lost, selected_mask, left_branch_rows, right_branch_rows
+        return (
+            left_points,
+            right_points,
+            centers,
+            left_lost,
+            right_lost,
+            selected_mask,
+            branch_rows[0],
+            branch_rows[1],
+        )
 
     def _stabilize_normal_track_switch(
         self,
