@@ -1204,7 +1204,6 @@ class UpperMachineApp:
                     "timestamp_ms": control_command.ts_ms,
                     "lateral_error_px": planning_state.lateral_error_px,
                     "heading_error_deg": planning_state.heading_error_deg,
-                    "curvature": planning_state.curvature,
                     "confidence": planning_state.confidence,
                     "target_speed": control_command.target_speed,
                     "steer_deg": control_command.steer_deg,
@@ -1495,7 +1494,6 @@ class UpperMachineApp:
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
             "heading_error_deg": tracked_state.heading_error_deg,
-            "curvature": tracked_state.curvature,
             "confidence": tracked_state.confidence,
             "is_lane_lost": tracked_state.is_lane_lost,
         }
@@ -1601,7 +1599,6 @@ class UpperMachineApp:
             roi_width=roi_width,
             roi_height=roi_height,
             lane_confidence=tracked_state.confidence,
-            curvature=tracked_state.curvature,
         )
         path_marker_result = self.path_marker_target_planner.plan(
             objects=self.last_detected_objects,
@@ -1637,7 +1634,6 @@ class UpperMachineApp:
             roi_width=roi_width,
             roi_height=roi_height,
             lane_confidence=tracked_state.confidence,
-            curvature=tracked_state.curvature,
         )
 
         if blocking_result.need_avoid or blocking_result.too_close:

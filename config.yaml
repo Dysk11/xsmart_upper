@@ -63,7 +63,6 @@ lane_geometry:
   confidence:
     lost_threshold: 0.22
     expected_area_ratio: 0.04
-    residual_tolerance_px: 22.0
   fork:
     corner_span_rows: 10
     outward_jump_ratio: 0.08
@@ -76,8 +75,8 @@ lane_geometry:
     split_enter_ratio: 0.15
     split_exit_ratio: 0.10
     split_min_rows: 5
-    smoothness_residual_threshold_px: 3.0
-    smoothness_tie_margin_px: 0.1
+    roughness_threshold_px: 3.0
+    roughness_tie_margin_px: 0.1
 
 tracker:
   ema_alpha: 0.25
@@ -192,14 +191,10 @@ road_sign_analyzer:
 planner:
   lateral_gain: 0.065
   heading_gain: 0.85
-  curvature_gain: 140.0
   max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2
   min_speed: 0.45
-  straight_curvature_threshold: 0.0025
-  straight_boost_speed: 0.2
-  curvature_speed_gain: 120.0
   heading_speed_gain: 0.03
   confidence_speed_gain: 0.7
   caution_confidence_threshold: 0.55

@@ -58,7 +58,6 @@ class AvoidanceTargetPlanner:
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
-        curvature: float,
     ) -> AvoidanceTargetResult:
         points = self._sort_near_to_far(centerline_points)
         if not self.enabled or not points:
@@ -98,7 +97,6 @@ class AvoidanceTargetPlanner:
                 roi_width=roi_width,
                 roi_height=roi_height,
                 lane_confidence=lane_confidence,
-                curvature=curvature,
             )
 
         if blocking_result.need_avoid and not can_start_avoid:
@@ -110,7 +108,6 @@ class AvoidanceTargetPlanner:
                 roi_width=roi_width,
                 roi_height=roi_height,
                 lane_confidence=lane_confidence,
-                curvature=curvature,
             )
             return self._from_target(
                 mode="return_center",
@@ -129,7 +126,6 @@ class AvoidanceTargetPlanner:
                 roi_width=roi_width,
                 roi_height=roi_height,
                 lane_confidence=lane_confidence,
-                curvature=curvature,
             )
             return self._from_target(
                 mode="return_center",
@@ -151,7 +147,6 @@ class AvoidanceTargetPlanner:
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
-        curvature: float,
     ) -> AvoidanceTargetResult:
         assert blocking_result.blocking_object is not None
         _, y1, _, y2 = blocking_result.blocking_object.bbox_roi
@@ -170,7 +165,6 @@ class AvoidanceTargetPlanner:
             roi_width=roi_width,
             roi_height=roi_height,
             lane_confidence=lane_confidence,
-            curvature=curvature,
         )
         target = self._limit_target_jump(target, roi_width=roi_width, roi_height=roi_height)
         reason = (

@@ -1,10 +1,13 @@
 from core.io.protocol import (
+    PACKET_FIELDS,
     build_packet,
+    normalize_payload,
     parse_packet,
     resolve_configured_speed_state,
     target_speed_to_speed_state,
     validate_drive_speed_state,
 )
+from core.io.logger import CsvLogger
 import pytest
 
 
@@ -39,6 +42,30 @@ def test_packet_derives_speed_state_from_target_speed() -> None:
         assert len(packet) == 7
         assert packet[6] == expected_state
         assert packet[6] & 0xFC == 0
+
+
+def test_metadata_and_csv_schemas_contain_only_active_lane_metrics() -> None:
+    assert PACKET_FIELDS == [
+        "ts_ms",
+        "mode",
+        "target_speed",
+        "speed_state",
+        "steer_deg",
+        "lateral_error_px",
+        "heading_error_deg",
+        "confidence",
+        "is_lane_lost",
+    ]
+    assert list(normalize_payload({})) == PACKET_FIELDS
+    assert CsvLogger({"enable": False}).fieldnames == [
+        "timestamp_ms",
+        "lateral_error_px",
+        "heading_error_deg",
+        "confidence",
+        "target_speed",
+        "steer_deg",
+        "lane_lost_count",
+    ]
 
 
 @pytest.mark.parametrize("configured_state", (0x01, 0x02, 0x03))

@@ -27,7 +27,6 @@ class CsvLogger:
             "timestamp_ms",
             "lateral_error_px",
             "heading_error_deg",
-            "curvature",
             "confidence",
             "target_speed",
             "steer_deg",

@@ -22,7 +22,6 @@ PACKET_FIELDS = [
     "steer_deg",
     "lateral_error_px",
     "heading_error_deg",
-    "curvature",
     "confidence",
     "is_lane_lost",
 ]
@@ -83,7 +82,6 @@ def normalize_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "steer_deg": float(payload.get("steer_deg", 0.0)),
         "lateral_error_px": float(payload.get("lateral_error_px", 0.0)),
         "heading_error_deg": float(payload.get("heading_error_deg", 0.0)),
-        "curvature": float(payload.get("curvature", 0.0)),
         "confidence": float(payload.get("confidence", 0.0)),
         "is_lane_lost": int(bool(payload.get("is_lane_lost", False))),
     }

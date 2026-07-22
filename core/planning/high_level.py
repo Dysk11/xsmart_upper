@@ -58,15 +58,11 @@ class HighLevelPlanner:
 
         self.lateral_gain = float(config.get("lateral_gain", 0.065))
         self.heading_gain = float(config.get("heading_gain", 0.85))
-        self.curvature_gain = float(config.get("curvature_gain", 140.0))
         self.max_steer_deg = float(config.get("max_steer_deg", 28.0))
 
         self.base_speed = float(config.get("base_speed", 1.6))
         self.max_speed = float(config.get("max_speed", 2.2))
         self.min_speed = float(config.get("min_speed", 0.45))
-        self.straight_curvature_threshold = float(config.get("straight_curvature_threshold", 0.0025))
-        self.straight_boost_speed = float(config.get("straight_boost_speed", 0.2))
-        self.curvature_speed_gain = float(config.get("curvature_speed_gain", 120.0))
         self.heading_speed_gain = float(config.get("heading_speed_gain", 0.03))
         self.confidence_speed_gain = float(config.get("confidence_speed_gain", 0.7))
         self.caution_confidence_threshold = float(config.get("caution_confidence_threshold", 0.55))
@@ -108,22 +104,14 @@ class HighLevelPlanner:
             steer_deg = (
                 tracked_state.lateral_error_px * self.lateral_gain
                 + tracked_state.heading_error_deg * self.heading_gain
-                + tracked_state.curvature * self.curvature_gain
             )
             steer_deg = clamp(steer_deg, -self.max_steer_deg, self.max_steer_deg)
 
             target_speed = self.base_speed
-            target_speed -= abs(tracked_state.curvature) * self.curvature_speed_gain
             target_speed -= abs(tracked_state.heading_error_deg) * self.heading_speed_gain
             target_speed -= (1.0 - tracked_state.confidence) * self.confidence_speed_gain
 
-            if (
-                abs(tracked_state.curvature) < self.straight_curvature_threshold
-                and tracked_state.confidence >= self.caution_confidence_threshold
-            ):
-                target_speed += self.straight_boost_speed
-                mode = "CRUISE"
-            elif tracked_state.confidence < self.caution_confidence_threshold:
+            if tracked_state.confidence < self.caution_confidence_threshold:
                 mode = "CAUTION"
             else:
                 mode = "NORMAL"

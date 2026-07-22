@@ -32,7 +32,6 @@ def make_detector(**overrides) -> LaneDetector:
         "confidence": {
             "lost_threshold": 0.0,
             "expected_area_ratio": 0.01,
-            "residual_tolerance_px": 40.0,
         },
         "fork": {
             "corner_span_rows": 2,
@@ -46,8 +45,8 @@ def make_detector(**overrides) -> LaneDetector:
             "split_enter_ratio": 0.60,
             "split_exit_ratio": 0.35,
             "split_min_rows": 5,
-            "smoothness_residual_threshold_px": 3.0,
-            "smoothness_tie_margin_px": 0.1,
+            "roughness_threshold_px": 3.0,
+            "roughness_tie_margin_px": 0.1,
         },
     }
     for section, values in overrides.items():
@@ -147,27 +146,27 @@ def test_rejects_invalid_perspective_width_config(centerline, message) -> None:
 @pytest.mark.parametrize(
     ("fork", "message"),
     [
-        ({"smoothness_residual_threshold_px": 0.0}, "threshold_px"),
-        ({"smoothness_residual_threshold_px": float("inf")}, "threshold_px"),
-        ({"smoothness_tie_margin_px": -0.1}, "tie_margin_px"),
-        ({"smoothness_tie_margin_px": float("nan")}, "tie_margin_px"),
+        ({"roughness_threshold_px": 0.0}, "threshold_px"),
+        ({"roughness_threshold_px": float("inf")}, "threshold_px"),
+        ({"roughness_tie_margin_px": -0.1}, "tie_margin_px"),
+        ({"roughness_tie_margin_px": float("nan")}, "tie_margin_px"),
     ],
 )
-def test_rejects_invalid_fork_smoothness_config(fork, message) -> None:
+def test_rejects_invalid_fork_roughness_config(fork, message) -> None:
     with pytest.raises(ValueError, match=message):
         make_detector(fork=fork)
 
 
-def test_raw_candidate_residual_distinguishes_smooth_curves_from_jagged_lines() -> None:
+def test_second_difference_distinguishes_smooth_curves_from_jagged_lines() -> None:
     detector = make_detector()
     straight = [(50, y) for y in range(40)]
-    quadratic = [(int(round(50.0 + 0.02 * (y - 20) ** 2)), y) for y in range(40)]
+    gentle_curve = [(int(round(50.0 + 0.02 * (y - 20) ** 2)), y) for y in range(40)]
     jagged = [(50 + (4 if (y // 2) % 2 else -4), y) for y in range(40)]
 
-    assert detector._fork_smoothness_residual(straight) == pytest.approx(0.0)
-    assert detector._fork_smoothness_residual(quadratic) < 1.0
-    assert detector._fork_smoothness_residual(jagged) > 3.0
-    assert detector._fork_smoothness_residual([(50, 1), (50, 0)]) is None
+    assert detector._fork_roughness(straight) == pytest.approx(0.0)
+    assert detector._fork_roughness(gentle_curve) < 1.0
+    assert detector._fork_roughness(jagged) > 3.0
+    assert detector._fork_roughness([(50, 1), (50, 0)]) is None
 
 
 def test_explicit_direction_selects_inferred_left_or_right_centerline() -> None:
@@ -255,18 +254,18 @@ def test_single_rough_branch_is_hidden_and_smoother_branch_is_selected(
     assert fork.rejected_direction == rejected_direction
     assert getattr(fork, f"{rejected_direction}_centerline_points") == []
     assert getattr(fork, f"{expected_direction}_centerline_points")
-    assert "branch by smoothness" in fork.reason
+    assert "branch by roughness" in fork.reason
     assert f"rejected={rejected_direction}" in fork.reason
 
 
-def test_two_rough_branches_discard_the_one_with_larger_residual() -> None:
+def test_two_rough_branches_discard_the_one_with_larger_roughness() -> None:
     result = make_detector().detect_from_mask(
         make_rough_fork_mask(left_amplitude=8.0, right_amplitude=4.0),
         vehicle_center_x=40.0,
     )
     fork = result.fork_result
 
-    assert fork.left_smoothness_residual_px > fork.right_smoothness_residual_px > 3.0
+    assert fork.left_roughness_px > fork.right_roughness_px > 3.0
     assert fork.selected_direction == "right"
     assert fork.rejected_direction == "left"
     assert fork.left_centerline_points == []
@@ -280,10 +279,10 @@ def test_similarly_rough_branches_fall_back_to_frame_center_selection() -> None:
     )
     fork = result.fork_result
 
-    assert fork.left_smoothness_residual_px > 3.0
-    assert fork.right_smoothness_residual_px > 3.0
+    assert fork.left_roughness_px > 3.0
+    assert fork.right_roughness_px > 3.0
     assert abs(
-        fork.left_smoothness_residual_px - fork.right_smoothness_residual_px
+        fork.left_roughness_px - fork.right_roughness_px
     ) <= 0.1
     assert fork.selected_direction == "left"
     assert fork.rejected_direction is None
@@ -295,8 +294,8 @@ def test_similarly_rough_branches_fall_back_to_frame_center_selection() -> None:
 def test_threshold_is_strictly_greater_and_invalid_scores_fall_back() -> None:
     detector = make_detector()
 
-    assert detector._choose_fork_direction_by_smoothness(3.0, 0.0) == (None, None)
-    assert detector._choose_fork_direction_by_smoothness(None, 4.0) == (None, None)
+    assert detector._choose_fork_direction_by_roughness(3.0, 0.0) == (None, None)
+    assert detector._choose_fork_direction_by_roughness(None, 4.0) == (None, None)
 
 
 def test_requested_rough_branch_is_not_filtered() -> None:
@@ -307,14 +306,14 @@ def test_requested_rough_branch_is_not_filtered() -> None:
     )
     fork = result.fork_result
 
-    assert fork.left_smoothness_residual_px > 3.0
+    assert fork.left_roughness_px > 3.0
     assert fork.selected_direction == "left"
     assert fork.rejected_direction is None
     assert fork.left_centerline_points
     assert "branch (requested)" in fork.reason
 
 
-def test_held_branch_is_not_reconsidered_by_smoothness() -> None:
+def test_held_branch_is_not_reconsidered_by_roughness() -> None:
     detector = make_detector()
 
     first = detector.detect_from_mask(make_fork_mask(), vehicle_center_x=40.0)
@@ -324,7 +323,7 @@ def test_held_branch_is_not_reconsidered_by_smoothness() -> None:
     )
 
     assert first.fork_result.selected_direction == "left"
-    assert held.fork_result.left_smoothness_residual_px > 3.0
+    assert held.fork_result.left_roughness_px > 3.0
     assert held.fork_result.selected_direction == "left"
     assert held.fork_result.rejected_direction is None
     assert held.fork_result.left_centerline_points

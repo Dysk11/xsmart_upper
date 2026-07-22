@@ -16,7 +16,6 @@ class TrackedLaneState:
     centerline_points: List[Tuple[int, int]]
     lateral_error_px: float
     heading_error_deg: float
-    curvature: float
     confidence: float
     is_lane_lost: bool
     lane_lost_count: int
@@ -51,7 +50,6 @@ class LaneTracker:
             centerline_points=[],
             lateral_error_px=0.0,
             heading_error_deg=0.0,
-            curvature=0.0,
             confidence=0.0,
             is_lane_lost=True,
             lane_lost_count=0,
@@ -67,7 +65,7 @@ class LaneTracker:
             detection_result: 单帧检测器输出结果。
 
         输出:
-            返回 TrackedLaneState，包含平滑后的误差、曲率、置信度与丢线计数。
+            返回 TrackedLaneState，包含平滑后的误差、置信度与丢线计数。
         """
 
         if not detection_result.is_lane_lost and detection_result.confidence >= self.confidence_gate:
@@ -108,7 +106,6 @@ class LaneTracker:
                 centerline_points=list(self.last_valid_centerline),
                 lateral_error_px=self.state.lateral_error_px * decay,
                 heading_error_deg=self.state.heading_error_deg * decay,
-                curvature=self.state.curvature * decay,
                 confidence=max(self.min_prediction_confidence, self.state.confidence * decay),
                 is_lane_lost=True,
                 lane_lost_count=self.state.lane_lost_count,
@@ -124,7 +121,6 @@ class LaneTracker:
                 centerline_points=list(self.last_valid_centerline),
                 lateral_error_px=self.state.lateral_error_px * decay,
                 heading_error_deg=self.state.heading_error_deg * decay,
-                curvature=self.state.curvature * decay,
                 confidence=0.0,
                 is_lane_lost=True,
                 lane_lost_count=self.state.lane_lost_count,
@@ -137,7 +133,6 @@ class LaneTracker:
             centerline_points=[],
             lateral_error_px=0.0,
             heading_error_deg=0.0,
-            curvature=0.0,
             confidence=0.0,
             is_lane_lost=True,
             lane_lost_count=self.state.lane_lost_count,
@@ -166,7 +161,6 @@ class LaneTracker:
                 centerline_points=list(detection_result.centerline_points),
                 lateral_error_px=detection_result.lateral_error_px,
                 heading_error_deg=detection_result.heading_error_deg,
-                curvature=detection_result.curvature,
                 confidence=detection_result.confidence,
                 is_lane_lost=False,
                 lane_lost_count=0,
@@ -185,7 +179,6 @@ class LaneTracker:
             centerline_points=smoothed_centerline,
             lateral_error_px=ema(self.state.lateral_error_px, detection_result.lateral_error_px, alpha),
             heading_error_deg=ema(self.state.heading_error_deg, detection_result.heading_error_deg, alpha),
-            curvature=ema(self.state.curvature, detection_result.curvature, alpha),
             confidence=ema(self.state.confidence, detection_result.confidence, alpha),
             is_lane_lost=False,
             lane_lost_count=0,

@@ -11,10 +11,6 @@ import numpy as np
 
 from utils.math_utils import (
     clamp,
-    compute_curvature,
-    evaluate_poly,
-    mean_abs_residual,
-    polyfit_with_fallback,
     safe_divide,
 )
 
@@ -34,8 +30,8 @@ class ForkLaneResult:
     left_corner: Tuple[int, int] | None = None
     right_corner: Tuple[int, int] | None = None
     confirm_frames: int = 0
-    left_smoothness_residual_px: float | None = None
-    right_smoothness_residual_px: float | None = None
+    left_roughness_px: float | None = None
+    right_roughness_px: float | None = None
     rejected_direction: str | None = None
 
 
@@ -46,12 +42,10 @@ class LaneDetectionResult:
     centerline_points: List[Tuple[int, int]]
     lateral_error_px: float
     heading_error_deg: float
-    curvature: float
     confidence: float
     is_lane_lost: bool
     mask: np.ndarray
     filtered_mask: np.ndarray
-    fit_coeffs: Optional[np.ndarray]
     lane_width_px: float
     valid_row_count: int
     fit_point_count: int
@@ -114,7 +108,7 @@ class LaneDetector:
     """使用传统视觉方法检测蓝色航道中心线。"""
 
     def __init__(self, config: Dict[str, Any]) -> None:
-        """读取阈值与拟合参数并初始化检测器。
+        """读取车道几何与过滤参数并初始化检测器。
 
         输入:
             config: lane_detector 对应配置字典。
@@ -158,12 +152,10 @@ class LaneDetector:
         self.single_side_edge_margin_px = int(
             self.centerline_config.get("single_side_edge_margin_px", 28)
         )
-        self.prediction_blend = float(self.centerline_config.get("prediction_blend", 0.2))
         self.distance_weight = float(self.centerline_config.get("distance_weight", 0.12))
         self.center_bias = float(self.centerline_config.get("center_bias", 0.02))
         self.lookahead_ratio = float(self.centerline_config.get("lookahead_ratio", 0.45))
         self.max_center_jump_px = float(self.centerline_config.get("max_center_jump_px", 120.0))
-        self.fit_top_extension_rows = int(self.centerline_config.get("fit_top_extension_rows", 1))
         # 箭头赛道不是连续实线，连通域内部会有“宽头 + 窄颈”结构。
         # 这里优先在组件内部找更窄、更靠上的锚点，避免中心线钻进底部尖角。
         self.anchor_sample_ratios = (0.35, 0.45, 0.55)
@@ -209,9 +201,6 @@ class LaneDetector:
         )
         self.lost_threshold = float(self.confidence_config.get("lost_threshold", 0.28))
         self.expected_area_ratio = float(self.confidence_config.get("expected_area_ratio", 0.08))
-        self.residual_tolerance_px = float(self.confidence_config.get("residual_tolerance_px", 18.0))
-
-        self.last_fit_coeffs: Optional[np.ndarray] = None
         self.last_lane_width_px = self.default_lane_width_px
         self.last_centerline_points: List[Tuple[int, int]] = []
         boundary_config = config.get("boundary", {})
@@ -244,11 +233,11 @@ class LaneDetector:
         self.fork_split_enter_ratio = float(fork_config.get("split_enter_ratio", 0.60))
         self.fork_split_exit_ratio = float(fork_config.get("split_exit_ratio", 0.35))
         self.fork_split_min_rows = max(1, int(fork_config.get("split_min_rows", 5)))
-        self.fork_smoothness_residual_threshold_px = float(
-            fork_config.get("smoothness_residual_threshold_px", 3.0)
+        self.fork_roughness_threshold_px = float(
+            fork_config.get("roughness_threshold_px", 3.0)
         )
-        self.fork_smoothness_tie_margin_px = float(
-            fork_config.get("smoothness_tie_margin_px", 0.1)
+        self.fork_roughness_tie_margin_px = float(
+            fork_config.get("roughness_tie_margin_px", 0.1)
         )
         if self.fork_split_enter_ratio <= 0.0:
             raise ValueError("fork.split_enter_ratio must be greater than zero")
@@ -257,18 +246,18 @@ class LaneDetector:
         if self.fork_split_exit_ratio >= self.fork_split_enter_ratio:
             raise ValueError("fork.split_exit_ratio must be less than fork.split_enter_ratio")
         if (
-            not math.isfinite(self.fork_smoothness_residual_threshold_px)
-            or self.fork_smoothness_residual_threshold_px <= 0.0
+            not math.isfinite(self.fork_roughness_threshold_px)
+            or self.fork_roughness_threshold_px <= 0.0
         ):
             raise ValueError(
-                "fork.smoothness_residual_threshold_px must be finite and greater than zero"
+                "fork.roughness_threshold_px must be finite and greater than zero"
             )
         if (
-            not math.isfinite(self.fork_smoothness_tie_margin_px)
-            or self.fork_smoothness_tie_margin_px < 0.0
+            not math.isfinite(self.fork_roughness_tie_margin_px)
+            or self.fork_roughness_tie_margin_px < 0.0
         ):
             raise ValueError(
-                "fork.smoothness_tie_margin_px must be finite and not negative"
+                "fork.roughness_tie_margin_px must be finite and not negative"
             )
         self.temporal_weights = tuple(float(v) for v in temporal_config.get("weights", [0.20, 0.50, 0.30]))
         if len(self.temporal_weights) != 3 or sum(self.temporal_weights) <= 0:
@@ -288,7 +277,7 @@ class LaneDetector:
             roi_frame: 经过预处理后的 ROI BGR 图像。
 
         输出:
-            返回 LaneDetectionResult，包含中心线、误差、曲率、置信度和调试掩膜。
+            返回 LaneDetectionResult，包含中心线、误差、置信度和调试掩膜。
         """
 
         if roi_frame.size == 0:
@@ -323,74 +312,6 @@ class LaneDetector:
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
             segmentation_instance_count=segmentation_instance_count,
-        )
-
-        # Legacy connected-component implementation is intentionally unreachable.
-        # 先提取所有可用蓝色连通域，再从中选出“沿地面连续前进”的主链条。
-        labels, candidate_components = self._extract_candidate_components(mask)
-        branch_result = self._select_components_for_route(
-            components=candidate_components,
-            shape=mask.shape,
-            route_direction=route_direction,
-        )
-        selected_components = branch_result.selected_components
-        selected_mask = self._build_mask_from_components(labels, selected_components)
-        # 当主链条太短时，不要让调试窗口里整片蓝箭头忽隐忽现，先显示全部候选区域。
-        filtered_mask = selected_mask if len(selected_components) >= 2 else mask
-
-        # 优先使用“箭头块内部锚点链 + 折线插值”生成中心线。
-        # 这样能显著减少二次曲线在尖角处钻出、再突然跳到下一块箭头的情况。
-        support_points = self._build_support_points_from_components(selected_components, mask.shape)
-        centerline_points = self._build_polyline_centerline(support_points, filtered_mask.shape)
-        lane_width_px = self._estimate_lane_width_from_components(selected_components)
-
-        # 如果组件链不够稳定，再退回到逐行扫描作为兜底方案。
-        if len(centerline_points) < self.min_valid_points:
-            fallback_mask = selected_mask if cv2.countNonZero(selected_mask) > 0 else mask
-            raw_points, lane_width_px = self._extract_centerline(fallback_mask)
-            centerline_points = self._filter_centerline_points(raw_points)
-            support_points = list(centerline_points)
-
-        # 曲线拟合只用于提取曲率和做少量历史预测，显示与控制主链路改用折线，避免拟合翻折。
-        fit_coeffs = self._fit_centerline(centerline_points)
-
-        # 根据中心线计算车辆当前最关心的三个量：横向误差、航向误差、曲率。
-        lateral_error_px, heading_error_deg, curvature = self._compute_lane_metrics(
-            centerline_points=centerline_points,
-            fit_coeffs=fit_coeffs,
-            shape=filtered_mask.shape,
-            support_points=support_points,
-        )
-        # 置信度用于告诉后面的跟踪器和规划器：这帧结果到底靠不靠谱。
-        confidence = self._estimate_confidence(
-            filtered_mask=filtered_mask,
-            raw_points=centerline_points,
-            fit_coeffs=fit_coeffs,
-            lane_width_px=lane_width_px,
-        )
-        is_lane_lost = len(centerline_points) < max(2, self.min_valid_points // 2) or confidence < self.lost_threshold
-
-        if not is_lane_lost and centerline_points:
-            self.last_fit_coeffs = fit_coeffs
-            self.last_lane_width_px = lane_width_px
-            self.last_centerline_points = centerline_points
-
-        return LaneDetectionResult(
-            centerline_points=centerline_points,
-            lateral_error_px=lateral_error_px,
-            heading_error_deg=heading_error_deg,
-            curvature=curvature,
-            confidence=confidence,
-            is_lane_lost=is_lane_lost,
-            mask=mask,
-            filtered_mask=filtered_mask,
-            fit_coeffs=fit_coeffs,
-            lane_width_px=lane_width_px,
-            valid_row_count=len(selected_components),
-            fit_point_count=len(centerline_points),
-            fork_result=branch_result.fork_result,
-            segmentation_confidence=segmentation_confidence,
-            segmentation_status=segmentation_status,
         )
 
     def _detect_from_boundaries(
@@ -463,20 +384,20 @@ class LaneDetector:
             fork_result.right_centerline_points = self._smooth_article_centerline(
                 right_candidate_points, mask.shape[1]
             )
-            left_smoothness_residual = self._fork_smoothness_residual(
+            left_roughness = self._fork_roughness(
                 left_candidate_points
             )
-            right_smoothness_residual = self._fork_smoothness_residual(
+            right_roughness = self._fork_roughness(
                 right_candidate_points
             )
-            fork_result.left_smoothness_residual_px = left_smoothness_residual
-            fork_result.right_smoothness_residual_px = right_smoothness_residual
+            fork_result.left_roughness_px = left_roughness
+            fork_result.right_roughness_px = right_roughness
             if outer_left_points and outer_right_points:
                 display_left_points = outer_left_points
                 display_right_points = outer_right_points
 
             center_distance_scores: tuple[float, float] | None = None
-            smoothness_selected_direction: str | None = None
+            roughness_selected_direction: str | None = None
             if requested_direction is not None:
                 self._held_fork_direction = requested_direction
             elif (
@@ -485,11 +406,11 @@ class LaneDetector:
                 and right_candidate_points
             ):
                 (
-                    smoothness_selected_direction,
+                    roughness_selected_direction,
                     rejected_direction,
-                ) = self._choose_fork_direction_by_smoothness(
-                    left_smoothness_residual,
-                    right_smoothness_residual,
+                ) = self._choose_fork_direction_by_roughness(
+                    left_roughness,
+                    right_roughness,
                 )
                 fork_result.rejected_direction = rejected_direction
                 if rejected_direction == "left":
@@ -497,8 +418,8 @@ class LaneDetector:
                 elif rejected_direction == "right":
                     fork_result.right_centerline_points = []
 
-                if smoothness_selected_direction is not None:
-                    self._held_fork_direction = smoothness_selected_direction
+                if roughness_selected_direction is not None:
+                    self._held_fork_direction = roughness_selected_direction
                 else:
                     (
                         current_direction,
@@ -513,13 +434,13 @@ class LaneDetector:
                     if current_direction is not None:
                         self._held_fork_direction = current_direction
 
-            def format_residual(value: float | None) -> str:
+            def format_roughness(value: float | None) -> str:
                 return "n/a" if value is None else f"{value:.2f}px"
 
-            smoothness_debug = (
-                f"smoothness left={format_residual(left_smoothness_residual)} "
-                f"right={format_residual(right_smoothness_residual)} "
-                f"threshold={self.fork_smoothness_residual_threshold_px:.2f}px "
+            roughness_debug = (
+                f"roughness left={format_roughness(left_roughness)} "
+                f"right={format_roughness(right_roughness)} "
+                f"threshold={self.fork_roughness_threshold_px:.2f}px "
                 f"rejected={fork_result.rejected_direction or 'none'}"
             )
 
@@ -545,21 +466,21 @@ class LaneDetector:
                 )
                 if requested_direction is not None:
                     fork_result.reason = (
-                        f"selected {selected_direction} branch (requested); {smoothness_debug}"
+                        f"selected {selected_direction} branch (requested); {roughness_debug}"
                     )
-                elif smoothness_selected_direction is not None:
+                elif roughness_selected_direction is not None:
                     fork_result.reason = (
-                        f"selected {selected_direction} branch by smoothness; {smoothness_debug}"
+                        f"selected {selected_direction} branch by roughness; {roughness_debug}"
                     )
                 elif center_distance_scores is not None:
                     fork_result.reason = (
                         f"selected {selected_direction} branch by frame center "
                         f"left={center_distance_scores[0]:.2f}px "
-                        f"right={center_distance_scores[1]:.2f}px; {smoothness_debug}"
+                        f"right={center_distance_scores[1]:.2f}px; {roughness_debug}"
                     )
                 else:
                     fork_result.reason = (
-                        f"selected {selected_direction} branch (held); {smoothness_debug}"
+                        f"selected {selected_direction} branch (held); {roughness_debug}"
                     )
             elif selected_direction is not None:
                 raw_centers = self._merge_fork_centerline(
@@ -580,11 +501,11 @@ class LaneDetector:
                         f"left={center_distance_scores[0]:.2f}px "
                         f"right={center_distance_scores[1]:.2f}px "
                         f"margin={CURRENT_ROUTE_DISTANCE_MARGIN_PX:.2f}px; "
-                        f"{smoothness_debug}"
+                        f"{roughness_debug}"
                     )
                 else:
                     fork_result.reason = (
-                        f"fork shared region; following normal centerline; {smoothness_debug}"
+                        f"fork shared region; following normal centerline; {roughness_debug}"
                     )
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
@@ -596,21 +517,18 @@ class LaneDetector:
                 fork_result.reason = track_hold_reason
         else:
             self._reset_pending_track_switch()
-        fit_coeffs = self._fit_centerline(centerline_points)
         widths = [right[0] - left[0] for left, right in zip(left_points, right_points) if right[0] > left[0]]
         lane_width_px = float(np.median(widths)) if widths else self.last_lane_width_px
-        lateral_error_px, heading_error_deg, curvature = self._article_metrics(
-            centerline_points, fit_coeffs, mask.shape
+        lateral_error_px, heading_error_deg = self._article_metrics(
+            centerline_points, mask.shape
         )
         confidence = self._estimate_confidence(
             selected_mask,
             centerline_points,
-            fit_coeffs,
             lane_width_px,
         )
         is_lane_lost = len(centerline_points) < max(2, self.min_valid_points // 2) or confidence < self.lost_threshold
         if not is_lane_lost and centerline_points:
-            self.last_fit_coeffs = fit_coeffs
             self.last_lane_width_px = lane_width_px
             self.last_centerline_points = centerline_points
 
@@ -618,12 +536,10 @@ class LaneDetector:
             centerline_points=centerline_points,
             lateral_error_px=lateral_error_px,
             heading_error_deg=heading_error_deg,
-            curvature=curvature,
             confidence=confidence,
             is_lane_lost=is_lane_lost,
             mask=mask,
             filtered_mask=selected_mask,
-            fit_coeffs=fit_coeffs,
             lane_width_px=lane_width_px,
             valid_row_count=len(raw_centers),
             fit_point_count=len(centerline_points),
@@ -754,30 +670,20 @@ class LaneDetector:
         direction = "left" if left_score < right_score else "right"
         return direction, left_score, right_score
 
-    def _fork_smoothness_residual(
+    def _fork_roughness(
         self,
         candidate_points: Sequence[Tuple[int, int]],
     ) -> float | None:
-        """Measure raw candidate roughness as its mean residual from a quadratic fit."""
+        """Measure raw candidate roughness using mean absolute second differences."""
 
-        return self._polyline_smoothness_residual(candidate_points, min_points=3)
-
-    def _polyline_smoothness_residual(
-        self,
-        points: Sequence[Tuple[int, int]],
-        min_points: int,
-    ) -> float | None:
-        """Return quadratic mean absolute residual for a sufficiently long polyline."""
-
-        if len(points) < max(3, int(min_points)):
+        if len(candidate_points) < 3:
             return None
-        x_values = [float(x) for x, _y in points]
-        y_values = [float(y) for _x, y in points]
-        fit_coeffs = polyfit_with_fallback(y_values, x_values, degree=2)
-        if fit_coeffs is None:
-            return None
-        residual = mean_abs_residual(fit_coeffs, y_values, x_values)
-        return float(residual) if math.isfinite(residual) else None
+        x_values = np.asarray(
+            [float(x) for x, _y in candidate_points],
+            dtype=np.float32,
+        )
+        second_differences = x_values[:-2] - 2.0 * x_values[1:-1] + x_values[2:]
+        return float(np.mean(np.abs(second_differences)))
 
     def _apply_roi_edge_single_side_fallback(
         self,
@@ -822,27 +728,27 @@ class LaneDetector:
             )
         return rebuilt
 
-    def _choose_fork_direction_by_smoothness(
+    def _choose_fork_direction_by_roughness(
         self,
-        left_residual: float | None,
-        right_residual: float | None,
+        left_roughness: float | None,
+        right_roughness: float | None,
     ) -> tuple[str | None, str | None]:
         """Reject a clearly rougher branch before automatic frame-center selection."""
 
-        if left_residual is None or right_residual is None:
+        if left_roughness is None or right_roughness is None:
             return None, None
 
-        threshold = self.fork_smoothness_residual_threshold_px
-        left_rough = left_residual > threshold
-        right_rough = right_residual > threshold
+        threshold = self.fork_roughness_threshold_px
+        left_rough = left_roughness > threshold
+        right_rough = right_roughness > threshold
         if left_rough and not right_rough:
             return "right", "left"
         if right_rough and not left_rough:
             return "left", "right"
         if left_rough and right_rough:
-            if abs(left_residual - right_residual) <= self.fork_smoothness_tie_margin_px:
+            if abs(left_roughness - right_roughness) <= self.fork_roughness_tie_margin_px:
                 return None, None
-            if left_residual > right_residual:
+            if left_roughness > right_roughness:
                 return "right", "left"
             return "left", "right"
         return None, None
@@ -1071,10 +977,10 @@ class LaneDetector:
                 smoothed.append((int(round(mean_x)), y))
         return smoothed
 
-    def _article_metrics(self, centerline_points, fit_coeffs, shape):
+    def _article_metrics(self, centerline_points, shape):
         height, width = shape[:2]
         if not centerline_points:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0
         weighted_sum = 0.0
         weight_sum = 0.0
         for x, y in centerline_points:
@@ -1094,7 +1000,7 @@ class LaneDetector:
         lookahead_index = min(len(ordered) - 1, max(1, int(len(ordered) * self.lookahead_ratio)))
         lookahead_x, lookahead_y = ordered[lookahead_index]
         heading = math.degrees(math.atan2(lookahead_x - bottom_x, max(1, bottom_y - lookahead_y)))
-        return float(weighted_center - width * 0.5), float(heading), float(compute_curvature(fit_coeffs, bottom_y))
+        return float(weighted_center - width * 0.5), float(heading)
 
     def _geometric_fork_result(
         self, left_points, right_points, left_lost, right_lost,
@@ -1805,10 +1711,6 @@ class LaneDetector:
             返回预测的横向位置。
         """
 
-        history_prediction: Optional[float] = None
-        if self.last_fit_coeffs is not None:
-            history_prediction = float(evaluate_poly(self.last_fit_coeffs, [target_y])[0])
-
         if len(chain_points) >= 2:
             x1, y1 = chain_points[-2]
             x2, y2 = chain_points[-1]
@@ -1822,15 +1724,7 @@ class LaneDetector:
         else:
             chain_prediction = float(image_center if image_center is not None else 0.0)
 
-        if history_prediction is None:
-            return chain_prediction
-        if not chain_points:
-            return history_prediction
-
-        return float(
-            chain_prediction * (1.0 - self.prediction_blend)
-            + history_prediction * self.prediction_blend
-        )
+        return chain_prediction
 
     def _build_mask_from_components(
         self,
@@ -1857,14 +1751,14 @@ class LaneDetector:
         components: Sequence[LaneComponent],
         shape: Tuple[int, int],
     ) -> List[Tuple[int, int]]:
-        """从主航道组件链中提取用于拟合的支撑点。
+        """从主航道组件链中提取用于构建折线的支撑点。
 
         输入:
             components: 按从下往上排序的主航道组件链。
             shape: 当前 ROI 尺寸，格式为 (高, 宽)。
 
         输出:
-            返回用于拟合中心线的支撑点列表，顺序为从下往上。
+            返回用于构建中心线的支撑点列表，顺序为从下往上。
         """
 
         if not components:
@@ -2000,12 +1894,7 @@ class LaneDetector:
             if not segments:
                 continue
 
-            # 优先参考上一帧拟合结果，帮助当前行在遮挡、断裂时少跑偏。
-            predicted_center: Optional[float] = None
-            if self.last_fit_coeffs is not None:
-                predicted_center = float(evaluate_poly(self.last_fit_coeffs, [y])[0])
-            elif previous_center is not None:
-                predicted_center = previous_center
+            predicted_center = previous_center
 
             start, end = self._select_best_segment(segments, predicted_center, width)
             segment_width = float(end - start + 1)
@@ -2055,7 +1944,7 @@ class LaneDetector:
         self,
         raw_points: Sequence[Tuple[int, int]],
     ) -> List[Tuple[int, int]]:
-        """根据行间连续性筛掉容易导致拟合翻折的离群点。
+        """根据行间连续性筛掉横向跳变的离群点。
 
         输入:
             raw_points: 原始中心线点集，顺序为从下往上。
@@ -2082,12 +1971,6 @@ class LaneDetector:
                 filtered_points.append((x, y))
                 previous_x = current_x
                 continue
-
-            if self.last_fit_coeffs is not None:
-                predicted_x = float(evaluate_poly(self.last_fit_coeffs, [y])[0])
-                if abs(current_x - predicted_x) <= max_jump:
-                    filtered_points.append((x, y))
-                    previous_x = current_x
 
         if len(filtered_points) < max(2, self.min_valid_points // 2):
             return list(raw_points)
@@ -2162,144 +2045,17 @@ class LaneDetector:
 
         return best_segment
 
-    def _fit_centerline(self, raw_points: Sequence[Tuple[int, int]]) -> Optional[np.ndarray]:
-        """对原始中心线点集进行二次曲线拟合。
-
-        输入:
-            raw_points: 原始中心线点集，格式为 [(x, y), ...]。
-
-        输出:
-            返回二次曲线系数数组 [a, b, c]；若点数不足则可能返回低阶退化结果或 None。
-        """
-
-        if not raw_points:
-            return None
-
-        x_values = [point[0] for point in raw_points]
-        y_values = [point[1] for point in raw_points]
-        return polyfit_with_fallback(y_values=y_values, x_values=x_values, degree=2)
-
-    def _generate_centerline_points(
-        self,
-        fit_coeffs: Optional[np.ndarray],
-        shape: Tuple[int, int],
-        support_points: Sequence[Tuple[int, int]],
-    ) -> List[Tuple[int, int]]:
-        """根据拟合曲线重新采样得到更平滑的中心线点集。
-
-        输入:
-            fit_coeffs: 拟合得到的曲线系数。
-            shape: 当前 ROI 掩膜尺寸，格式为 (高, 宽)。
-            support_points: 真正参与拟合的中心线点集。
-
-        输出:
-            返回平滑后的中心线点集。
-        """
-
-        if fit_coeffs is None or not support_points:
-            return []
-
-        _, width = shape[:2]
-        support_y_values = [point[1] for point in support_points]
-        bottom_y = max(support_y_values)
-        top_y = max(0, min(support_y_values) - self.fit_top_extension_rows * self.scan_step)
-
-        points: List[Tuple[int, int]] = []
-        for y in range(bottom_y, top_y - 1, -self.scan_step):
-            x = float(evaluate_poly(fit_coeffs, [y])[0])
-            x = clamp(x, 0.0, width - 1.0)
-            points.append((int(round(x)), int(y)))
-        return points
-
-    def _compute_lane_metrics(
-        self,
-        centerline_points: Sequence[Tuple[int, int]],
-        fit_coeffs: Optional[np.ndarray],
-        shape: Tuple[int, int],
-        support_points: Sequence[Tuple[int, int]],
-    ) -> Tuple[float, float, float]:
-        """根据中心线计算横向误差、航向误差与曲率。
-
-        输入:
-            centerline_points: 平滑后的中心线点集。
-            fit_coeffs: 中心线拟合系数。
-            shape: 当前 ROI 尺寸，格式为 (高, 宽)。
-            support_points: 真正参与拟合的中心线点集。
-
-        输出:
-            返回三元组 (lateral_error_px, heading_error_deg, curvature)。
-        """
-
-        _, width = shape[:2]
-        if not centerline_points or not support_points:
-            return 0.0, 0.0, 0.0
-
-        support_y_values = [point[1] for point in support_points]
-        bottom_y = max(support_y_values)
-        top_y = min(support_y_values)
-        support_span = max(self.scan_step * 2, bottom_y - top_y)
-        lookahead_distance = max(self.scan_step * 2, int(support_span * self.lookahead_ratio))
-        lookahead_y = max(top_y, bottom_y - lookahead_distance)
-        image_center_x = width * 0.5
-
-        bottom_x = float(centerline_points[0][0])
-        lookahead_x = self._sample_centerline_x(centerline_points, lookahead_y)
-
-        lateral_error_px = bottom_x - image_center_x
-        heading_error_deg = math.degrees(
-            math.atan2(lookahead_x - bottom_x, max(1.0, bottom_y - lookahead_y))
-        )
-        curvature = compute_curvature(fit_coeffs, bottom_y)
-        return float(lateral_error_px), float(heading_error_deg), float(curvature)
-
-    def _sample_centerline_x(
-        self,
-        centerline_points: Sequence[Tuple[int, int]],
-        target_y: int,
-    ) -> float:
-        """按目标纵坐标在中心线上插值采样横坐标。
-
-        输入:
-            centerline_points: 按从下往上排序的中心线点集。
-            target_y: 需要采样的目标纵坐标。
-
-        输出:
-            返回插值得到的横坐标。
-        """
-
-        if not centerline_points:
-            return 0.0
-        if len(centerline_points) == 1:
-            return float(centerline_points[0][0])
-
-        ordered_points = sorted(centerline_points, key=lambda item: item[1], reverse=True)
-        if target_y >= ordered_points[0][1]:
-            return float(ordered_points[0][0])
-        if target_y <= ordered_points[-1][1]:
-            return float(ordered_points[-1][0])
-
-        for index in range(len(ordered_points) - 1):
-            x1, y1 = ordered_points[index]
-            x2, y2 = ordered_points[index + 1]
-            if y1 >= target_y >= y2 and y1 != y2:
-                ratio = safe_divide(float(target_y - y1), float(y2 - y1), default=0.0)
-                return float(x1 + (x2 - x1) * ratio)
-
-        return float(ordered_points[-1][0])
-
     def _estimate_confidence(
         self,
         filtered_mask: np.ndarray,
         raw_points: Sequence[Tuple[int, int]],
-        fit_coeffs: Optional[np.ndarray],
         lane_width_px: float,
     ) -> float:
-        """综合覆盖率、拟合残差与面积特征估计当前检测置信度。
+        """综合有效行、掩膜面积与车道宽度估计当前检测置信度。
 
         输入:
             filtered_mask: 筛选后的主航道掩膜。
             raw_points: 原始中心线点集。
-            fit_coeffs: 中心线拟合系数。
             lane_width_px: 当前帧估计的航道宽度。
 
         输出:
@@ -2321,23 +2077,14 @@ class LaneDetector:
             overflow_ratio = safe_divide(non_zero_pixels - expected_area * 3.0, height * width, default=0.0)
             area_score *= clamp(1.0 - overflow_ratio * 4.0, 0.2, 1.0)
 
-        if fit_coeffs is not None and raw_points:
-            x_values = [point[0] for point in raw_points]
-            y_values = [point[1] for point in raw_points]
-            residual = mean_abs_residual(fit_coeffs, y_values=y_values, x_values=x_values)
-            fit_score = clamp(1.0 - residual / max(self.residual_tolerance_px, 1.0), 0.0, 1.0)
-        else:
-            fit_score = 0.0
-
         width_score = clamp(lane_width_px / max(self.default_lane_width_px, 1.0), 0.0, 1.0)
         if lane_width_px > self.default_lane_width_px * 1.8:
             width_score *= 0.7
 
         confidence = (
-            0.45 * row_score
-            + 0.25 * fit_score
-            + 0.20 * area_score
-            + 0.10 * width_score
+            0.60 * row_score
+            + (4.0 / 15.0) * area_score
+            + (2.0 / 15.0) * width_score
         )
         if len(raw_points) < self.min_valid_points:
             confidence *= 0.6
@@ -2359,12 +2106,10 @@ class LaneDetector:
             centerline_points=[],
             lateral_error_px=0.0,
             heading_error_deg=0.0,
-            curvature=0.0,
             confidence=0.0,
             is_lane_lost=True,
             mask=mask,
             filtered_mask=mask.copy(),
-            fit_coeffs=None,
             lane_width_px=self.last_lane_width_px,
             valid_row_count=0,
             fit_point_count=0,

@@ -43,7 +43,6 @@ class TargetSelector:
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
-        curvature: float,
         shifted_centerline_points: Sequence[Tuple[float, float]] | None = None,
     ) -> TargetPointResult:
         points = self._sort_near_to_far(shifted_centerline_points or centerline_points)
@@ -62,9 +61,6 @@ class TargetSelector:
                 reason="lost: no centerline points",
             )
 
-        # Keep curvature in the public call signature for compatibility. Target
-        # height is intentionally independent of curvature and lane confidence.
-        _ = curvature
         target_y = clamp(self.fixed_target_y, 0.0, float(max(0, roi_height - 1)))
         target, target_index, sample_reason = self._sample_at_fixed_y(
             points=points,
