@@ -36,6 +36,7 @@ class Visualizer:
 
         self.show_window = bool(config.get("show_window", True))
         self.window_name = str(config.get("window_name", "X-SmartCar Upper"))
+        self.debug_window_name = str(config.get("debug_window_name", "X-SmartCar Debug"))
         self.save_video = bool(config.get("save_video", False))
         self.record_without_ui = bool(config.get("record_without_ui", False))
         self.save_screenshot = bool(config.get("save_screenshot", True))
@@ -106,6 +107,18 @@ class Visualizer:
 
         if self.show_window:
             cv2.imshow(self.window_name, canvas)
+            debug_panel = self._build_debug_panel(
+                width=frame.shape[1],
+                avoidance_result=avoidance_result,
+                blocking_result=blocking_result,
+                control_command=control_command,
+                fps_value=fps_value,
+                gold_result=gold_result,
+                path_marker_result=path_marker_result,
+                detection_result=detection_result,
+                ocr_result=ocr_result,
+            )
+            cv2.imshow(self.debug_window_name, debug_panel)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 return False
@@ -299,18 +312,7 @@ class Visualizer:
                 roi_offset=(x1, y1),
                 roi_height=y2 - y1,
             )
-        debug_panel = self._build_debug_panel(
-            width=original_panel.shape[1],
-            avoidance_result=avoidance_result,
-            blocking_result=blocking_result,
-            control_command=control_command,
-            fps_value=fps_value,
-            gold_result=gold_result,
-            path_marker_result=path_marker_result,
-            detection_result=detection_result,
-            ocr_result=ocr_result,
-        )
-        return np.vstack((original_panel, debug_panel))
+        return original_panel
 
     def _overlay_roi_mask(
         self,

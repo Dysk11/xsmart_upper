@@ -127,7 +127,8 @@ camera:
 ### 6. `visualizer`
 
 - `show_window`: 是否显示调试窗口
-- `debug_panel_font_size`: 底部双列调试面板字号，默认 `18`；长状态和原因会按面板列宽自动换行
+- `debug_window_name`: 独立调试信息窗口的名称
+- `debug_panel_font_size`: 独立调试窗口的双列面板字号，默认 `18`；长状态和原因会按面板列宽自动换行
 - `save_video`: 是否保存调试视频
 - `record_without_ui`: 是否只把摄像头原始画面写入视频；不影响窗口继续显示完整 UI 标注，缺省为 `false`
 - `save_screenshot`: 是否允许按 `s` 保存截图

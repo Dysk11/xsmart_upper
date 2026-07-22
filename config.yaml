@@ -52,10 +52,10 @@ lane_geometry:
     scan_step: 4
     min_valid_points: 6
     default_lane_width_px: 60
-    perspective_width_top_px: 74
-    perspective_width_bottom_px: 250
+    perspective_width_top_px: 75
+    perspective_width_bottom_px: 260
     enable_boundary_smoothness_fallback: true
-    boundary_smoothness_residual_threshold_px: 3.0
+    boundary_smoothness_residual_threshold_px: 2.0
     boundary_smoothness_tie_margin_px: 0.1
     boundary_smoothness_confirm_frames: 2
     lookahead_ratio: 0.45
@@ -114,8 +114,8 @@ ocr:
   core_mask: NPU_CORE_1
   class_names: [road_sign]
   bbox_min_confidence: 0.50
-  bbox_min_width_px: 140
-  bbox_min_height_px: 70
+  bbox_min_width_px: 100
+  bbox_min_height_px: 50
   bbox_padding_ratio: 0.10
   input_width: 480
   input_height: 480
@@ -218,6 +218,7 @@ bridge:
 visualizer:
   show_window: true
   window_name: X-SmartCar Upper
+  debug_window_name: X-SmartCar Debug
   font_path: "C:/Windows/Fonts/msyh.ttc"
   font_size: 22
   debug_panel_font_size: 18

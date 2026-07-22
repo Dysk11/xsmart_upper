@@ -46,7 +46,8 @@ def test_raw_recording_keeps_annotated_window(
     frame = np.full((4, 6, 3), 10, dtype=np.uint8)
     canvas = np.full((8, 12, 3), 20, dtype=np.uint8)
     recorded: list[np.ndarray] = []
-    displayed: list[np.ndarray] = []
+    displayed: list[tuple[str, np.ndarray]] = []
+    debug_panel = np.full((5, 12, 3), 30, dtype=np.uint8)
     visualizer = Visualizer(
         {
             "show_window": True,
@@ -56,13 +57,17 @@ def test_raw_recording_keeps_annotated_window(
         }
     )
     monkeypatch.setattr(visualizer, "_build_canvas", lambda **_: canvas)
+    monkeypatch.setattr(visualizer, "_build_debug_panel", lambda **_: debug_panel)
     monkeypatch.setattr(visualizer, "_write_video", recorded.append)
-    monkeypatch.setattr(cv2, "imshow", lambda _name, image: displayed.append(image))
+    monkeypatch.setattr(cv2, "imshow", lambda name, image: displayed.append((name, image)))
     monkeypatch.setattr(cv2, "waitKey", lambda _delay: -1)
 
     assert render_once(visualizer, frame)
     assert recorded == [frame]
-    assert displayed == [canvas]
+    assert displayed == [
+        ("X-SmartCar Upper", canvas),
+        ("X-SmartCar Debug", debug_panel),
+    ]
 
 
 def test_raw_recording_continues_without_window(

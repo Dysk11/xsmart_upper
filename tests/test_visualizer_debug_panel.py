@@ -92,7 +92,7 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
     assert long_panel.shape[0] > short_panel.shape[0]
 
 
-def test_canvas_keeps_camera_frame_on_top_and_panel_below() -> None:
+def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
     visualizer = Visualizer({"show_window": False, "debug_panel_font_size": 18})
     frame = np.full((480, 640, 3), 110, dtype=np.uint8)
     canvas = visualizer._build_canvas(
@@ -105,9 +105,8 @@ def test_canvas_keeps_camera_frame_on_top_and_panel_below() -> None:
     )
 
     assert canvas.shape[1] == frame.shape[1]
-    assert canvas.shape[0] > frame.shape[0]
+    assert canvas.shape[0] == frame.shape[0]
     assert np.array_equal(canvas[:100, :100], frame[:100, :100])
-    assert not np.array_equal(canvas[480:], frame[: canvas.shape[0] - 480])
 
 
 def test_debug_panel_handles_missing_optional_results() -> None:
