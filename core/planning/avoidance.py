@@ -201,7 +201,7 @@ class AvoidanceTargetPlanner:
             final_lateral_error_px=normal_target.target_lateral_error_px,
             final_heading_error_deg=normal_target.target_heading_error_deg,
             confidence=normal_target.confidence,
-            reason=f"lane follow; {reason}",
+            reason=f"lane follow; {normal_target.reason}; {reason}",
         )
 
     def _from_target(

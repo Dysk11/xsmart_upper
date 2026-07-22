@@ -1003,6 +1003,7 @@ class UpperMachineApp:
                 vehicle_center_x=vehicle_center_x,
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
+                segmentation_instance_count=len(segmentation_result.instances),
             )
             self.last_confirmed_fork_detected = bool(
                 detection_result.fork_result.fork_detected

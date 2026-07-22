@@ -62,6 +62,7 @@ class LaneDetectionResult:
     right_lost_rows: int = 0
     segmentation_confidence: float = 0.0
     segmentation_status: str = "legacy"
+    segmentation_instance_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -247,10 +248,20 @@ class LaneDetector:
         boundary_config = config.get("boundary", {})
         fork_config = config.get("fork", {})
         temporal_config = config.get("temporal_filter", {})
+        track_selection_config = config.get("track_selection", {})
         self.gradient_jump_ratio = float(boundary_config.get("gradient_jump_ratio", 0.05))
         self.gradient_step_ratio = float(boundary_config.get("gradient_step_ratio", 0.025))
         self.max_single_side_gap_rows = int(boundary_config.get("max_single_side_gap_rows", 12))
         self.min_run_width_px = int(boundary_config.get("min_run_width_px", 6))
+        self.track_switch_threshold_px = float(
+            track_selection_config.get("switch_threshold_px", 80.0)
+        )
+        self.track_switch_confirm_frames = max(
+            1, int(track_selection_config.get("switch_confirm_frames", 3))
+        )
+        self.track_pending_tolerance_px = float(
+            track_selection_config.get("pending_tolerance_px", 40.0)
+        )
         self.fork_corner_span_rows = int(fork_config.get("corner_span_rows", 10))
         self.fork_outward_jump_ratio = float(fork_config.get("outward_jump_ratio", 0.08))
         self.fork_min_lost_rows = int(fork_config.get("min_lost_rows", 3))
@@ -301,6 +312,8 @@ class LaneDetector:
         self._normal_centerline_mode = "normal"
         self._pending_normal_centerline_mode: str | None = None
         self._pending_normal_centerline_hits = 0
+        self._pending_track_center_x: float | None = None
+        self._pending_track_hits = 0
 
     def detect(self, roi_frame: np.ndarray, route_direction: str | None = None) -> LaneDetectionResult:
         """对单帧 ROI 图像执行蓝色航道检测。
@@ -326,6 +339,7 @@ class LaneDetector:
         vehicle_center_x: float | None = None,
         segmentation_confidence: float = 0.0,
         segmentation_status: str = "ok",
+        segmentation_instance_count: int = 0,
     ) -> LaneDetectionResult:
         """Extract lane geometry from an externally produced binary ROI mask."""
 
@@ -342,6 +356,7 @@ class LaneDetector:
             vehicle_center_x=vehicle_center_x,
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
+            segmentation_instance_count=segmentation_instance_count,
         )
 
         # Legacy connected-component implementation is intentionally unreachable.
@@ -419,6 +434,7 @@ class LaneDetector:
         vehicle_center_x: float | None,
         segmentation_confidence: float,
         segmentation_status: str,
+        segmentation_instance_count: int,
     ) -> LaneDetectionResult:
         """Build the driving centerline directly from row-wise track boundaries."""
 
@@ -437,7 +453,11 @@ class LaneDetector:
             selected_mask,
             left_branch_rows,
             right_branch_rows,
-        ) = self._extract_row_boundaries(mask, row_runs=row_runs)
+        ) = self._extract_row_boundaries(
+            mask,
+            row_runs=row_runs,
+            bottom_center_x=roi_center_x,
+        )
         fork_result = self._geometric_fork_result(
             left_points,
             right_points,
@@ -603,6 +623,14 @@ class LaneDetector:
                     )
 
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
+        if not fork_result.fork_detected and requested_direction is None:
+            centerline_points, track_hold_reason = self._stabilize_normal_track_switch(
+                centerline_points
+            )
+            if track_hold_reason is not None:
+                fork_result.reason = track_hold_reason
+        else:
+            self._reset_pending_track_switch()
         fit_coeffs = self._fit_centerline(centerline_points)
         widths = [right[0] - left[0] for left, right in zip(left_points, right_points) if right[0] > left[0]]
         lane_width_px = float(np.median(widths)) if widths else self.last_lane_width_px
@@ -641,6 +669,7 @@ class LaneDetector:
             right_lost_rows=sum(right_lost),
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
+            segmentation_instance_count=segmentation_instance_count,
         )
 
     def _perspective_lane_width(self, y: int, height: int) -> float:
@@ -1006,14 +1035,26 @@ class LaneDetector:
         mask: np.ndarray,
         route_direction: str | None = None,
         row_runs: Sequence[Sequence[tuple[int, int]]] | None = None,
+        bottom_center_x: float | None = None,
     ):
-        """Follow the run nearest the previous center from the vehicle upward."""
+        """Choose the bottom run nearest vehicle center, then follow it upward."""
 
         height, width = mask.shape[:2]
         if row_runs is None:
             row_runs = self._build_row_runs(mask)
         selected_mask = np.zeros_like(mask)
-        prior_center = float(self.last_centerline_points[0][0]) if self.last_centerline_points else width * 0.5
+        historical_center = (
+            float(self.last_centerline_points[0][0])
+            if self.last_centerline_points
+            else width * 0.5
+        )
+        prior_center = historical_center
+        mapped_bottom_center = (
+            None
+            if bottom_center_x is None
+            else clamp(float(bottom_center_x), 0.0, float(max(0, width - 1)))
+        )
+        first_valid_row = True
         rows: list[tuple[int, int, int, bool, bool]] = []
         left_branch_rows: list[tuple[int, int]] = []
         right_branch_rows: list[tuple[int, int]] = []
@@ -1030,13 +1071,29 @@ class LaneDetector:
 
             single_side_gap = 0
             centers = [0.5 * (left + right) for left, right in runs]
+            select_from_vehicle_center = (
+                first_valid_row
+                and len(runs) > 1
+                and mapped_bottom_center is not None
+                and route_direction not in {"left", "right"}
+            )
             if route_direction == "left" and len(runs) > 1:
                 chosen_index = min(range(len(runs)), key=lambda index: centers[index])
             elif route_direction == "right" and len(runs) > 1:
                 chosen_index = max(range(len(runs)), key=lambda index: centers[index])
+            elif select_from_vehicle_center:
+                chosen_index = min(
+                    range(len(runs)),
+                    key=lambda index: (
+                        abs(centers[index] - mapped_bottom_center),
+                        abs(centers[index] - historical_center),
+                        index,
+                    ),
+                )
             else:
                 chosen_index = min(range(len(runs)), key=lambda index: abs(centers[index] - prior_center))
             left, right = runs[chosen_index]
+            first_valid_row = False
             for index, (candidate_left, candidate_right) in enumerate(runs):
                 if index == chosen_index:
                     continue
@@ -1051,7 +1108,11 @@ class LaneDetector:
             # rebuilding it inward from the historical lane width.
             rows.append((y, left, right, False, False))
             selected_mask[y, left : right + 1] = 255
-            prior_center = 0.65 * prior_center + 0.35 * (0.5 * (left + right))
+            chosen_center = 0.5 * (left + right)
+            if select_from_vehicle_center:
+                prior_center = chosen_center
+            else:
+                prior_center = 0.65 * prior_center + 0.35 * chosen_center
 
         left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
         right_points = [(right, y) for y, _left, right, _ll, _rl in rows]
@@ -1059,6 +1120,54 @@ class LaneDetector:
         left_lost = [left_lost for _y, _left, _right, left_lost, _right_lost in rows]
         right_lost = [right_lost for _y, _left, _right, _left_lost, right_lost in rows]
         return left_points, right_points, centers, left_lost, right_lost, selected_mask, left_branch_rows, right_branch_rows
+
+    def _stabilize_normal_track_switch(
+        self,
+        current_points: Sequence[Tuple[int, int]],
+    ) -> tuple[list[tuple[int, int]], str | None]:
+        """Require repeated evidence before accepting a large normal-track jump."""
+
+        current = [(int(x), int(y)) for x, y in current_points]
+        if not current or not self.last_centerline_points:
+            self._reset_pending_track_switch()
+            return current, None
+
+        current_bottom_x = float(max(current, key=lambda point: point[1])[0])
+        previous_bottom_x = float(
+            max(self.last_centerline_points, key=lambda point: point[1])[0]
+        )
+        shift = current_bottom_x - previous_bottom_x
+        if abs(shift) <= self.track_switch_threshold_px:
+            self._reset_pending_track_switch()
+            return current, None
+
+        if (
+            self._pending_track_center_x is not None
+            and abs(current_bottom_x - self._pending_track_center_x)
+            <= self.track_pending_tolerance_px
+        ):
+            self._pending_track_hits += 1
+            self._pending_track_center_x = 0.5 * (
+                self._pending_track_center_x + current_bottom_x
+            )
+        else:
+            self._pending_track_center_x = current_bottom_x
+            self._pending_track_hits = 1
+
+        if self._pending_track_hits >= self.track_switch_confirm_frames:
+            self._reset_pending_track_switch()
+            return current, None
+
+        held = [(int(x), int(y)) for x, y in self.last_centerline_points]
+        return held, (
+            "holding current track; pending large switch "
+            f"shift={shift:.1f}px confirm={self._pending_track_hits}/"
+            f"{self.track_switch_confirm_frames}"
+        )
+
+    def _reset_pending_track_switch(self) -> None:
+        self._pending_track_center_x = None
+        self._pending_track_hits = 0
 
     def _smooth_article_centerline(
         self, raw_points: Sequence[Tuple[int, int]], width: int

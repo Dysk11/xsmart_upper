@@ -26,7 +26,7 @@ rknn_lane_segmenter:
   score_threshold: 0.30
   nms_threshold: 0.45
   mask_threshold: 0.5
-  max_instances: 1
+  max_instances: 3
   runtime_backend: lite2
   core_mask: NPU_CORE_0
   parallel: true
@@ -59,6 +59,10 @@ lane_geometry:
     boundary_smoothness_tie_margin_px: 0.1
     boundary_smoothness_confirm_frames: 2
     lookahead_ratio: 0.45
+  track_selection:
+    switch_threshold_px: 80
+    switch_confirm_frames: 3
+    pending_tolerance_px: 40
   confidence:
     lost_threshold: 0.22
     expected_area_ratio: 0.04
@@ -130,6 +134,8 @@ ocr:
 # Planning
 target_selector:
   fixed_target_y: 80
+  max_extrapolation_y_px: 40
+  max_extrapolation_x_px: 60
 
 gold_target:
   enabled: true

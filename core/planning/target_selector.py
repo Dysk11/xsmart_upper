@@ -30,6 +30,12 @@ class TargetSelector:
 
     def __init__(self, config: Dict[str, Any]) -> None:
         self.fixed_target_y = float(config.get("fixed_target_y", 80.0))
+        self.max_extrapolation_y_px = max(
+            0.0, float(config.get("max_extrapolation_y_px", 40.0))
+        )
+        self.max_extrapolation_x_px = max(
+            0.0, float(config.get("max_extrapolation_x_px", 60.0))
+        )
 
     def select(
         self,
@@ -65,7 +71,7 @@ class TargetSelector:
             target_y=target_y,
             roi_width=roi_width,
         )
-        lookahead = max(0.0, ego_y - target_y)
+        lookahead = max(0.0, ego_y - float(target[1]))
 
         if len(points) == 1:
             return self._build_result(
@@ -145,11 +151,31 @@ class TargetSelector:
             key=lambda item: (abs(item[1][1] - target_y), item[0]),
         )
         first_index, (x1, y1) = candidates[0]
+        extrapolation_y = abs(float(target_y) - float(y1))
+        if extrapolation_y > self.max_extrapolation_y_px:
+            x = clamp(x1, 0.0, max_x)
+            return (
+                (float(x), float(y1)),
+                first_index,
+                f"visible endpoint fallback; extrapolation_y={extrapolation_y:.1f}px",
+            )
         for _second_index, (x2, y2) in candidates[1:]:
             if y2 == y1:
                 continue
-            x = self._linear_x_at_y(x1, y1, x2, y2, target_y)
-            x = clamp(x, 0.0, max_x)
+            extrapolated_x = self._linear_x_at_y(x1, y1, x2, y2, target_y)
+            extrapolation_x = abs(extrapolated_x - x1)
+            if (
+                extrapolation_x > self.max_extrapolation_x_px
+                or extrapolated_x < 0.0
+                or extrapolated_x > max_x
+            ):
+                x = clamp(x1, 0.0, max_x)
+                return (
+                    (float(x), float(y1)),
+                    first_index,
+                    f"visible endpoint fallback; extrapolation_x={extrapolation_x:.1f}px",
+                )
+            x = clamp(extrapolated_x, 0.0, max_x)
             return (
                 (float(x), float(target_y)),
                 first_index,

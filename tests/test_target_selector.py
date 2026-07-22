@@ -58,7 +58,7 @@ def test_short_centerline_is_extrapolated_to_fixed_height() -> None:
     assert "extrapolation" in result.reason
 
 
-def test_extrapolated_x_is_clamped_to_roi() -> None:
+def test_extrapolation_outside_roi_uses_visible_endpoint() -> None:
     result = make_selector().select(
         centerline_points=[(190, 150), (210, 120)],
         roi_width=200,
@@ -67,7 +67,22 @@ def test_extrapolated_x_is_clamped_to_roi() -> None:
         curvature=0.0,
     )
 
-    assert result.target_point_roi == pytest.approx((199.0, 80.0))
+    assert result.target_point_roi == pytest.approx((199.0, 120.0))
+    assert "visible endpoint fallback" in result.reason
+
+
+def test_excessive_vertical_extrapolation_uses_visible_endpoint() -> None:
+    result = make_selector().select(
+        centerline_points=[(100, 170), (110, 130)],
+        roi_width=200,
+        roi_height=200,
+        lane_confidence=0.8,
+        curvature=0.0,
+    )
+
+    assert result.target_point_roi == pytest.approx((110.0, 130.0))
+    assert result.lookahead_px == pytest.approx(69.0)
+    assert "extrapolation_y=50.0px" in result.reason
 
 
 def test_single_point_keeps_x_and_uses_fixed_height() -> None:

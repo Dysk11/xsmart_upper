@@ -447,11 +447,22 @@ class Visualizer:
         steer_text = f"{float(steer_deg):.2f}" if steer_deg is not None else "n/a"
         segmentation_status = getattr(detection_result, "segmentation_status", "n/a")
         segmentation_confidence = getattr(detection_result, "segmentation_confidence", None)
-        track_text = (
-            f"track: {segmentation_status} conf={float(segmentation_confidence):.2f}"
-            if segmentation_confidence is not None
-            else f"track: {segmentation_status}"
+        segmentation_instance_count = int(
+            getattr(detection_result, "segmentation_instance_count", 0)
         )
+        track_text = (
+            f"track: {segmentation_status} conf={float(segmentation_confidence):.2f} "
+            f"instances={segmentation_instance_count}"
+            if segmentation_confidence is not None
+            else f"track: {segmentation_status} instances={segmentation_instance_count}"
+        )
+        target_point = getattr(avoidance_result, "target_point_roi", None)
+        target_text = (
+            f"target: x={float(target_point[0]):.1f} y={float(target_point[1]):.1f}"
+            if target_point is not None
+            else "target: n/a"
+        )
+        lane_reason = getattr(avoidance_result, "reason", "n/a")
         left_lines = wrap_text_lines(
             [
                 "运行 / 控制",
@@ -460,6 +471,8 @@ class Visualizer:
                 f"bias_px: {bias}",
                 f"final_error: {final_error}",
                 f"steer_deg: {steer_text}",
+                target_text,
+                f"lane reason: {lane_reason}",
             ],
             column_width,
             self.font_path,
