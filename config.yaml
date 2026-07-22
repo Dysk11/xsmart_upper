@@ -26,7 +26,7 @@ rknn_lane_segmenter:
   score_threshold: 0.30
   nms_threshold: 0.45
   mask_threshold: 0.5
-  max_instances: 1
+  max_instances: 3
   runtime_backend: lite2
   core_mask: NPU_CORE_0
   parallel: true
@@ -52,7 +52,17 @@ lane_geometry:
     scan_step: 4
     min_valid_points: 6
     default_lane_width_px: 60
+    perspective_width_top_px: 75
+    perspective_width_bottom_px: 260
+    enable_boundary_smoothness_fallback: true
+    boundary_smoothness_residual_threshold_px: 2.0
+    boundary_smoothness_tie_margin_px: 0.1
+    boundary_smoothness_confirm_frames: 2
     lookahead_ratio: 0.45
+  track_selection:
+    switch_threshold_px: 80
+    switch_confirm_frames: 3
+    pending_tolerance_px: 40
   confidence:
     lost_threshold: 0.22
     expected_area_ratio: 0.04
@@ -66,6 +76,11 @@ lane_geometry:
     corner_side_margin_ratio: 0.02
     confirm_frames: 2
     release_frames: 3
+    split_enter_ratio: 0.15
+    split_exit_ratio: 0.10
+    split_min_rows: 5
+    smoothness_residual_threshold_px: 3.0
+    smoothness_tie_margin_px: 0.1
 
 tracker:
   ema_alpha: 0.25
@@ -80,7 +95,7 @@ tracker:
 # Object and road-sign perception
 rknn_object_detector:
   enable: true
-  model_path: models/object/rknn_7classes_0718.rknn
+  model_path: models/object/rknn_7classes_0718_0718.rknn
   input_size: [640, 480]
   input_layout: nhwc
   input_color: rgb
@@ -103,8 +118,8 @@ ocr:
   core_mask: NPU_CORE_1
   class_names: [road_sign]
   bbox_min_confidence: 0.50
-  bbox_min_width_px: 140
-  bbox_min_height_px: 70
+  bbox_min_width_px: 100
+  bbox_min_height_px: 50
   bbox_padding_ratio: 0.10
   input_width: 480
   input_height: 480
@@ -118,12 +133,9 @@ ocr:
 
 # Planning
 target_selector:
-  base_lookahead_px: 120
-  min_lookahead_px: 70
-  max_lookahead_px: 180
-  curvature_gain: 80
-  low_confidence_lookahead_px: 80
-  low_confidence_threshold: 0.45
+  fixed_target_y: 80
+  max_extrapolation_y_px: 40
+  max_extrapolation_x_px: 60
 
 gold_target:
   enabled: true
@@ -164,7 +176,6 @@ avoidance_target_planner:
   clear_frames: 8
   front_margin_px: 45
   rear_margin_px: 35
-  target_front_margin_px: 35
   min_lane_confidence_to_start_avoid: 0.45
   max_target_jump_px: 50
 
@@ -177,7 +188,7 @@ road_sign_analyzer:
   read_timeout_sec: 8.0
   max_attempts: 2
   retry_interval_sec: 0.5
-  default_direction: left
+  default_direction: current
   decision_ttl_sec: 20.0
   output_dir: outputs/logs/api
 
@@ -213,8 +224,10 @@ bridge:
 visualizer:
   show_window: true
   window_name: X-SmartCar Upper
+  debug_window_name: X-SmartCar Debug
   font_path: "C:/Windows/Fonts/msyh.ttc"
   font_size: 22
+  debug_panel_font_size: 18
   mask_alpha: 0.35
   mask_color: [0, 180, 255]
   save_video: true

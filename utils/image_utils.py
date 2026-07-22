@@ -134,13 +134,12 @@ def draw_text_lines(
     if not text_lines:
         return output
 
-    use_pil = _contains_non_ascii(text_lines)
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
+    font_scale = max(0.4, float(font_size) / 36.0)
     thickness = 2
 
-    pil_font = _load_font(font_path, font_size) if use_pil else None
-    if use_pil and pil_font is not None:
+    pil_font = _load_font(font_path, font_size)
+    if pil_font is not None:
         widths = [_measure_text_width(line, pil_font) for line in text_lines]
         max_width = max(widths) if widths else 0
     else:
@@ -159,7 +158,7 @@ def draw_text_lines(
     cv2.rectangle(overlay, (left, top), (right, bottom), background_color, -1)
     output = cv2.addWeighted(overlay, background_alpha, output, 1.0 - background_alpha, 0.0)
 
-    if use_pil and pil_font is not None and Image is not None and ImageDraw is not None:
+    if pil_font is not None and Image is not None and ImageDraw is not None:
         rgb_image = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_image)
         draw = ImageDraw.Draw(pil_image)
@@ -174,6 +173,66 @@ def draw_text_lines(
             cv2.putText(output, line, position, font, font_scale, color, thickness, cv2.LINE_AA)
 
     return output
+
+
+def measure_text_width(text: str, font_path: str = "", font_size: int = 22) -> int:
+    """Return the rendered pixel width used by :func:`draw_text_lines`."""
+
+    pil_font = _load_font(font_path, font_size)
+    if pil_font is not None:
+        return _measure_text_width(text, pil_font)
+    font_scale = max(0.4, float(font_size) / 36.0)
+    text_size, _ = cv2.getTextSize(
+        text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        2,
+    )
+    return int(text_size[0])
+
+
+def wrap_text_lines(
+    lines: Iterable[str],
+    max_width: int,
+    font_path: str = "",
+    font_size: int = 22,
+) -> List[str]:
+    """Wrap mixed Chinese/ASCII text to a measured pixel width.
+
+    Wrapping prefers the last whitespace that fits.  A single token wider than
+    the available space is split by character so diagnostic identifiers and
+    unbroken error messages can never escape the panel.
+    """
+
+    width_limit = max(1, int(max_width))
+    wrapped: List[str] = []
+    for source_line in lines:
+        remaining = str(source_line)
+        if not remaining:
+            wrapped.append("")
+            continue
+        while remaining:
+            if measure_text_width(remaining, font_path, font_size) <= width_limit:
+                wrapped.append(remaining)
+                break
+
+            low, high = 1, len(remaining)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if measure_text_width(remaining[:middle], font_path, font_size) <= width_limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            fit_count = max(1, low)
+            prefix = remaining[:fit_count]
+            whitespace_index = max(prefix.rfind(" "), prefix.rfind("\t"))
+            if whitespace_index > 0:
+                wrapped.append(prefix[:whitespace_index].rstrip())
+                remaining = remaining[whitespace_index + 1 :].lstrip()
+            else:
+                wrapped.append(prefix)
+                remaining = remaining[fit_count:].lstrip()
+    return wrapped
 
 
 def stack_images(

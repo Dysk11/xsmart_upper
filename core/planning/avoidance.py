@@ -39,7 +39,6 @@ class AvoidanceTargetPlanner:
         self.clear_frames_threshold = int(config.get("clear_frames", 8))
         self.front_margin_px = float(config.get("front_margin_px", 45.0))
         self.rear_margin_px = float(config.get("rear_margin_px", 35.0))
-        self.target_front_margin_px = float(config.get("target_front_margin_px", 35.0))
         self.min_lane_confidence_to_start_avoid = float(
             config.get("min_lane_confidence_to_start_avoid", 0.45)
         )
@@ -166,14 +165,12 @@ class AvoidanceTargetPlanner:
             roi_width=roi_width,
         )
 
-        min_target_y = y1 - self.target_front_margin_px
-        target = self.target_selector.select_on_polyline_with_min_y(
+        target = self.target_selector.select(
             centerline_points=shifted_points,
             roi_width=roi_width,
             roi_height=roi_height,
             lane_confidence=lane_confidence,
             curvature=curvature,
-            min_target_y=min_target_y,
         )
         target = self._limit_target_jump(target, roi_width=roi_width, roi_height=roi_height)
         reason = (
@@ -204,7 +201,7 @@ class AvoidanceTargetPlanner:
             final_lateral_error_px=normal_target.target_lateral_error_px,
             final_heading_error_deg=normal_target.target_heading_error_deg,
             confidence=normal_target.confidence,
-            reason=f"lane follow; {reason}",
+            reason=f"lane follow; {normal_target.reason}; {reason}",
         )
 
     def _from_target(

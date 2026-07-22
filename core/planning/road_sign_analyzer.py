@@ -33,7 +33,7 @@ class RoadSignAnalyzerConfig:
     read_timeout_sec: float = 8.0
     max_attempts: int = 2
     retry_interval_sec: float = 0.5
-    default_direction: str = "left"
+    default_direction: str = "current"
     decision_ttl_sec: float = 20.0
     output_dir: str = "outputs/logs/api"
 
@@ -67,8 +67,10 @@ class RoadSignAnalyzerConfig:
             raise ValueError("road_sign_analyzer.max_attempts must be at least one")
         if config.retry_interval_sec < 0:
             raise ValueError("road_sign_analyzer.retry_interval_sec must not be negative")
-        if config.default_direction not in {"left", "right"}:
-            raise ValueError("road_sign_analyzer.default_direction must be left or right")
+        if config.default_direction not in {"left", "right", "current"}:
+            raise ValueError(
+                "road_sign_analyzer.default_direction must be left, right, or current"
+            )
         if config.decision_ttl_sec <= 0:
             raise ValueError("road_sign_analyzer.decision_ttl_sec must be greater than zero")
         if not config.output_dir:
@@ -348,7 +350,7 @@ class RoadSignAnalysisState:
     def __init__(
         self,
         enabled: bool = True,
-        default_direction: str = "left",
+        default_direction: str = "current",
         decision_ttl_sec: float = 20.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -356,8 +358,8 @@ class RoadSignAnalysisState:
         self.default_direction = str(default_direction).casefold()
         self.decision_ttl_sec = float(decision_ttl_sec)
         self.clock = clock
-        if self.default_direction not in {"left", "right"}:
-            raise ValueError("default_direction must be left or right")
+        if self.default_direction not in {"left", "right", "current"}:
+            raise ValueError("default_direction must be left, right, or current")
         if self.decision_ttl_sec <= 0:
             raise ValueError("decision_ttl_sec must be greater than zero")
         self.pending_event_id: int | None = None
@@ -366,9 +368,10 @@ class RoadSignAnalysisState:
         self.last_submitted_event_id = 0
 
     @property
-    def route_direction(self) -> str:
+    def route_direction(self) -> str | None:
         self._expire_if_needed()
-        return self.default_direction if self.decision is None else self.decision.direction
+        direction = self.default_direction if self.decision is None else self.decision.direction
+        return direction if direction in {"left", "right"} else None
 
     @property
     def idle(self) -> bool:
@@ -411,7 +414,10 @@ class RoadSignAnalysisState:
             return False
         if self.pending_event_id is not None:
             return True
-        return getattr(fork_result, "selected_direction", None) != self.route_direction
+        requested_direction = self.route_direction
+        if requested_direction is None:
+            return False
+        return getattr(fork_result, "selected_direction", None) != requested_direction
 
     def _expire_if_needed(self) -> None:
         if self.decision is not None and self.clock() >= self.decision_expires_at:

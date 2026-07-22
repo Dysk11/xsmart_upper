@@ -990,11 +990,20 @@ class UpperMachineApp:
             segmentation_result = self._segment_lane(frame, captured_at)
             roi_x1, roi_y1, roi_x2, roi_y2 = roi_rect
             roi_mask = segmentation_result.mask[roi_y1:roi_y2, roi_x1:roi_x2]
+            vehicle_center_x = max(
+                0.0,
+                min(
+                    float(max(0, roi_x2 - roi_x1 - 1)),
+                    0.5 * float(frame.shape[1]) - float(roi_x1),
+                ),
+            )
             detection_result = self.detector.detect_from_mask(
                 roi_mask,
                 route_direction=self.road_sign_analysis_state.route_direction,
+                vehicle_center_x=vehicle_center_x,
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
+                segmentation_instance_count=len(segmentation_result.instances),
             )
             self.last_confirmed_fork_detected = bool(
                 detection_result.fork_result.fork_detected

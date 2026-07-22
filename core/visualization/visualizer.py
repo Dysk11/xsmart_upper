@@ -18,7 +18,7 @@ from core.lane.tracker import TrackedLaneState
 from core.ocr.recognizer import OcrResult
 from core.planning.high_level import ControlCommand
 from core.planning.target_selector import TargetPointResult
-from utils.image_utils import draw_centerline, draw_text_lines
+from utils.image_utils import draw_centerline, draw_text_lines, wrap_text_lines
 
 
 class Visualizer:
@@ -36,6 +36,7 @@ class Visualizer:
 
         self.show_window = bool(config.get("show_window", True))
         self.window_name = str(config.get("window_name", "X-SmartCar Upper"))
+        self.debug_window_name = str(config.get("debug_window_name", "X-SmartCar Debug"))
         self.save_video = bool(config.get("save_video", False))
         self.record_without_ui = bool(config.get("record_without_ui", False))
         self.save_screenshot = bool(config.get("save_screenshot", True))
@@ -45,6 +46,7 @@ class Visualizer:
         self.video_fps = float(config.get("video_fps", 25.0))
         self.font_path = str(config.get("font_path", ""))
         self.font_size = int(config.get("font_size", 22))
+        self.debug_panel_font_size = int(config.get("debug_panel_font_size", 18))
         self.mask_alpha = float(config.get("mask_alpha", 0.35))
         self.mask_color = tuple(int(value) for value in config.get("mask_color", [0, 180, 255]))
 
@@ -105,6 +107,18 @@ class Visualizer:
 
         if self.show_window:
             cv2.imshow(self.window_name, canvas)
+            debug_panel = self._build_debug_panel(
+                width=frame.shape[1],
+                avoidance_result=avoidance_result,
+                blocking_result=blocking_result,
+                control_command=control_command,
+                fps_value=fps_value,
+                gold_result=gold_result,
+                path_marker_result=path_marker_result,
+                detection_result=detection_result,
+                ocr_result=ocr_result,
+            )
+            cv2.imshow(self.debug_window_name, debug_panel)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 return False
@@ -182,20 +196,20 @@ class Visualizer:
             original_panel, detection_result.right_boundary_points,
             color=(80, 80, 255), radius=1, thickness=1, offset=(x1, y1),
         )
-        if fork_lane.left_points:
+        if fork_lane.left_centerline_points:
             original_panel = draw_centerline(
                 original_panel,
-                fork_lane.left_points,
+                fork_lane.left_centerline_points,
                 color=(255, 0, 255),
                 radius=2,
                 thickness=1,
                 offset=(x1, y1),
             )
-        if fork_lane.right_points:
+        if fork_lane.right_centerline_points:
             original_panel = draw_centerline(
                 original_panel,
-                fork_lane.right_points,
-                color=(255, 128, 0),
+                fork_lane.right_centerline_points,
+                color=(0, 128, 255),
                 radius=2,
                 thickness=1,
                 offset=(x1, y1),
@@ -298,25 +312,6 @@ class Visualizer:
                 roi_offset=(x1, y1),
                 roi_height=y2 - y1,
             )
-        original_panel = draw_text_lines(
-            original_panel,
-            self._build_original_panel_lines(
-                avoidance_result=avoidance_result,
-                blocking_result=blocking_result,
-                control_command=control_command,
-                fps_value=fps_value,
-                gold_result=gold_result,
-                path_marker_result=path_marker_result,
-                detection_result=detection_result,
-                ocr_result=ocr_result,
-            ) or [
-                "窗口1：原始画面",
-                "黄色框 = ROI范围  红线 = 车身中心参考线  绿线 = 航道中心线",
-            ],
-            font_path=self.font_path,
-            font_size=self.font_size,
-        )
-
         return original_panel
 
     def _overlay_roi_mask(
@@ -410,8 +405,9 @@ class Visualizer:
         _ = roi_x1
         _ = roi_y1
 
-    def _build_original_panel_lines(
+    def _build_debug_panel(
         self,
+        width: int,
         avoidance_result: AvoidanceTargetResult | None,
         blocking_result: BlockingAnalysisResult | None,
         control_command: ControlCommand,
@@ -420,9 +416,69 @@ class Visualizer:
         path_marker_result: PathMarkerTargetResult | None = None,
         detection_result: LaneDetectionResult | None = None,
         ocr_result: OcrResult | None = None,
-    ) -> list[str]:
-        if avoidance_result is None:
-            return self._ocr_status_lines(ocr_result)
+    ) -> np.ndarray:
+        """Build an opaque, auto-sized two-column status panel."""
+
+        padding = 12
+        column_gap = 16
+        line_height = self.debug_panel_font_size + 6
+        content_width = max(1, int(width) - padding * 2)
+        column_width = max(1, (content_width - column_gap) // 2)
+
+        header_lines = wrap_text_lines(
+            [
+                "窗口1：原始画面",
+                "绿线=原中心线 青线=最终路径 紫线=Go/Stop连接 N=普通 A=最终 G=coin P=路径目标",
+                "洋红线=左岔中线 橙线=右岔中线 LF/RF=左右岔路拐点",
+            ],
+            content_width,
+            self.font_path,
+            self.debug_panel_font_size,
+        )
+
+        mode = avoidance_result.mode if avoidance_result is not None else "n/a"
+        bias = f"{avoidance_result.avoid_bias_px:.1f}" if avoidance_result is not None else "n/a"
+        final_error = (
+            f"{avoidance_result.final_lateral_error_px:.1f}"
+            if avoidance_result is not None
+            else "n/a"
+        )
+        steer_deg = getattr(control_command, "steer_deg", None)
+        steer_text = f"{float(steer_deg):.2f}" if steer_deg is not None else "n/a"
+        segmentation_status = getattr(detection_result, "segmentation_status", "n/a")
+        segmentation_confidence = getattr(detection_result, "segmentation_confidence", None)
+        segmentation_instance_count = int(
+            getattr(detection_result, "segmentation_instance_count", 0)
+        )
+        track_text = (
+            f"track: {segmentation_status} conf={float(segmentation_confidence):.2f} "
+            f"instances={segmentation_instance_count}"
+            if segmentation_confidence is not None
+            else f"track: {segmentation_status} instances={segmentation_instance_count}"
+        )
+        target_point = getattr(avoidance_result, "target_point_roi", None)
+        target_text = (
+            f"target: x={float(target_point[0]):.1f} y={float(target_point[1]):.1f}"
+            if target_point is not None
+            else "target: n/a"
+        )
+        lane_reason = getattr(avoidance_result, "reason", "n/a")
+        left_lines = wrap_text_lines(
+            [
+                "运行 / 控制",
+                f"mode: {mode}  FPS: {fps_value:.1f}",
+                track_text,
+                f"bias_px: {bias}",
+                f"final_error: {final_error}",
+                f"steer_deg: {steer_text}",
+                target_text,
+                f"lane reason: {lane_reason}",
+            ],
+            column_width,
+            self.font_path,
+            self.debug_panel_font_size,
+        )
+
         blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
         path_marker_reason = (
@@ -430,27 +486,65 @@ class Visualizer:
             if path_marker_result is not None and path_marker_result.active
             else "no Go/Stop path marker"
         )
-        fork_reason = "fork: none"
+        fork_summary = "fork: none"
+        fork_reason = "reason: no fork"
         if detection_result is not None:
             fork_lane = detection_result.fork_result
-            fork_reason = (
+            fork_summary = (
                 f"fork: left={fork_lane.left_detected} right={fork_lane.right_detected} "
-                f"confirm={fork_lane.confirm_frames}"
+                f"confirm={fork_lane.confirm_frames} selected={fork_lane.selected_direction}"
             )
-        lines = [
-            "窗口1：原始画面",
-            "绿线=原中心线 青线=最终路径 紫线=Go/Stop连接 N=普通 A=最终 G=coin P=路径目标",
-            f"mode: {avoidance_result.mode}  FPS: {fps_value:.1f}",
-            f"track: {detection_result.segmentation_status} conf={detection_result.segmentation_confidence:.2f}",
-            f"bias_px: {avoidance_result.avoid_bias_px:.1f}  final_error: {avoidance_result.final_lateral_error_px:.1f}",
-            f"steer_deg: {control_command.steer_deg:.2f}",
-            f"{fork_reason}",
+            fork_reason = f"reason: {fork_lane.reason}"
+        right_source_lines = [
+            "规划 / 识别",
+            fork_summary,
+            fork_reason,
             f"{path_marker_reason}",
             f"{gold_reason}",
             f"{blocking_reason}",
         ]
-        lines.extend(self._ocr_status_lines(ocr_result))
-        return lines
+        right_source_lines.extend(self._ocr_status_lines(ocr_result))
+        right_lines = wrap_text_lines(
+            right_source_lines,
+            column_width,
+            self.font_path,
+            self.debug_panel_font_size,
+        )
+
+        header_height = len(header_lines) * line_height
+        columns_top = padding + header_height + 10
+        panel_height = columns_top + max(len(left_lines), len(right_lines)) * line_height + padding
+        panel = np.full((panel_height, int(width), 3), (24, 24, 24), dtype=np.uint8)
+        panel = draw_text_lines(
+            panel,
+            header_lines,
+            origin=(padding, padding + self.debug_panel_font_size),
+            line_height=line_height,
+            background_alpha=0.0,
+            font_path=self.font_path,
+            font_size=self.debug_panel_font_size,
+        )
+        separator_y = padding + header_height + 3
+        cv2.line(panel, (padding, separator_y), (int(width) - padding - 1, separator_y), (80, 80, 80), 1)
+        panel = draw_text_lines(
+            panel,
+            left_lines,
+            origin=(padding, columns_top + self.debug_panel_font_size),
+            line_height=line_height,
+            background_alpha=0.0,
+            font_path=self.font_path,
+            font_size=self.debug_panel_font_size,
+        )
+        panel = draw_text_lines(
+            panel,
+            right_lines,
+            origin=(padding + column_width + column_gap, columns_top + self.debug_panel_font_size),
+            line_height=line_height,
+            background_alpha=0.0,
+            font_path=self.font_path,
+            font_size=self.debug_panel_font_size,
+        )
+        return panel
 
     @staticmethod
     def _ocr_status_lines(ocr_result: OcrResult | None) -> list[str]:
