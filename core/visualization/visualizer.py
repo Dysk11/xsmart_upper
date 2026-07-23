@@ -382,7 +382,7 @@ class Visualizer:
         result: CarAvoidanceResult,
         roi_offset: tuple[int, int],
     ) -> np.ndarray:
-        """Draw expanded warning boxes and the final constrained route."""
+        """Draw original car boxes, the locked boundary, and the blended route."""
 
         output = image
         boundary_route = getattr(result, "boundary_route_points", [])
@@ -616,7 +616,9 @@ class Visualizer:
                         f"cars={len(car_avoidance_result.warning_zones)} "
                         f"edge={car_avoidance_result.edge_limited} "
                         f"stop={car_avoidance_result.stop_required} "
-                        f"recovery={getattr(car_avoidance_result, 'recovery_progress', 0.0):.2f}"
+                        f"side={getattr(car_avoidance_result, 'locked_side', None)} "
+                        f"phase={getattr(car_avoidance_result, 'transition_phase', 'inactive')} "
+                        f"progress={getattr(car_avoidance_result, 'transition_progress', 0.0):.2f}"
                     ),
                     f"car reason: {car_avoidance_result.reason}",
                 ]

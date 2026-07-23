@@ -151,18 +151,20 @@ def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     assert tuple(frame[60, 45]) == (0, 0, 255)
 
 
-def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
+def test_original_car_box_and_avoidance_route_are_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
     result = SimpleNamespace(
         active=True,
         shifted_centerline_points=[(69.0, 150.0), (69.0, 50.0)],
         boundary_route_points=[(40.0, 150.0), (40.0, 50.0)],
-        recovery_progress=0.0,
+        locked_side="left",
+        transition_phase="entry",
+        transition_progress=0.0,
         stop_required=False,
         warning_zones=[
             SimpleNamespace(
-                bbox_frame=(70.0, 50.0, 130.0, 110.0),
+                bbox_frame=(80.0, 60.0, 120.0, 100.0),
                 avoid_side="left",
             )
         ],
@@ -174,7 +176,7 @@ def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
         roi_offset=(0, 0),
     )
 
-    assert tuple(output[50, 70]) == (0, 128, 255)
+    assert tuple(output[60, 80]) == (0, 128, 255)
     assert tuple(output[150, 69]) == (0, 255, 255)
     assert tuple(output[150, 40]) == (255, 0, 255)
 

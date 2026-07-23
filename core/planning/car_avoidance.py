@@ -1,4 +1,4 @@
-"""Lightweight car avoidance using selected track boundaries."""
+"""Low-complexity car avoidance using one locked track boundary."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ BBox = Tuple[float, float, float, float]
 
 @dataclass(frozen=True)
 class CarWarningZone:
-    """One expanded car box expressed in frame and lane-ROI coordinates."""
+    """One original car detection box in frame and lane-ROI coordinates."""
 
     bbox_frame: BBox
     bbox_roi: BBox
@@ -39,11 +39,13 @@ class CarAvoidanceResult:
     stop_required: bool
     reason: str
     boundary_route_points: list[Point]
-    recovery_progress: float
+    locked_side: str | None
+    transition_phase: str
+    transition_progress: float
 
 
 class CarAvoidancePlanner:
-    """Follow a selected track boundary with spatial and temporal smoothstep."""
+    """Blend between the normal route and one episode-locked track boundary."""
 
     def __init__(
         self,
@@ -52,30 +54,31 @@ class CarAvoidancePlanner:
         max_boundary_gap_rows: int = 12,
     ) -> None:
         self.enabled = bool(config.get("enabled", True))
-        self.box_scale = float(config.get("box_scale", 1.5))
-        self.transition_margin_px = float(config.get("transition_margin_px", 40.0))
-        self.edge_slow_margin_px = float(config.get("edge_slow_margin_px", 20.0))
+        self.entry_duration_s = float(config.get("entry_duration_s", 1.0))
         self.release_duration_s = float(config.get("release_duration_s", 1.0))
+        self.edge_slow_margin_px = float(config.get("edge_slow_margin_px", 20.0))
         self.max_boundary_gap_rows = int(max_boundary_gap_rows)
-        if self.box_scale < 1.0:
-            raise ValueError("car_avoidance.box_scale must be >= 1.0")
-        if self.transition_margin_px <= 0.0:
-            raise ValueError("car_avoidance.transition_margin_px must be > 0")
-        if self.edge_slow_margin_px < 0.0:
-            raise ValueError("car_avoidance.edge_slow_margin_px must be >= 0")
+        if self.entry_duration_s <= 0.0:
+            raise ValueError("car_avoidance.entry_duration_s must be > 0")
         if self.release_duration_s <= 0.0:
             raise ValueError("car_avoidance.release_duration_s must be > 0")
+        if self.edge_slow_margin_px < 0.0:
+            raise ValueError("car_avoidance.edge_slow_margin_px must be >= 0")
         if self.max_boundary_gap_rows < 0:
-            raise ValueError("lane_geometry.boundary.max_single_side_gap_rows must be >= 0")
+            raise ValueError(
+                "lane_geometry.boundary.max_single_side_gap_rows must be >= 0"
+            )
         self.target_selector = target_selector
 
         self._last_detection_result_id: int | None = None
+        self._last_detection_zones: list[CarWarningZone] = []
         self._last_live_zones: list[CarWarningZone] = []
-        self._last_active_route: list[Point] = []
-        self._last_active_base_route: list[Point] = []
+        self._last_output_route: list[Point] = []
         self._last_boundary_route: list[Point] = []
-        self._release_start_monotonic: float | None = None
-        self._recovery_offsets: list[Point] = []
+        self._locked_side: str | None = None
+        self._phase = "inactive"
+        self._transition_start_monotonic: float | None = None
+        self._transition_start_offsets: list[Point] = []
 
     def plan(
         self,
@@ -102,40 +105,101 @@ class CarAvoidancePlanner:
 
         detection_id = int(detection_result_id)
         new_detection = detection_id != self._last_detection_result_id
-        zones = self._build_warning_zones(
+        detected_zones = self._build_original_zones(
             objects=objects,
-            base_route=base_route,
             roi_rect=roi_rect,
             roi_width=roi_width,
             roi_height=roi_height,
         )
         if new_detection:
             self._last_detection_result_id = detection_id
-        elif (
-            not zones
-            and self._release_start_monotonic is None
-            and self._last_active_route
-        ):
-            # Reusing a cached detector result must not confirm that the car vanished.
-            zones = list(self._last_live_zones)
+            self._last_detection_zones = list(detected_zones)
+        # Reusing an AI result must preserve whether that result contained a car.
+        zones = list(self._last_detection_zones)
 
         if zones:
-            self._release_start_monotonic = None
-            self._recovery_offsets = []
+            if self._phase == "inactive":
+                if not base_route:
+                    return self._stop(
+                        normal_target=normal_target,
+                        zones=zones,
+                        reason=(
+                            "car box intersects ROI but no lane centerline is available"
+                        ),
+                        route=[],
+                        boundary_route=[],
+                        transition_phase="entry",
+                        transition_progress=0.0,
+                    )
+                primary = self._select_primary_zone(zones)
+                self._locked_side = self._choose_avoid_side(
+                    primary,
+                    base_route=base_route,
+                    roi_x1=float(roi_rect[0]),
+                    roi_y1=float(roi_rect[1]),
+                )
+                self._start_transition(
+                    phase="entry",
+                    now_monotonic=now,
+                    base_route=base_route,
+                    start_route=base_route,
+                )
+            elif self._phase == "recovery":
+                # Re-enter from the route currently being commanded, without a jump.
+                start_route = self._last_output_route or base_route
+                self._start_transition(
+                    phase="entry",
+                    now_monotonic=now,
+                    base_route=base_route,
+                    start_route=start_route,
+                )
+
+            if self._locked_side is None:
+                return self._stop(
+                    normal_target=normal_target,
+                    zones=zones,
+                    reason="car avoidance side is unavailable",
+                    route=[],
+                    boundary_route=[],
+                    transition_phase="entry",
+                    transition_progress=0.0,
+                )
+
+            zones = [
+                CarWarningZone(
+                    bbox_frame=zone.bbox_frame,
+                    bbox_roi=zone.bbox_roi,
+                    car_center_x_frame=zone.car_center_x_frame,
+                    avoid_side=self._locked_side,
+                    confidence=zone.confidence,
+                )
+                for zone in zones
+            ]
+            self._last_live_zones = list(zones)
             return self._plan_live_avoidance(
                 base_route=base_route,
                 track_boundary_rows=track_boundary_rows,
                 zones=zones,
+                now_monotonic=now,
                 roi_width=roi_width,
                 roi_height=roi_height,
                 lane_confidence=lane_confidence,
                 normal_target=normal_target,
             )
 
-        if new_detection and self._last_active_route and self._release_start_monotonic is None:
-            self._start_recovery(now)
+        if (
+            new_detection
+            and self._phase in {"entry", "hold"}
+            and self._transition_start_monotonic is not None
+        ):
+            self._start_transition(
+                phase="recovery",
+                now_monotonic=now,
+                base_route=base_route,
+                start_route=self._last_output_route or base_route,
+            )
 
-        if self._release_start_monotonic is not None:
+        if self._phase == "recovery":
             return self._plan_recovery(
                 base_route=base_route,
                 now_monotonic=now,
@@ -145,86 +209,189 @@ class CarAvoidancePlanner:
                 normal_target=normal_target,
             )
 
-        return self._inactive(
-            base_route,
-            normal_target,
-            "no car warning zone in ROI",
-            warning_zones=zones,
-        )
+        return self._inactive(base_route, normal_target, "no original car box in ROI")
 
     def _plan_live_avoidance(
         self,
         base_route: list[Point],
         track_boundary_rows: Sequence[LaneBoundaryRow],
         zones: list[CarWarningZone],
+        now_monotonic: float,
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
         normal_target: TargetPointResult,
     ) -> CarAvoidanceResult:
         if not base_route:
-            self._clear_route_state()
             return self._stop(
-                normal_target,
-                zones,
-                "car warning zone is in ROI but no lane centerline is available",
+                normal_target=normal_target,
+                zones=zones,
+                reason="lane centerline unavailable during car avoidance",
+                route=[],
+                boundary_route=[],
+                transition_phase=self._phase,
+                transition_progress=0.0,
             )
+        assert self._locked_side in {"left", "right"}
 
-        shifted, boundary_route, feasible, failure_reason = self._build_boundary_route(
+        boundary_route, failure_reason = self._build_boundary_route(
             base_route=base_route,
             boundary_rows=track_boundary_rows,
-            zones=zones,
-            roi_width=roi_width,
-            roi_height=roi_height,
+            side=self._locked_side,
         )
-        if not feasible:
-            self._clear_route_state()
-            return self._stop(normal_target, zones, failure_reason)
-
-        colliding = [
-            zone
-            for zone in zones
-            if self.polyline_intersects_rect(shifted, zone.bbox_roi)
-        ]
-        if colliding:
-            self._clear_route_state()
+        if not boundary_route:
             return self._stop(
-                normal_target,
-                zones,
-                "final segment-to-warning-zone validation failed",
+                normal_target=normal_target,
+                zones=zones,
+                reason=failure_reason,
+                route=[],
+                boundary_route=[],
+                transition_phase=self._phase,
+                transition_progress=0.0,
             )
 
+        if self._phase == "entry":
+            progress = self._transition_progress(
+                now_monotonic,
+                self.entry_duration_s,
+            )
+            weight = self._smoothstep(progress)
+            route = self._blend_to_route(
+                base_route=base_route,
+                destination_route=boundary_route,
+                start_offsets=self._transition_start_offsets,
+                destination_weight=weight,
+            )
+            if progress >= 1.0:
+                self._phase = "hold"
+        else:
+            progress = 1.0
+            route = list(boundary_route)
+
+        self._last_output_route = list(route)
+        self._last_boundary_route = list(boundary_route)
+        phase = "hold" if self._phase == "hold" else "entry"
         target = self.target_selector.select(
-            centerline_points=shifted,
+            centerline_points=route,
             roi_width=roi_width,
             roi_height=roi_height,
             lane_confidence=lane_confidence,
         )
-        edge_limited = self._is_edge_limited(shifted, roi_width)
-        mode = "CAR_AVOID_EDGE" if edge_limited else "CAR_AVOID"
-        sides = ",".join(zone.avoid_side for zone in zones)
+        colliding = [
+            zone
+            for zone in zones
+            if self.polyline_intersects_rect(route, zone.bbox_roi)
+        ]
+        if colliding:
+            return self._stop(
+                normal_target=target,
+                zones=zones,
+                reason=(
+                    "transition route intersects an original car box: "
+                    f"cars={len(colliding)}"
+                ),
+                route=route,
+                boundary_route=boundary_route,
+                transition_phase=phase,
+                transition_progress=progress,
+            )
 
-        self._last_live_zones = list(zones)
-        self._last_active_route = list(shifted)
-        self._last_active_base_route = list(base_route)
-        self._last_boundary_route = list(boundary_route)
+        edge_limited = self._is_edge_limited(route, roi_width)
+        mode = "CAR_AVOID_EDGE" if edge_limited else "CAR_AVOID"
         return CarAvoidanceResult(
             active=True,
             mode=mode,
             warning_zones=list(zones),
-            shifted_centerline_points=shifted,
+            shifted_centerline_points=route,
             target_result=target,
             edge_limited=edge_limited,
             stop_required=False,
-            reason=f"{mode}: cars={len(zones)} sides={sides}",
+            reason=(
+                f"{mode}: side={self._locked_side} phase={phase} "
+                f"progress={progress:.3f} cars={len(zones)}"
+            ),
             boundary_route_points=boundary_route,
-            recovery_progress=0.0,
+            locked_side=self._locked_side,
+            transition_phase=phase,
+            transition_progress=float(progress),
         )
 
-    def _build_warning_zones(
+    def _plan_recovery(
+        self,
+        base_route: list[Point],
+        now_monotonic: float,
+        roi_width: int,
+        roi_height: int,
+        lane_confidence: float,
+        normal_target: TargetPointResult,
+    ) -> CarAvoidanceResult:
+        if not base_route or not self._transition_start_offsets:
+            return self._stop(
+                normal_target=normal_target,
+                zones=self._last_live_zones,
+                reason="normal lane centerline unavailable during car avoidance recovery",
+                route=[],
+                boundary_route=self._last_boundary_route,
+                transition_phase="recovery",
+                transition_progress=0.0,
+            )
+
+        progress = self._transition_progress(
+            now_monotonic,
+            self.release_duration_s,
+        )
+        if progress >= 1.0:
+            old_zones = list(self._last_live_zones)
+            self._clear_route_state()
+            return self._inactive(
+                base_route,
+                normal_target,
+                "car avoidance recovery complete",
+                warning_zones=old_zones,
+            )
+
+        remaining_weight = 1.0 - self._smoothstep(progress)
+        max_x = float(max(0, roi_width - 1))
+        route = [
+            (
+                clamp(
+                    base_x
+                    + remaining_weight
+                    * self._interpolate_x(self._transition_start_offsets, y),
+                    0.0,
+                    max_x,
+                ),
+                y,
+            )
+            for base_x, y in base_route
+        ]
+        route = self._deduplicate_rows(route)
+        self._last_output_route = list(route)
+        target = self.target_selector.select(
+            centerline_points=route,
+            roi_width=roi_width,
+            roi_height=roi_height,
+            lane_confidence=lane_confidence,
+        )
+        edge_limited = self._is_edge_limited(route, roi_width)
+        return CarAvoidanceResult(
+            active=True,
+            mode="CAR_AVOID_RECOVERY",
+            warning_zones=list(self._last_live_zones),
+            shifted_centerline_points=route,
+            target_result=target,
+            edge_limited=edge_limited,
+            stop_required=False,
+            reason=f"CAR_AVOID_RECOVERY: progress={progress:.3f}",
+            boundary_route_points=list(self._last_boundary_route),
+            locked_side=self._locked_side,
+            transition_phase="recovery",
+            transition_progress=float(progress),
+        )
+
+    def _build_original_zones(
         self,
         objects: Sequence[DetectedObject],
-        base_route: Sequence[Point],
         roi_rect: tuple[int, int, int, int],
         roi_width: int,
         roi_height: int,
@@ -232,6 +399,8 @@ class CarAvoidancePlanner:
         roi_x1, roi_y1, _, _ = roi_rect
         max_x = float(max(0, roi_width - 1))
         max_y = float(max(0, roi_height - 1))
+        roi_extent_x = float(max(0, roi_width))
+        roi_extent_y = float(max(0, roi_height))
         zones: list[CarWarningZone] = []
         for obj in objects:
             if obj.class_name.casefold() != "car":
@@ -239,25 +408,16 @@ class CarAvoidancePlanner:
             x1, y1, x2, y2 = [float(value) for value in obj.bbox_frame]
             if x2 <= x1 or y2 <= y1:
                 continue
-            center_x = 0.5 * (x1 + x2)
-            center_y = 0.5 * (y1 + y2)
-            half_width = 0.5 * (x2 - x1) * self.box_scale
-            half_height = 0.5 * (y2 - y1) * self.box_scale
-            expanded_frame = (
-                center_x - half_width,
-                center_y - half_height,
-                center_x + half_width,
-                center_y + half_height,
-            )
             raw_roi = (
-                expanded_frame[0] - float(roi_x1),
-                expanded_frame[1] - float(roi_y1),
-                expanded_frame[2] - float(roi_x1),
-                expanded_frame[3] - float(roi_y1),
+                x1 - float(roi_x1),
+                y1 - float(roi_y1),
+                x2 - float(roi_x1),
+                y2 - float(roi_y1),
             )
-            if raw_roi[2] < 0.0 or raw_roi[0] > max_x:
+            # Inclusive comparisons make edge contact count as entering the ROI.
+            if raw_roi[2] < 0.0 or raw_roi[0] > roi_extent_x:
                 continue
-            if raw_roi[3] < 0.0 or raw_roi[1] > max_y:
+            if raw_roi[3] < 0.0 or raw_roi[1] > roi_extent_y:
                 continue
             clipped_roi = (
                 clamp(raw_roi[0], 0.0, max_x),
@@ -265,143 +425,58 @@ class CarAvoidancePlanner:
                 clamp(raw_roi[2], 0.0, max_x),
                 clamp(raw_roi[3], 0.0, max_y),
             )
-            car_center_y_roi = center_y - float(roi_y1)
-            lane_x_roi = (
-                self._interpolate_x(base_route, car_center_y_roi)
-                if base_route
-                else center_x - float(roi_x1)
-            )
-            lane_x_frame = float(roi_x1) + lane_x_roi
-            avoid_side = "left" if lane_x_frame <= center_x else "right"
             zones.append(
                 CarWarningZone(
-                    bbox_frame=expanded_frame,
+                    bbox_frame=(x1, y1, x2, y2),
                     bbox_roi=clipped_roi,
-                    car_center_x_frame=center_x,
-                    avoid_side=avoid_side,
+                    car_center_x_frame=0.5 * (x1 + x2),
+                    avoid_side=self._locked_side or "unlocked",
                     confidence=float(obj.confidence),
                 )
             )
         return zones
 
+    @staticmethod
+    def _select_primary_zone(zones: Sequence[CarWarningZone]) -> CarWarningZone:
+        return max(
+            zones,
+            key=lambda zone: (
+                zone.bbox_frame[3],
+                zone.confidence,
+            ),
+        )
+
+    def _choose_avoid_side(
+        self,
+        primary: CarWarningZone,
+        base_route: Sequence[Point],
+        roi_x1: float,
+        roi_y1: float,
+    ) -> str:
+        car_center_y_roi = (
+            0.5 * (primary.bbox_frame[1] + primary.bbox_frame[3])
+            - roi_y1
+        )
+        lane_x_frame = roi_x1 + self._interpolate_x(base_route, car_center_y_roi)
+        return "left" if lane_x_frame <= primary.car_center_x_frame else "right"
+
     def _build_boundary_route(
         self,
         base_route: Sequence[Point],
         boundary_rows: Sequence[LaneBoundaryRow],
-        zones: Sequence[CarWarningZone],
-        roi_width: int,
-        roi_height: int,
-    ) -> tuple[list[Point], list[Point], bool, str]:
-        max_x = float(max(0, roi_width - 1))
-        max_y = float(max(0, roi_height - 1))
-        anchor_ys = {float(y) for _, y in base_route}
-        for zone in zones:
-            _, top, _, bottom = zone.bbox_roi
-            start = clamp(top - self.transition_margin_px, 0.0, max_y)
-            end = clamp(bottom + self.transition_margin_px, 0.0, max_y)
-            anchor_ys.update({start, top, bottom, end})
-            anchor_ys.update(float(y) for y in range(int(start), int(end) + 1))
-
-        boundary_cache: dict[tuple[int, str], float | None] = {}
-
-        def boundary_x(y: float, side: str) -> float | None:
-            cache_key = (int(round(y * 1000.0)), side)
-            if cache_key not in boundary_cache:
-                boundary_cache[cache_key] = self._interpolate_boundary_x(
-                    boundary_rows,
-                    target_y=y,
-                    side=side,
-                )
-            return boundary_cache[cache_key]
-
-        # Every pixel row inside a warning box must have a trustworthy boundary.
-        for zone in zones:
-            _, top, _, bottom = zone.bbox_roi
-            core_ys = {top, bottom}
-            core_ys.update(
-                float(y)
-                for y in range(
-                    max(0, int(top)),
-                    min(int(max_y), int(bottom)) + 1,
-                )
-            )
-            for y in core_ys:
-                if boundary_x(y, zone.avoid_side) is None:
-                    return (
-                        list(base_route),
-                        [],
-                        False,
-                        f"missing {zone.avoid_side} track boundary at roi_y={y:.1f}",
-                    )
-
+        side: str,
+    ) -> tuple[list[Point], str]:
         route: list[Point] = []
-        selected_boundary: list[Point] = []
-        for y in sorted(anchor_ys, reverse=True):
-            base_x = self._interpolate_x(base_route, y)
-            core_zones = [
-                zone
-                for zone in zones
-                if zone.bbox_roi[1] <= y <= zone.bbox_roi[3]
-            ]
-            core_sides = {zone.avoid_side for zone in core_zones}
-            if len(core_sides) > 1:
-                return (
-                    list(base_route),
-                    [],
-                    False,
-                    f"overlapping cars require opposite boundaries at roi_y={y:.1f}",
-                )
-
-            if core_zones:
-                side = core_zones[0].avoid_side
-                selected_x = boundary_x(y, side)
-                if selected_x is None:
-                    return (
-                        list(base_route),
-                        [],
-                        False,
-                        f"missing {side} track boundary at roi_y={y:.1f}",
-                    )
-                route_x = selected_x
-                selected_boundary.append((float(selected_x), float(y)))
-            else:
-                weighted_offsets: list[tuple[float, float]] = []
-                for zone in zones:
-                    _, top, _, bottom = zone.bbox_roi
-                    weight = self._influence_weight(y, top, bottom)
-                    if weight <= 0.0:
-                        continue
-                    selected_x = boundary_x(y, zone.avoid_side)
-                    if selected_x is None:
-                        edge_y = top if y < top else bottom
-                        selected_x = boundary_x(edge_y, zone.avoid_side)
-                    if selected_x is None:
-                        continue
-                    weighted_offsets.append((weight, selected_x - base_x))
-                if weighted_offsets:
-                    weight_sum = sum(weight for weight, _ in weighted_offsets)
-                    combined_offset = sum(
-                        weight * offset for weight, offset in weighted_offsets
-                    ) / max(1.0, weight_sum)
-                    route_x = base_x + combined_offset
-                else:
-                    route_x = base_x
-
-            if route_x < 0.0 or route_x > max_x:
-                return (
-                    list(base_route),
-                    [],
-                    False,
-                    f"selected track boundary leaves ROI at roi_y={y:.1f}",
-                )
-            route.append((float(route_x), float(y)))
-
-        return (
-            self._deduplicate_rows(route),
-            self._deduplicate_rows(selected_boundary),
-            True,
-            "",
-        )
+        for _, y in base_route:
+            boundary_x = self._interpolate_boundary_x(
+                boundary_rows,
+                target_y=y,
+                side=side,
+            )
+            if boundary_x is None:
+                return [], f"missing {side} track boundary at roi_y={y:.1f}"
+            route.append((float(boundary_x), float(y)))
+        return self._deduplicate_rows(route), ""
 
     def _interpolate_boundary_x(
         self,
@@ -424,7 +499,6 @@ class CarAvoidancePlanner:
         )
         if not samples:
             return None
-
         for x, y in samples:
             if abs(y - target_y) <= 1e-6:
                 return x
@@ -446,98 +520,51 @@ class CarAvoidancePlanner:
         ratio = (target_y - lower[1]) / (upper[1] - lower[1])
         return float(lower[0] + (upper[0] - lower[0]) * ratio)
 
-    def _start_recovery(self, now_monotonic: float) -> None:
-        anchor_ys = {
-            float(y)
-            for _x, y in self._last_active_route + self._last_active_base_route
-        }
-        self._recovery_offsets = [
-            (
-                self._interpolate_x(self._last_active_route, y)
-                - self._interpolate_x(self._last_active_base_route, y),
-                y,
-            )
-            for y in sorted(anchor_ys, reverse=True)
-        ]
-        self._release_start_monotonic = float(now_monotonic)
-
-    def _plan_recovery(
+    def _start_transition(
         self,
-        base_route: list[Point],
+        phase: str,
         now_monotonic: float,
-        roi_width: int,
-        roi_height: int,
-        lane_confidence: float,
-        normal_target: TargetPointResult,
-    ) -> CarAvoidanceResult:
-        assert self._release_start_monotonic is not None
-        elapsed = max(0.0, now_monotonic - self._release_start_monotonic)
-        progress = clamp(elapsed / self.release_duration_s, 0.0, 1.0)
-        if progress >= 1.0:
-            old_zones = list(self._last_live_zones)
-            self._clear_route_state()
-            return self._inactive(
-                base_route,
-                normal_target,
-                "car avoidance recovery complete",
-                warning_zones=old_zones,
-            )
-        if not base_route or not self._recovery_offsets:
-            self._clear_route_state()
-            return self._stop(
-                normal_target,
-                self._last_live_zones,
-                "normal lane centerline unavailable during car avoidance recovery",
-            )
-
-        smooth_progress = self._smoothstep(progress)
-        remaining_weight = 1.0 - smooth_progress
-        anchor_ys = {
-            float(y) for _x, y in base_route + self._recovery_offsets
-        }
-        max_x = float(max(0, roi_width - 1))
-        route = [
+        base_route: Sequence[Point],
+        start_route: Sequence[Point],
+    ) -> None:
+        self._phase = phase
+        self._transition_start_monotonic = float(now_monotonic)
+        self._transition_start_offsets = [
             (
-                clamp(
-                    self._interpolate_x(base_route, y)
-                    + remaining_weight
-                    * self._interpolate_x(self._recovery_offsets, y),
-                    0.0,
-                    max_x,
-                ),
+                self._interpolate_x(start_route, y) - base_x,
                 y,
             )
-            for y in sorted(anchor_ys, reverse=True)
+            for base_x, y in base_route
         ]
-        route = self._deduplicate_rows(route)
-        target = self.target_selector.select(
-            centerline_points=route,
-            roi_width=roi_width,
-            roi_height=roi_height,
-            lane_confidence=lane_confidence,
-        )
-        edge_limited = self._is_edge_limited(route, roi_width)
-        return CarAvoidanceResult(
-            active=True,
-            mode="CAR_AVOID_RECOVERY",
-            warning_zones=list(self._last_live_zones),
-            shifted_centerline_points=route,
-            target_result=target,
-            edge_limited=edge_limited,
-            stop_required=False,
-            reason=f"CAR_AVOID_RECOVERY: progress={progress:.3f}",
-            boundary_route_points=list(self._last_boundary_route),
-            recovery_progress=float(progress),
-        )
 
-    def _influence_weight(self, y: float, top: float, bottom: float) -> float:
-        if top <= y <= bottom:
-            return 1.0
-        distance = top - y if y < top else y - bottom
-        if distance >= self.transition_margin_px:
+    def _transition_progress(
+        self,
+        now_monotonic: float,
+        duration_s: float,
+    ) -> float:
+        if self._transition_start_monotonic is None:
             return 0.0
-        ratio = 1.0 - distance / self.transition_margin_px
-        return self._smoothstep(clamp(ratio, 0.0, 1.0))
+        elapsed = max(0.0, now_monotonic - self._transition_start_monotonic)
+        return clamp(elapsed / duration_s, 0.0, 1.0)
+
+    def _blend_to_route(
+        self,
+        base_route: Sequence[Point],
+        destination_route: Sequence[Point],
+        start_offsets: Sequence[Point],
+        destination_weight: float,
+    ) -> list[Point]:
+        route = []
+        for base_x, y in base_route:
+            start_x = base_x + self._interpolate_x(start_offsets, y)
+            destination_x = self._interpolate_x(destination_route, y)
+            route.append(
+                (
+                    start_x + destination_weight * (destination_x - start_x),
+                    y,
+                )
+            )
+        return self._deduplicate_rows(route)
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -641,15 +668,17 @@ class CarAvoidancePlanner:
 
     def _clear_state(self) -> None:
         self._last_detection_result_id = None
+        self._last_detection_zones = []
         self._clear_route_state()
 
     def _clear_route_state(self) -> None:
         self._last_live_zones = []
-        self._last_active_route = []
-        self._last_active_base_route = []
+        self._last_output_route = []
         self._last_boundary_route = []
-        self._release_start_monotonic = None
-        self._recovery_offsets = []
+        self._locked_side = None
+        self._phase = "inactive"
+        self._transition_start_monotonic = None
+        self._transition_start_offsets = []
 
     @staticmethod
     def _inactive(
@@ -668,24 +697,32 @@ class CarAvoidancePlanner:
             stop_required=False,
             reason=reason,
             boundary_route_points=[],
-            recovery_progress=1.0,
+            locked_side=None,
+            transition_phase="inactive",
+            transition_progress=1.0,
         )
 
-    @staticmethod
     def _stop(
+        self,
         normal_target: TargetPointResult,
         zones: Sequence[CarWarningZone],
         reason: str,
+        route: Sequence[Point],
+        boundary_route: Sequence[Point],
+        transition_phase: str,
+        transition_progress: float,
     ) -> CarAvoidanceResult:
         return CarAvoidanceResult(
             active=True,
             mode="CAR_AVOID_STOP",
             warning_zones=list(zones),
-            shifted_centerline_points=[],
+            shifted_centerline_points=list(route),
             target_result=normal_target,
             edge_limited=False,
             stop_required=True,
             reason=reason,
-            boundary_route_points=[],
-            recovery_progress=0.0,
+            boundary_route_points=list(boundary_route),
+            locked_side=self._locked_side,
+            transition_phase=transition_phase,
+            transition_progress=float(transition_progress),
         )
