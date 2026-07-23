@@ -1568,6 +1568,9 @@ class UpperMachineApp:
         self.last_pedestrian_safety_result = self.pedestrian_safety_analyzer.analyze(
             objects=self.last_detected_objects,
             roi_rect=roi_rect,
+            target_point_roi=normal_target.target_point_roi,
+            detection_result_id=self.last_ai_frame_id,
+            now_monotonic=time.monotonic(),
         )
         path_marker_result = self.path_marker_target_planner.plan(
             objects=self.last_detected_objects,

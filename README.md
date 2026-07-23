@@ -160,7 +160,7 @@ python main.py --mode video --video /path/to/demo.mp4 --bridge mock
 
 # RKNN 目标识别、行人停车、吃 coin 功能
 
-本章节说明当前工程里和目标检测模型、固定危险区行人停车、`coin` 目标追踪相关的实现细节。
+本章节说明当前工程里和目标检测模型、行人目标点穿越停车、`coin` 目标追踪相关的实现细节。
 
 ## 1. 当前已接入的内容
 
@@ -170,7 +170,7 @@ python main.py --mode video --video /path/to/demo.mp4 --bridge mock
 - 测试视频：`outputs/video/cbf977c5bd5978922b972f4f0285c0bd.mp4`
 - RKNN 推理模块：`core/object/rknn_detector.py`
 - coin 目标规划模块：`core/planning/gold_target.py`
-- 行人危险区模块：`core/object/pedestrian_safety.py`
+- 行人目标点穿越模块：`core/object/pedestrian_safety.py`
 - 主流程入口：`main.py`
 - 主要配置文件：`config.yaml`
 
@@ -214,10 +214,10 @@ rknn_object_detector:
 当前主逻辑优先级是：
 
 ```text
-脱轨停车 > 行人危险区停车 > 路牌分析停车等待 > Go/Stop 路径 > 吃 coin > 普通巡线
+脱轨停车 > 行人穿越等待 > 路牌分析停车等待 > Go/Stop 路径 > 吃 coin > 普通巡线
 ```
 
-行人框触发危险区锁存后，运行模式为 `PEDESTRIAN_WAIT`，目标速度和协议
+行人框触发目标点穿越锁存后，运行模式为 `PEDESTRIAN_WAIT`，目标速度和协议
 `speed_state` 均为 0。`car` 只显示检测框，不参与车辆控制。
 
 ## 4. coin 目标逻辑
@@ -238,37 +238,37 @@ rknn_object_detector:
 
 调试画面中紫线为 Go/Stop 连接路径，`L/U` 为下方和上方锚点，`P` 为检测框中心目标。
 
-## 6. human 危险区停车逻辑
+## 6. human 目标点穿越停车逻辑
 
-危险区由 `pedestrian_safety.danger_zone` 的 ROI 相对比例配置，默认覆盖 ROI
-中央 40% 宽度和全部高度。完整 `human` 检测框面积达到
-`min_box_area_px: 600` 且与危险区存在正面积交集时，车辆立即停车并锁存。
+`center_region` 由 ROI 相对横坐标配置并贯穿 ROI 全高；其左侧是 `left`
+区域，右侧是 `right` 区域。完整 `human` 框面积达到 `min_box_area_px: 600`
+且框中心位于 ROI 时，车辆选择面积最大的合格行人并立即停车。
 
 ```yaml
 pedestrian_safety:
   enabled: true
   min_box_area_px: 600
-  danger_zone:
+  rearm_cooldown_sec: 3.0
+  center_region:
     left_ratio: 0.30
     right_ratio: 0.70
-    top_ratio: 0.00
-    bottom_ratio: 1.00
 ```
 
-锁存后不再使用面积门槛：最新结果没有 `human` 时继续等待，任一 `human`
-仍与危险区重叠时继续等待；只有至少识别到一个 `human` 且所有框均与危险区
-零重叠时才恢复。完全走出 ROI 但仍被目标检测器识别到的 `human` 可用于解除。
+停车时冻结普通巡线目标点 x 和它所属的 `left/center/right` 区域。后续结果
+始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时无限
+保持停车。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标只
+接受左到右。完成穿越后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发。
 `car` 不触发停车或避让。
 
 ## 7. 主流程顺序
 
-1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 行人危险区判断 -> 6. 决策规划（停车 > Go/Stop 路径 > 金币 > 巡线） -> 7. 生成协议帧发送。
+1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 行人目标点穿越判断 -> 6. 决策规划（停车 > Go/Stop 路径 > 金币 > 巡线） -> 7. 生成协议帧发送。
 
 ## 8. 如何确认功能正常
 
 1. 终端出现 `RKNN detector loaded`；
 2. 调试画面中出现 `coin/Go/Stop/car/human` 目标框；
-3. 画面上 `G` 为 coin 目标点，`P` 为 Go/Stop 框中心，黄色/红色矩形为行人危险区；
+3. 画面上 `G` 为 coin 目标点，`P` 为 Go/Stop 框中心，两条黄线分隔 `LEFT/CENTER/RIGHT`，停车时红线为冻结目标 x；
 4. 行人停车时模式显示 `PEDESTRIAN_WAIT`，Go/Stop 路径显示 `PATH_TARGET`，吃金币时显示 `GOLD`。
 
 ---
@@ -348,7 +348,7 @@ python3 main.py --mode camera --bridge serial
 - 首次自动选路前，用原始左右候选线的平均绝对二阶差分评估粗糙度；超过 `roughness_threshold_px`（默认 `3 px`）的候选会被舍弃。若两侧都粗糙，则舍弃粗糙度更大的一侧；差值不超过 `roughness_tie_margin_px`（默认 `0.1 px`）时回退到画面中心距离规则；
 - 把 120 行赛道权重重采样到当前 ROI，计算加权横向误差并做三帧时域滤波；
 - 通过左右边界外移、拐点、丢线统计和连续帧确认独立上报左/右岔路；无新方向时，以整幅画面中心线表示车辆朝向，选择平均横向距离短至少 `1 px` 的候选路线并锁定，距离差不超过 `1 px` 时继续普通巡线，离开岔路后释放；
-- 行人危险区停车、coin 目标和丢线历史恢复按新的优先级链工作。
+- 行人目标点穿越停车、coin 目标和丢线历史恢复按新的优先级链工作。
 
 ## RK3588 PP-OCR 路牌识别
 

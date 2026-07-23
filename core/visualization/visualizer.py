@@ -267,7 +267,7 @@ class Visualizer:
                 label="N",
             )
         if pedestrian_safety_result is not None:
-            self._draw_pedestrian_danger_zone(
+            self._draw_pedestrian_regions(
                 original_panel,
                 pedestrian_safety_result,
             )
@@ -354,31 +354,67 @@ class Visualizer:
                 cv2.LINE_AA,
             )
 
-    def _draw_pedestrian_danger_zone(
+    def _draw_pedestrian_regions(
         self,
         image: np.ndarray,
         result: PedestrianSafetyResult,
     ) -> None:
-        x1, y1, x2, y2 = result.danger_zone_frame
-        color = (0, 0, 255) if result.stop_required else (0, 255, 255)
-        thickness = 3 if result.stop_required else 2
-        cv2.rectangle(
-            image,
-            (int(round(x1)), int(round(y1))),
-            (int(round(x2)), int(round(y2))),
-            color,
-            thickness,
-        )
-        cv2.putText(
-            image,
-            "DANGER",
-            (int(round(x1)) + 4, max(18, int(round(y1)) + 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            cv2.LINE_AA,
-        )
+        center_left, y1, center_right, y2 = result.center_region_frame
+        boundary_color = (0, 255, 255)
+        top = int(round(y1))
+        bottom = int(round(y2))
+        left = int(round(center_left))
+        right = int(round(center_right))
+        cv2.line(image, (left, top), (left, bottom), boundary_color, 2)
+        cv2.line(image, (right, top), (right, bottom), boundary_color, 2)
+
+        label_y = max(18, top + 20)
+        for label, label_x in (
+            ("LEFT", max(2, left - 55)),
+            ("CENTER", left + 5),
+            ("RIGHT", right + 5),
+        ):
+            cv2.putText(
+                image,
+                label,
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                boundary_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        if result.frozen_target_x_frame is not None:
+            target_x = int(round(result.frozen_target_x_frame))
+            target_color = (0, 0, 255) if result.stop_required else (255, 255, 0)
+            cv2.line(
+                image,
+                (target_x, top),
+                (target_x, bottom),
+                target_color,
+                3,
+            )
+            cv2.putText(
+                image,
+                f"TARGET {result.target_region.upper()}",
+                (target_x + 5, min(bottom - 5, label_y + 22)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                target_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        if result.tracked_center_frame is not None:
+            tracked_x, tracked_y = result.tracked_center_frame
+            cv2.circle(
+                image,
+                (int(round(tracked_x)), int(round(tracked_y))),
+                7,
+                (0, 0, 255),
+                -1,
+            )
 
     def _build_debug_panel(
         self,
@@ -456,10 +492,20 @@ class Visualizer:
             pedestrian_status = "pedestrian: unavailable"
             pedestrian_reason = "pedestrian reason: unavailable"
         else:
+            frozen_target = (
+                f"{pedestrian_safety_result.frozen_target_x_frame:.1f}"
+                if pedestrian_safety_result.frozen_target_x_frame is not None
+                else "n/a"
+            )
             pedestrian_status = (
                 f"pedestrian: latched={pedestrian_safety_result.latched} "
-                f"humans={pedestrian_safety_result.human_count} "
-                f"overlaps={pedestrian_safety_result.overlapping_count}"
+                f"armed={pedestrian_safety_result.armed} "
+                f"humans={pedestrian_safety_result.human_count}"
+            )
+            pedestrian_tracking = (
+                f"ped target: region={pedestrian_safety_result.target_region} "
+                f"x={frozen_target} "
+                f"cooldown={pedestrian_safety_result.cooldown_remaining_sec:.2f}s"
             )
             pedestrian_reason = f"pedestrian reason: {pedestrian_safety_result.reason}"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
@@ -484,6 +530,11 @@ class Visualizer:
             f"{path_marker_reason}",
             f"{gold_reason}",
             pedestrian_status,
+            (
+                pedestrian_tracking
+                if pedestrian_safety_result is not None
+                else "ped target: unavailable"
+            ),
             pedestrian_reason,
         ]
         right_source_lines.extend(self._ocr_status_lines(ocr_result))

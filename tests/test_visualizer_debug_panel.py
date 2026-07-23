@@ -77,9 +77,12 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
         detection_result=make_detection("ok"),
         pedestrian_safety_result=SimpleNamespace(
             latched=False,
+            armed=True,
             human_count=0,
-            overlapping_count=0,
-            reason="no qualifying pedestrian overlaps danger zone",
+            frozen_target_x_frame=None,
+            target_region="none",
+            cooldown_remaining_sec=0.0,
+            reason="armed; no qualifying pedestrian center in ROI",
         ),
     )
     long_panel = visualizer._build_debug_panel(
@@ -90,10 +93,13 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
         ),
         pedestrian_safety_result=SimpleNamespace(
             latched=True,
+            armed=False,
             human_count=2,
-            overlapping_count=1,
+            frozen_target_x_frame=318.0,
+            target_region="center",
+            cooldown_remaining_sec=0.0,
             reason=(
-                "latched pedestrian still overlaps the configured danger zone "
+                "latched triggering pedestrian still waits to cross the frozen target "
                 "through_multiple_consecutive_detection_results"
             ),
         ),
@@ -121,28 +127,28 @@ def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
     assert np.array_equal(canvas[:100, :100], frame[:100, :100])
 
 
-def test_pedestrian_danger_zone_changes_from_yellow_to_red_when_stopped() -> None:
+def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
-    safe_frame = np.zeros((100, 100, 3), dtype=np.uint8)
-    stop_frame = safe_frame.copy()
-    common = {
-        "danger_zone_frame": (30.0, 10.0, 70.0, 90.0),
-        "human_count": 1,
-        "overlapping_count": 1,
-        "reason": "test",
-    }
-
-    visualizer._draw_pedestrian_danger_zone(
-        safe_frame,
-        PedestrianSafetyResult(stop_required=False, latched=False, **common),
-    )
-    visualizer._draw_pedestrian_danger_zone(
-        stop_frame,
-        PedestrianSafetyResult(stop_required=True, latched=True, **common),
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    result = PedestrianSafetyResult(
+        stop_required=True,
+        latched=True,
+        armed=False,
+        center_region_frame=(30.0, 10.0, 70.0, 90.0),
+        frozen_target_x_frame=50.0,
+        target_region="center",
+        tracked_center_frame=(45.0, 60.0),
+        human_count=1,
+        cooldown_remaining_sec=0.0,
+        reason="test",
     )
 
-    assert tuple(safe_frame[10, 30]) == (0, 255, 255)
-    assert tuple(stop_frame[10, 30]) == (0, 0, 255)
+    visualizer._draw_pedestrian_regions(frame, result)
+
+    assert tuple(frame[10, 30]) == (0, 255, 255)
+    assert tuple(frame[10, 70]) == (0, 255, 255)
+    assert tuple(frame[50, 50]) == (0, 0, 255)
+    assert tuple(frame[60, 45]) == (0, 0, 255)
 
 
 def test_debug_panel_handles_missing_optional_results() -> None:

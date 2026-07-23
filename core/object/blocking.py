@@ -1,7 +1,7 @@
 """Shared object-detection data types.
 
 The former lane-corridor blocking analyzer was removed when pedestrian handling
-changed from lateral avoidance to a fixed danger-zone stop policy.
+changed from lateral avoidance to a frozen-target crossing stop policy.
 """
 
 from __future__ import annotations
