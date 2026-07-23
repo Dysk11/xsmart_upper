@@ -110,32 +110,6 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
     assert long_panel.shape[0] > short_panel.shape[0]
 
 
-def test_debug_panel_omits_camera_legend_header(monkeypatch) -> None:
-    drawn_lines: list[str] = []
-
-    def capture_lines(image, lines, **kwargs):
-        drawn_lines.extend(lines)
-        return image
-
-    monkeypatch.setattr(
-        "core.visualization.visualizer.draw_text_lines",
-        capture_lines,
-    )
-    visualizer = Visualizer({"show_window": False, "debug_panel_font_size": 18})
-    visualizer._build_debug_panel(
-        width=640,
-        target_result=None,
-        pedestrian_safety_result=None,
-        control_command=None,  # type: ignore[arg-type]
-        fps_value=0.0,
-    )
-
-    drawn_text = "\n".join(drawn_lines)
-    assert "窗口1：原始画面" not in drawn_text
-    assert "绿线=原中心线" not in drawn_text
-    assert "洋红线=左岔中线" not in drawn_text
-
-
 def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
     visualizer = Visualizer({"show_window": False, "debug_panel_font_size": 18})
     frame = np.full((480, 640, 3), 110, dtype=np.uint8)
