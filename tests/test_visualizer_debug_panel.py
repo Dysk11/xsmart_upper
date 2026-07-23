@@ -183,6 +183,8 @@ def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
     result = SimpleNamespace(
         active=True,
         shifted_centerline_points=[(69.0, 150.0), (69.0, 50.0)],
+        boundary_route_points=[(40.0, 150.0), (40.0, 50.0)],
+        recovery_progress=0.0,
         stop_required=False,
         warning_zones=[
             SimpleNamespace(
@@ -200,6 +202,7 @@ def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
 
     assert tuple(output[50, 70]) == (0, 128, 255)
     assert tuple(output[150, 69]) == (0, 255, 255)
+    assert tuple(output[150, 40]) == (255, 0, 255)
 
 
 def test_debug_panel_handles_missing_optional_results() -> None:

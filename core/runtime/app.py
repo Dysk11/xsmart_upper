@@ -804,6 +804,12 @@ class UpperMachineApp:
         self.car_avoidance_planner = CarAvoidancePlanner(
             config.get("car_avoidance", {}),
             target_selector=self.target_selector,
+            max_boundary_gap_rows=int(
+                self.lane_geometry_config.get("boundary", {}).get(
+                    "max_single_side_gap_rows",
+                    12,
+                )
+            ),
         )
         self.pedestrian_safety_analyzer = PedestrianSafetyAnalyzer(
             config.get("pedestrian_safety", {})
@@ -1619,6 +1625,9 @@ class UpperMachineApp:
             centerline_points=centerline_points,
             candidate_route_points=candidate_route,
             candidate_target_roi=candidate_target,
+            track_boundary_rows=detection_result.track_boundary_rows,
+            detection_result_id=self.last_ai_frame_id,
+            now_monotonic=time.monotonic(),
             roi_rect=roi_rect,
             roi_width=roi_width,
             roi_height=roi_height,

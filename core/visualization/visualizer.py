@@ -385,9 +385,19 @@ class Visualizer:
         """Draw expanded warning boxes and the final constrained route."""
 
         output = image
+        boundary_route = getattr(result, "boundary_route_points", [])
+        if boundary_route:
+            output = draw_centerline(
+                output,
+                boundary_route,
+                color=(255, 0, 255),
+                radius=1,
+                thickness=2,
+                offset=roi_offset,
+            )
         if result.active:
             output = draw_centerline(
-                image,
+                output,
                 result.shifted_centerline_points,
                 color=(0, 255, 255),
                 radius=2,
@@ -594,7 +604,8 @@ class Visualizer:
                         f"car avoidance: mode={car_avoidance_result.mode} "
                         f"cars={len(car_avoidance_result.warning_zones)} "
                         f"edge={car_avoidance_result.edge_limited} "
-                        f"stop={car_avoidance_result.stop_required}"
+                        f"stop={car_avoidance_result.stop_required} "
+                        f"recovery={getattr(car_avoidance_result, 'recovery_progress', 0.0):.2f}"
                     ),
                     f"car reason: {car_avoidance_result.reason}",
                 ]

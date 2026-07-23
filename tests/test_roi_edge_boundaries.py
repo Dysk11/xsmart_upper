@@ -90,6 +90,23 @@ def test_empty_row_reuses_boundaries_and_marks_both_sides_lost() -> None:
     assert right_lost == [False, True, False]
 
 
+def test_detection_result_exposes_selected_track_boundary_validity() -> None:
+    mask = np.zeros((3, WIDTH), dtype=np.uint8)
+    mask[2, 0:13] = 255
+    mask[0, 1:14] = 255
+
+    result = make_detector(max_single_side_gap_rows=1).detect_from_mask(mask)
+
+    rows = {row.y: row for row in result.track_boundary_rows}
+    assert rows[2].left_x == 0
+    assert rows[2].left_valid
+    assert rows[2].right_valid
+    assert not rows[1].left_valid
+    assert not rows[1].right_valid
+    assert rows[0].left_x == 1
+    assert rows[0].left_valid
+
+
 def test_bottom_row_chooses_run_nearest_mapped_vehicle_center() -> None:
     detector = make_detector()
     detector.last_centerline_points = [(17, 2), (17, 1), (17, 0)]

@@ -57,6 +57,18 @@ class LaneDetectionResult:
     segmentation_confidence: float = 0.0
     segmentation_status: str = "legacy"
     segmentation_instance_count: int = 0
+    track_boundary_rows: List["LaneBoundaryRow"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class LaneBoundaryRow:
+    """One selected-track row with measured-boundary validity."""
+
+    y: int
+    left_x: int
+    right_x: int
+    left_valid: bool
+    right_valid: bool
 
 
 @dataclass(frozen=True)
@@ -532,6 +544,51 @@ class LaneDetector:
             self.last_lane_width_px = lane_width_px
             self.last_centerline_points = centerline_points
 
+        extracted_by_y = {
+            int(left[1]): (
+                int(left[0]),
+                int(right[0]),
+                not bool(left_is_lost),
+                not bool(right_is_lost),
+            )
+            for left, right, left_is_lost, right_is_lost in zip(
+                left_points,
+                right_points,
+                left_lost,
+                right_lost,
+            )
+        }
+        selected_mask_ys = set(
+            int(y)
+            for y in np.flatnonzero(np.any(selected_mask > 0, axis=1))
+        )
+        track_boundary_rows: list[LaneBoundaryRow] = []
+        for y in sorted(set(extracted_by_y) | selected_mask_ys, reverse=True):
+            row_x = np.flatnonzero(selected_mask[int(y)] > 0)
+            if row_x.size:
+                track_boundary_rows.append(
+                    LaneBoundaryRow(
+                        y=int(y),
+                        left_x=int(row_x[0]),
+                        right_x=int(row_x[-1]),
+                        left_valid=True,
+                        right_valid=True,
+                    )
+                )
+                continue
+            if y not in extracted_by_y:
+                continue
+            left_x, right_x, left_valid, right_valid = extracted_by_y[y]
+            track_boundary_rows.append(
+                LaneBoundaryRow(
+                    y=int(y),
+                    left_x=left_x,
+                    right_x=right_x,
+                    left_valid=left_valid,
+                    right_valid=right_valid,
+                )
+            )
+
         return LaneDetectionResult(
             centerline_points=centerline_points,
             lateral_error_px=lateral_error_px,
@@ -551,6 +608,7 @@ class LaneDetector:
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
             segmentation_instance_count=segmentation_instance_count,
+            track_boundary_rows=track_boundary_rows,
         )
 
     def _perspective_lane_width(self, y: int, height: int) -> float:
