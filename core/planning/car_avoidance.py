@@ -81,8 +81,6 @@ class CarAvoidancePlanner:
         self,
         objects: Sequence[DetectedObject],
         centerline_points: Sequence[Tuple[float, float]],
-        candidate_route_points: Sequence[Tuple[float, float]],
-        candidate_target_roi: Point,
         track_boundary_rows: Sequence[LaneBoundaryRow],
         detection_result_id: int,
         now_monotonic: float,
@@ -92,7 +90,6 @@ class CarAvoidancePlanner:
         lane_confidence: float,
         normal_target: TargetPointResult,
     ) -> CarAvoidanceResult:
-        del candidate_target_roi  # Car side is intentionally based on the lane centerline.
         now = float(now_monotonic)
         base_route = self._normalize_route(
             centerline_points,
@@ -112,36 +109,23 @@ class CarAvoidancePlanner:
             roi_width=roi_width,
             roi_height=roi_height,
         )
-        candidate_route = self._normalize_route(
-            candidate_route_points,
-            roi_width=roi_width,
-            roi_height=roi_height,
-        )
-        relevant = [
-            zone
-            for zone in zones
-            if self.polyline_intersects_rect(candidate_route, zone.bbox_roi)
-            or self.polyline_intersects_rect(base_route, zone.bbox_roi)
-        ]
-
         if new_detection:
             self._last_detection_result_id = detection_id
         elif (
-            not relevant
+            not zones
             and self._release_start_monotonic is None
             and self._last_active_route
         ):
             # Reusing a cached detector result must not confirm that the car vanished.
-            relevant = list(self._last_live_zones)
+            zones = list(self._last_live_zones)
 
-        if relevant:
+        if zones:
             self._release_start_monotonic = None
             self._recovery_offsets = []
             return self._plan_live_avoidance(
                 base_route=base_route,
                 track_boundary_rows=track_boundary_rows,
-                relevant=relevant,
-                all_zones=zones or relevant,
+                zones=zones,
                 roi_width=roi_width,
                 roi_height=roi_height,
                 lane_confidence=lane_confidence,
@@ -164,7 +148,7 @@ class CarAvoidancePlanner:
         return self._inactive(
             base_route,
             normal_target,
-            "no relevant car warning zone",
+            "no car warning zone in ROI",
             warning_zones=zones,
         )
 
@@ -172,8 +156,7 @@ class CarAvoidancePlanner:
         self,
         base_route: list[Point],
         track_boundary_rows: Sequence[LaneBoundaryRow],
-        relevant: list[CarWarningZone],
-        all_zones: Sequence[CarWarningZone],
+        zones: list[CarWarningZone],
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
@@ -183,42 +166,31 @@ class CarAvoidancePlanner:
             self._clear_route_state()
             return self._stop(
                 normal_target,
-                relevant,
-                "car warning zone blocks route but no lane centerline is available",
+                zones,
+                "car warning zone is in ROI but no lane centerline is available",
             )
 
-        planning_zones = list(relevant)
-        while True:
-            shifted, boundary_route, feasible, failure_reason = self._build_boundary_route(
-                base_route=base_route,
-                boundary_rows=track_boundary_rows,
-                zones=planning_zones,
-                roi_width=roi_width,
-                roi_height=roi_height,
-            )
-            if not feasible:
-                self._clear_route_state()
-                return self._stop(normal_target, planning_zones, failure_reason)
-            newly_relevant = [
-                zone
-                for zone in all_zones
-                if zone not in planning_zones
-                and self.polyline_intersects_rect(shifted, zone.bbox_roi)
-            ]
-            if not newly_relevant:
-                break
-            planning_zones.extend(newly_relevant)
+        shifted, boundary_route, feasible, failure_reason = self._build_boundary_route(
+            base_route=base_route,
+            boundary_rows=track_boundary_rows,
+            zones=zones,
+            roi_width=roi_width,
+            roi_height=roi_height,
+        )
+        if not feasible:
+            self._clear_route_state()
+            return self._stop(normal_target, zones, failure_reason)
 
         colliding = [
             zone
-            for zone in all_zones
+            for zone in zones
             if self.polyline_intersects_rect(shifted, zone.bbox_roi)
         ]
         if colliding:
             self._clear_route_state()
             return self._stop(
                 normal_target,
-                planning_zones,
+                zones,
                 "final segment-to-warning-zone validation failed",
             )
 
@@ -230,21 +202,21 @@ class CarAvoidancePlanner:
         )
         edge_limited = self._is_edge_limited(shifted, roi_width)
         mode = "CAR_AVOID_EDGE" if edge_limited else "CAR_AVOID"
-        sides = ",".join(zone.avoid_side for zone in planning_zones)
+        sides = ",".join(zone.avoid_side for zone in zones)
 
-        self._last_live_zones = list(planning_zones)
+        self._last_live_zones = list(zones)
         self._last_active_route = list(shifted)
         self._last_active_base_route = list(base_route)
         self._last_boundary_route = list(boundary_route)
         return CarAvoidanceResult(
             active=True,
             mode=mode,
-            warning_zones=list(planning_zones),
+            warning_zones=list(zones),
             shifted_centerline_points=shifted,
             target_result=target,
             edge_limited=edge_limited,
             stop_required=False,
-            reason=f"{mode}: cars={len(planning_zones)} sides={sides}",
+            reason=f"{mode}: cars={len(zones)} sides={sides}",
             boundary_route_points=boundary_route,
             recovery_progress=0.0,
         )

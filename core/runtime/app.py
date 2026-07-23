@@ -1609,22 +1609,9 @@ class UpperMachineApp:
         )
         self.last_gold_result = gold_result
 
-        ego_point = (float(roi_width) * 0.5, float(max(0, roi_height - 1)))
-        if path_marker_result.active:
-            candidate_target = path_marker_result.target_point_roi
-            candidate_route = path_marker_result.connected_centerline_points
-        elif gold_result.active:
-            candidate_target = gold_result.target_point_roi
-            candidate_route = [ego_point, gold_result.target_point_roi]
-        else:
-            candidate_target = normal_target.target_point_roi
-            candidate_route = centerline_points
-
         car_avoidance_result = self.car_avoidance_planner.plan(
             objects=self.last_detected_objects,
             centerline_points=centerline_points,
-            candidate_route_points=candidate_route,
-            candidate_target_roi=candidate_target,
             track_boundary_rows=detection_result.track_boundary_rows,
             detection_result_id=self.last_ai_frame_id,
             now_monotonic=time.monotonic(),

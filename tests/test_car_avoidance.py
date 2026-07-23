@@ -62,7 +62,6 @@ def plan(
     *,
     planner: CarAvoidancePlanner | None = None,
     centerline: list[tuple[float, float]] = CENTERLINE,
-    candidate_route: list[tuple[float, float]] | None = None,
     boundaries: list[LaneBoundaryRow] | None = None,
     detection_id: int = 1,
     now: float = 0.0,
@@ -72,8 +71,6 @@ def plan(
     return planner.plan(
         objects=objects,
         centerline_points=centerline,
-        candidate_route_points=candidate_route or centerline,
-        candidate_target_roi=target.target_point_roi,
         track_boundary_rows=boundaries or boundary_rows(),
         detection_result_id=detection_id,
         now_monotonic=now,
@@ -128,33 +125,11 @@ def test_centerline_at_car_height_selects_boundary_side(
     assert_route_clear(result)
 
 
-def test_candidate_target_x_does_not_choose_avoidance_side() -> None:
-    planner = make_planner()
-    target = normal_target()
-    result = planner.plan(
-        objects=[car((80, 60, 120, 100))],
-        centerline_points=CENTERLINE,
-        candidate_route_points=CENTERLINE,
-        candidate_target_roi=(190.0, 80.0),
-        track_boundary_rows=boundary_rows(),
-        detection_result_id=1,
-        now_monotonic=0.0,
-        roi_rect=ROI_RECT,
-        roi_width=200,
-        roi_height=200,
-        lane_confidence=0.9,
-        normal_target=target,
-    )
-
-    assert result.warning_zones[0].avoid_side == "left"
-
-
-def test_special_candidate_line_can_trigger_when_lane_centerline_is_clear() -> None:
+def test_car_in_roi_triggers_when_lane_centerline_is_clear() -> None:
     lane = [(150.0, float(y)) for y in range(199, -1, -4)]
     result = plan(
         [car((70, 80, 90, 120))],
         centerline=lane,
-        candidate_route=[(100.0, 199.0), (50.0, 40.0)],
         boundaries=boundary_rows(left_x=20, right_x=180),
     )
 
@@ -168,11 +143,10 @@ def test_special_candidate_line_can_trigger_when_lane_centerline_is_clear() -> N
     assert_route_clear(result)
 
 
-def test_candidate_route_blocked_without_centerline_stops() -> None:
+def test_car_in_roi_without_centerline_stops() -> None:
     result = plan(
         [car((80, 60, 120, 100))],
         centerline=[],
-        candidate_route=[(100.0, 199.0), (100.0, 0.0)],
     )
 
     assert result.stop_required
@@ -285,12 +259,6 @@ def test_overlapping_opposite_boundary_requirements_stop() -> None:
             car((70, 70, 90, 110)),
         ],
         centerline=[(100.0, float(y)) for y in range(199, -1, -4)],
-        candidate_route=[
-            (100.0, 199.0),
-            (120.0, 100.0),
-            (80.0, 80.0),
-            (100.0, 0.0),
-        ],
     )
 
     assert result.stop_required
@@ -304,13 +272,6 @@ def test_vertically_separated_opposite_sides_remain_feasible() -> None:
             car((70, 125, 90, 145)),
         ],
         centerline=[(100.0, float(y)) for y in range(199, -1, -4)],
-        candidate_route=[
-            (100.0, 199.0),
-            (80.0, 135.0),
-            (100.0, 100.0),
-            (120.0, 45.0),
-            (100.0, 0.0),
-        ],
     )
 
     assert result.active
@@ -323,12 +284,38 @@ def test_cached_detection_cannot_start_recovery_and_new_clear_result_can() -> No
     planner = make_planner()
     active = plan([car((80, 60, 120, 100))], planner=planner, detection_id=10, now=5.0)
     cached = plan([], planner=planner, detection_id=10, now=5.5)
-    started = plan([], planner=planner, detection_id=11, now=6.0)
+    started = plan(
+        [car((220, 60, 250, 100))],
+        planner=planner,
+        detection_id=11,
+        now=6.0,
+    )
 
     assert active.mode == "CAR_AVOID"
     assert cached.mode == "CAR_AVOID"
     assert started.mode == "CAR_AVOID_RECOVERY"
     assert started.recovery_progress == pytest.approx(0.0)
+
+
+def test_same_car_zone_stays_active_when_centerline_moves_away() -> None:
+    planner = make_planner()
+    plan([car((80, 60, 120, 100))], planner=planner, detection_id=10, now=5.0)
+    moved_centerline = [(180.0, float(y)) for y in range(199, -1, -4)]
+
+    held = plan(
+        [car((80, 60, 120, 100))],
+        planner=planner,
+        centerline=moved_centerline,
+        boundaries=boundary_rows(left_x=20, right_x=160),
+        detection_id=10,
+        now=5.5,
+    )
+
+    assert held.active
+    assert held.mode == "CAR_AVOID_EDGE"
+    assert held.edge_limited
+    assert held.recovery_progress == pytest.approx(0.0)
+    assert held.warning_zones[0].avoid_side == "right"
 
 
 def test_recovery_smoothstep_returns_to_current_centerline_in_one_second() -> None:
@@ -364,12 +351,26 @@ def test_car_reappearing_during_recovery_cancels_release() -> None:
     assert recovered.recovery_progress == pytest.approx(0.0)
 
 
-def test_non_car_and_clear_car_do_not_activate() -> None:
+def test_side_car_in_roi_activates_even_when_all_routes_are_clear() -> None:
     human = DetectedObject("human", 0.9, (80, 60, 120, 100))
     result = plan([human, car((150, 60, 180, 100))])
 
-    assert not result.active
+    assert result.active
     assert len(result.warning_zones) == 1
+    assert result.warning_zones[0].avoid_side == "left"
+    assert all(
+        x == pytest.approx(40.0)
+        for x, y in result.shifted_centerline_points
+        if 50.0 <= y <= 110.0
+    )
+    assert_route_clear(result)
+
+
+def test_car_warning_zone_fully_outside_roi_does_not_activate() -> None:
+    result = plan([car((220, 60, 250, 100))])
+
+    assert not result.active
+    assert result.warning_zones == []
 
 
 @pytest.mark.parametrize(

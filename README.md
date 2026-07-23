@@ -266,8 +266,9 @@ pedestrian_safety:
 
 识别到 `car` 后，以检测框中心不变，将宽、高分别扩大为 1.5 倍警戒区。在 car
 垂直中心对应的 ROI 行比较原巡线中心线与 car 中心：中心线在左侧或同 x 时沿
-track 左边界绕行，中心线在右侧时沿 track 右边界绕行。规划器只对会影响普通
-中心线、Go/Stop 连线路径或 coin 控制连线的警戒区生效。
+track 左边界绕行，中心线在右侧时沿 track 右边界绕行。只要扩大后的警戒区与
+巡线 ROI 有重叠，其覆盖行就无条件采用对应 track 边界；不再要求警戒区先命中
+普通中心线、Go/Stop 连线路径或 coin 控制连线。
 
 ```yaml
 car_avoidance:
@@ -279,7 +280,7 @@ car_avoidance:
 ```
 
 警戒区覆盖行直接采用所选 track 边界，警戒区上下使用分段 smoothstep 与正常中心线
-衔接，不进行栅格搜索或曲线拟合。新 AI 检测结果确认 car 不再影响路线后，模式切换为
+衔接，不进行栅格搜索或曲线拟合。新 AI 检测结果确认 ROI 内已无 car 警戒区后，模式切换为
 `CAR_AVOID_RECOVERY`，并在 1 秒内按时间 smoothstep 回到正常中心线。最终每条折线段
 都会再次检查，不能进入任一相关警戒区。安全路线进入 ROI 左右边缘 20 px 时模式为
 `CAR_AVOID_EDGE`，速度限制为 `planner.min_speed`；指定侧完全堵塞或多车约束冲突时
