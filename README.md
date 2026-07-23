@@ -264,14 +264,16 @@ pedestrian_safety:
 
 ## 7. car 警戒区避让
 
-识别到 `car` 后，以检测框中心不变，将宽、高分别扩大为 1.5 倍警戒区。候选目标点
-位于 car 中心左侧时左绕，位于右侧时右绕，相同 x 时固定左绕。规划器只对会影响
-普通中心线、Go/Stop 连线路径或 coin 控制连线的警戒区生效。
+识别到 `car` 后，复用赛道 `perspective_width_top_px` 和
+`perspective_width_bottom_px`，按检测框上下边所在 ROI 高度分别插值得到赛道宽度。
+框上边向左右和向上各偏移半个上边透视宽度，框下边向左右和向下各偏移半个下边
+透视宽度，形成近端更宽的梯形警戒区。候选目标点位于 car 中心左侧时左绕，位于
+右侧时右绕，相同 x 时固定左绕。规划器只对会影响普通中心线、Go/Stop 连线路径或
+coin 控制连线的警戒区生效。
 
 ```yaml
 car_avoidance:
   enabled: true
-  box_scale: 1.5
   clearance_px: 1
   transition_margin_px: 40
   edge_slow_margin_px: 20
@@ -280,7 +282,7 @@ car_avoidance:
 避让路线使用分段 smoothstep 横移，不进行栅格搜索或曲线拟合。最终每条折线段都会
 再次检查，不能进入任一相关警戒区。安全路线进入 ROI 左右边缘 20 px 时模式为
 `CAR_AVOID_EDGE`，速度限制为 `planner.min_speed`；指定侧完全堵塞或多车约束冲突时
-模式为 `CAR_AVOID_STOP`。避让目标点仍固定在 ROI `y=80`。调试画面中的橙/红框为
+模式为 `CAR_AVOID_STOP`。避让目标点仍固定在 ROI `y=80`。调试画面中的橙/红梯形为
 扩大后的警戒区，黄色折线为最终避让路线。
 
 ## 8. 主流程顺序

@@ -804,6 +804,7 @@ class UpperMachineApp:
         self.car_avoidance_planner = CarAvoidancePlanner(
             config.get("car_avoidance", {}),
             target_selector=self.target_selector,
+            perspective_config=self.lane_geometry_config.get("centerline", {}),
         )
         self.pedestrian_safety_analyzer = PedestrianSafetyAnalyzer(
             config.get("pedestrian_safety", {})

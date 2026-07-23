@@ -135,7 +135,6 @@ target_selector:
 
 car_avoidance:
   enabled: true
-  box_scale: 1.5
   clearance_px: 1
   transition_margin_px: 40
   edge_slow_margin_px: 20
