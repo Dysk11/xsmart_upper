@@ -14,27 +14,16 @@ ROI_RECT = (0, 0, 200, 200)
 CENTERLINE = [(100.0, float(y)) for y in range(196, 0, -4)]
 
 
-def make_planner(
-    *,
-    perspective_top: float = 20.0,
-    perspective_bottom: float = 40.0,
-    **overrides: object,
-) -> CarAvoidancePlanner:
+def make_planner(**overrides: object) -> CarAvoidancePlanner:
     config: dict[str, object] = {
         "enabled": True,
+        "box_scale": 1.5,
         "clearance_px": 1,
         "transition_margin_px": 40,
         "edge_slow_margin_px": 20,
     }
     config.update(overrides)
-    return CarAvoidancePlanner(
-        config,
-        TargetSelector({"fixed_target_y": 80}),
-        {
-            "perspective_width_top_px": perspective_top,
-            "perspective_width_bottom_px": perspective_bottom,
-        },
-    )
+    return CarAvoidancePlanner(config, TargetSelector({"fixed_target_y": 80}))
 
 
 def car(bbox: tuple[int, int, int, int]) -> DetectedObject:
@@ -68,125 +57,46 @@ def plan(
 
 def assert_route_clear(result) -> None:
     for zone in result.warning_zones:
-        assert not CarAvoidancePlanner.polyline_intersects_polygon(
+        assert not CarAvoidancePlanner.polyline_intersects_rect(
             result.shifted_centerline_points,
-            zone.polygon_roi,
+            zone.bbox_roi,
         )
 
 
-def test_warning_polygon_uses_top_and_bottom_perspective_half_widths() -> None:
+def test_warning_box_scales_width_and_height_about_center() -> None:
     result = plan([car((80, 60, 120, 100))], target_x=90.0)
 
     assert result.active
-    top_offset = 0.5 * (20.0 + 20.0 * 60.0 / 199.0)
-    bottom_offset = 0.5 * (20.0 + 20.0 * 100.0 / 199.0)
-    expected = (
-        (80.0 - top_offset, 60.0 - top_offset),
-        (120.0 + top_offset, 60.0 - top_offset),
-        (120.0 + bottom_offset, 100.0 + bottom_offset),
-        (80.0 - bottom_offset, 100.0 + bottom_offset),
-    )
-    for actual, expected_point in zip(
-        result.warning_zones[0].polygon_frame,
-        expected,
-    ):
-        assert actual == pytest.approx(expected_point)
-    for actual, expected_point in zip(
-        result.warning_zones[0].polygon_roi,
-        expected,
-    ):
-        assert actual == pytest.approx(expected_point)
-
-
-def test_perspective_width_clamps_box_rows_outside_roi() -> None:
-    planner = make_planner(perspective_top=20.0, perspective_bottom=60.0)
-    target = normal_target()
-    result = planner.plan(
-        objects=[car((80, -20, 120, 240))],
-        centerline_points=CENTERLINE,
-        candidate_route_points=CENTERLINE,
-        candidate_target_roi=(90.0, 80.0),
-        roi_rect=ROI_RECT,
-        roi_width=200,
-        roi_height=200,
-        lane_confidence=0.9,
-        normal_target=target,
-    )
-
-    polygon = result.warning_zones[0].polygon_roi
-    assert polygon[0] == pytest.approx((70.0, -30.0))
-    assert polygon[2] == pytest.approx((150.0, 270.0))
-
-
-def test_warning_polygon_converts_between_frame_and_nonzero_roi_coordinates() -> None:
-    planner = make_planner()
-    target = normal_target()
-    result = planner.plan(
-        objects=[car((90, 80, 130, 120))],
-        centerline_points=CENTERLINE,
-        candidate_route_points=CENTERLINE,
-        candidate_target_roi=(90.0, 80.0),
-        roi_rect=(10, 20, 210, 220),
-        roi_width=200,
-        roi_height=200,
-        lane_confidence=0.9,
-        normal_target=target,
-    )
-
-    zone = result.warning_zones[0]
-    for frame_point, roi_point in zip(zone.polygon_frame, zone.polygon_roi):
-        assert frame_point == pytest.approx((roi_point[0] + 10.0, roi_point[1] + 20.0))
-
-
-def test_near_car_has_larger_offsets_than_same_size_far_car() -> None:
-    far = plan([car((80, 20, 120, 40))], target_x=90.0)
-    near = plan([car((80, 140, 120, 160))], target_x=90.0)
-
-    far_polygon = far.warning_zones[0].polygon_roi
-    near_polygon = near.warning_zones[0].polygon_roi
-    far_bottom_offset = far_polygon[2][0] - 120.0
-    near_bottom_offset = near_polygon[2][0] - 120.0
-    assert near_bottom_offset > far_bottom_offset
+    assert result.warning_zones[0].bbox_frame == pytest.approx((70, 50, 130, 110))
+    assert result.warning_zones[0].bbox_roi == pytest.approx((70, 50, 130, 110))
 
 
 @pytest.mark.parametrize(
-    ("route", "expected"),
+    ("target_x", "side", "expected_bound"),
     [
-        ([(50.0, 0.0), (50.0, 100.0)], True),
-        ([(25.0, 20.0), (25.0, 40.0)], False),
-        ([(40.0, 20.0), (30.0, 50.0)], True),
-        ([(10.0, 0.0), (10.0, 100.0)], False),
-    ],
-)
-def test_polyline_collision_uses_trapezoid_not_bounding_rectangle(
-    route: list[tuple[float, float]],
-    expected: bool,
-) -> None:
-    polygon = (
-        (40.0, 20.0),
-        (60.0, 20.0),
-        (80.0, 80.0),
-        (20.0, 80.0),
-    )
-
-    assert CarAvoidancePlanner.polyline_intersects_polygon(route, polygon) is expected
-
-
-@pytest.mark.parametrize(
-    ("target_x", "side"),
-    [
-        (90.0, "left"),
-        (110.0, "right"),
-        (100.0, "left"),
+        (90.0, "left", 69.0),
+        (110.0, "right", 131.0),
+        (100.0, "left", 69.0),
     ],
 )
 def test_target_relative_to_car_center_selects_side(
     target_x: float,
     side: str,
+    expected_bound: float,
 ) -> None:
     result = plan([car((80, 60, 120, 100))], target_x=target_x)
 
     assert result.warning_zones[0].avoid_side == side
+    inside_x = [
+        x
+        for x, y in result.shifted_centerline_points
+        if 50.0 <= y <= 110.0
+    ]
+    assert inside_x
+    if side == "left":
+        assert max(inside_x) <= expected_bound
+    else:
+        assert min(inside_x) >= expected_bound
     assert_route_clear(result)
 
 
@@ -207,16 +117,16 @@ def test_special_candidate_line_can_trigger_avoidance_when_lane_is_clear() -> No
 
 def test_multiple_opposite_constraints_use_gap_between_zones() -> None:
     objects = [
-        car((130, 70, 150, 110)),
-        car((50, 70, 70, 110)),
+        car((110, 70, 130, 110)),
+        car((70, 70, 90, 110)),
     ]
     result = plan(
         objects,
         target_x=100.0,
         candidate_route=[
             (100.0, 196.0),
-            (140.0, 100.0),
-            (60.0, 80.0),
+            (120.0, 100.0),
+            (80.0, 80.0),
             (100.0, 0.0),
         ],
     )
@@ -328,12 +238,11 @@ def test_infeasible_route_stops_and_maps_to_zero_protocol_state() -> None:
 def test_transition_anchors_are_smooth_and_fixed_target_height_is_preserved() -> None:
     result = plan([car((80, 60, 120, 100))], target_x=90.0)
     route = {round(y, 6): x for x, y in result.shifted_centerline_points}
-    polygon = result.warning_zones[0].polygon_roi
-    top = min(point[1] for point in polygon)
-    bottom = max(point[1] for point in polygon)
 
-    assert route[round(max(0.0, top - 40.0), 6)] == pytest.approx(100.0)
-    assert route[round(min(199.0, bottom + 40.0), 6)] == pytest.approx(100.0)
+    assert route[10.0] == pytest.approx(100.0)
+    assert route[50.0] == pytest.approx(69.0)
+    assert route[110.0] == pytest.approx(69.0)
+    assert route[150.0] == pytest.approx(100.0)
     assert result.target_result.target_point_roi[1] == pytest.approx(80.0)
     assert_route_clear(result)
 
@@ -349,6 +258,7 @@ def test_non_car_and_clear_car_do_not_activate() -> None:
 @pytest.mark.parametrize(
     ("config", "message"),
     [
+        ({"box_scale": 0.9}, "box_scale"),
         ({"clearance_px": -1}, "clearance_px"),
         ({"clearance_px": 0.5}, "clearance_px"),
         ({"transition_margin_px": 0}, "transition_margin_px"),
@@ -358,20 +268,3 @@ def test_non_car_and_clear_car_do_not_activate() -> None:
 def test_config_is_validated(config: dict[str, object], message: str) -> None:
     with pytest.raises(ValueError, match=message):
         make_planner(**config)
-
-
-@pytest.mark.parametrize(
-    ("top", "bottom", "message"),
-    [
-        (0.0, 40.0, "perspective_width_top_px"),
-        (20.0, 0.0, "perspective_width_bottom_px"),
-        (40.0, 20.0, "greater than or equal"),
-    ],
-)
-def test_shared_perspective_config_is_validated(
-    top: float,
-    bottom: float,
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        make_planner(perspective_top=top, perspective_bottom=bottom)

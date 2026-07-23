@@ -186,12 +186,7 @@ def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
         stop_required=False,
         warning_zones=[
             SimpleNamespace(
-                polygon_frame=(
-                    (70.0, 50.0),
-                    (130.0, 50.0),
-                    (140.0, 110.0),
-                    (60.0, 110.0),
-                ),
+                bbox_frame=(70.0, 50.0, 130.0, 110.0),
                 avoid_side="left",
             )
         ],

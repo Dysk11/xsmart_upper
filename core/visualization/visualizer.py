@@ -396,19 +396,14 @@ class Visualizer:
             )
         color = (0, 0, 255) if result.stop_required else (0, 128, 255)
         for zone in result.warning_zones:
-            polygon = np.asarray(
-                [
-                    (int(round(point[0])), int(round(point[1])))
-                    for point in zone.polygon_frame
-                ],
-                dtype=np.int32,
-            )
-            cv2.polylines(output, [polygon], True, color, 2, cv2.LINE_AA)
-            label_point = tuple(polygon[0].tolist())
+            x1, y1, x2, y2 = zone.bbox_frame
+            top_left = (int(round(x1)), int(round(y1)))
+            bottom_right = (int(round(x2)), int(round(y2)))
+            cv2.rectangle(output, top_left, bottom_right, color, 2)
             cv2.putText(
                 output,
                 f"CAR {zone.avoid_side.upper()}",
-                (int(label_point[0]), max(18, int(label_point[1]) - 6)),
+                (top_left[0], max(18, top_left[1] - 6)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 color,
