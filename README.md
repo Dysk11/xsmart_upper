@@ -214,11 +214,13 @@ rknn_object_detector:
 当前主逻辑优先级是：
 
 ```text
-脱轨停车 > 行人穿越等待 > 路牌分析停车等待 > Go/Stop 路径 > 吃 coin > 普通巡线
+脱轨停车 > 行人穿越等待 > 路牌分析停车等待 > 不可行 car 避让停车 >
+car 避让 > Go/Stop 路径 > 吃 coin > 普通巡线
 ```
 
 行人框触发目标点穿越锁存后，运行模式为 `PEDESTRIAN_WAIT`，目标速度和协议
-`speed_state` 均为 0。`car` 只显示检测框，不参与车辆控制。
+`speed_state` 均为 0。`car` 警戒区无法从指定侧安全绕过时使用
+`CAR_AVOID_STOP`，同样发送零速度。
 
 ## 4. coin 目标逻辑
 
@@ -258,18 +260,41 @@ pedestrian_safety:
 始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时无限
 保持停车。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标只
 接受左到右。完成穿越后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发。
-`car` 不触发停车或避让。
+行人逻辑只处理 `human`，不会把 `car` 当作行人停车目标。
 
-## 7. 主流程顺序
+## 7. car 警戒区避让
 
-1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 行人目标点穿越判断 -> 6. 决策规划（停车 > Go/Stop 路径 > 金币 > 巡线） -> 7. 生成协议帧发送。
+识别到 `car` 后，以检测框中心不变，将宽、高分别扩大为 1.5 倍警戒区。候选目标点
+位于 car 中心左侧时左绕，位于右侧时右绕，相同 x 时固定左绕。规划器只对会影响
+普通中心线、Go/Stop 连线路径或 coin 控制连线的警戒区生效。
 
-## 8. 如何确认功能正常
+```yaml
+car_avoidance:
+  enabled: true
+  box_scale: 1.5
+  clearance_px: 1
+  transition_margin_px: 40
+  edge_slow_margin_px: 20
+```
+
+避让路线使用分段 smoothstep 横移，不进行栅格搜索或曲线拟合。最终每条折线段都会
+再次检查，不能进入任一相关警戒区。安全路线进入 ROI 左右边缘 20 px 时模式为
+`CAR_AVOID_EDGE`，速度限制为 `planner.min_speed`；指定侧完全堵塞或多车约束冲突时
+模式为 `CAR_AVOID_STOP`。避让目标点仍固定在 ROI `y=80`。调试画面中的橙/红框为
+扩大后的警戒区，黄色折线为最终避让路线。
+
+## 8. 主流程顺序
+
+1. 读取图像 -> 2. ROI 裁剪/预处理 -> 3. 蓝色航道巡线 -> 4. RKNN 目标识别 -> 5. 行人安全判断 -> 6. car 警戒区避让 -> 7. 特殊目标/普通巡线决策 -> 8. 生成协议帧发送。
+
+## 9. 如何确认功能正常
 
 1. 终端出现 `RKNN detector loaded`；
 2. 调试画面中出现 `coin/Go/Stop/car/human` 目标框；
 3. 画面上 `G` 为 coin 目标点，`P` 为 Go/Stop 框中心，两条黄线分隔 `LEFT/CENTER/RIGHT`，停车时红线为冻结目标 x；
-4. 行人停车时模式显示 `PEDESTRIAN_WAIT`，Go/Stop 路径显示 `PATH_TARGET`，吃金币时显示 `GOLD`。
+4. 行人停车时模式显示 `PEDESTRIAN_WAIT`，car 避让显示 `CAR_AVOID` /
+   `CAR_AVOID_EDGE` / `CAR_AVOID_STOP`，Go/Stop 路径显示 `PATH_TARGET`，
+   吃金币时显示 `GOLD`。
 
 ---
 

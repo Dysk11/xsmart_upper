@@ -71,6 +71,32 @@ def build_safety_stop_hint(
     return None
 
 
+def build_car_avoidance_hint(
+    car_avoidance_result: Any | None,
+    min_speed: float,
+) -> ModuleHints | None:
+    """Convert an active car-avoidance result into a control hint."""
+
+    if (
+        car_avoidance_result is None
+        or not bool(getattr(car_avoidance_result, "active", False))
+    ):
+        return None
+    reason = str(getattr(car_avoidance_result, "reason", ""))
+    if bool(getattr(car_avoidance_result, "stop_required", False)):
+        return ModuleHints(
+            stop=True,
+            force_mode="CAR_AVOID_STOP",
+            note=reason,
+        )
+    edge_limited = bool(getattr(car_avoidance_result, "edge_limited", False))
+    return ModuleHints(
+        speed_limit=float(min_speed) if edge_limited else None,
+        force_mode=str(getattr(car_avoidance_result, "mode", "CAR_AVOID")),
+        note=reason,
+    )
+
+
 class HighLevelPlanner:
     """根据巡线状态生成目标速度与目标转向。"""
 

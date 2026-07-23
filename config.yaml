@@ -133,6 +133,13 @@ target_selector:
   max_extrapolation_y_px: 40
   max_extrapolation_x_px: 60
 
+car_avoidance:
+  enabled: true
+  box_scale: 1.5
+  clearance_px: 1
+  transition_margin_px: 40
+  edge_slow_margin_px: 20
+
 gold_target:
   enabled: true
   class_names: [coin]

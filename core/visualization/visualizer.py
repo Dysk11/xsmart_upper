@@ -11,6 +11,7 @@ import numpy as np
 
 from core.object.blocking import DetectedObject
 from core.object.pedestrian_safety import PedestrianSafetyResult
+from core.planning.car_avoidance import CarAvoidanceResult
 from core.planning.gold_target import GoldTargetResult
 from core.planning.path_marker_target import PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult
@@ -67,6 +68,7 @@ class Visualizer:
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> bool:
@@ -95,6 +97,7 @@ class Visualizer:
             detected_objects=detected_objects,
             gold_result=gold_result,
             path_marker_result=path_marker_result,
+            car_avoidance_result=car_avoidance_result,
             ocr_result=ocr_result,
             show_ocr_bbox=show_ocr_bbox,
         )
@@ -113,6 +116,7 @@ class Visualizer:
                 fps_value=fps_value,
                 gold_result=gold_result,
                 path_marker_result=path_marker_result,
+                car_avoidance_result=car_avoidance_result,
                 detection_result=detection_result,
                 ocr_result=ocr_result,
             )
@@ -154,6 +158,7 @@ class Visualizer:
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> np.ndarray:
@@ -171,7 +176,12 @@ class Visualizer:
         """
 
         x1, y1, x2, y2 = roi_rect
-        centerline_points = tracked_state.centerline_points or detection_result.centerline_points
+        if car_avoidance_result is not None and car_avoidance_result.active:
+            centerline_points = tracked_state.centerline_points
+        else:
+            centerline_points = (
+                tracked_state.centerline_points or detection_result.centerline_points
+            )
 
         original_panel = frame.copy()
         self._overlay_roi_mask(original_panel, detection_result.filtered_mask, (x1, y1, x2, y2))
@@ -233,7 +243,10 @@ class Visualizer:
                     color,
                     1,
                 )
-        if path_marker_result is not None and path_marker_result.active:
+        avoidance_active = bool(
+            car_avoidance_result is not None and car_avoidance_result.active
+        )
+        if path_marker_result is not None and path_marker_result.active and not avoidance_active:
             original_panel = draw_centerline(
                 original_panel,
                 path_marker_result.connected_centerline_points,
@@ -273,10 +286,19 @@ class Visualizer:
             )
         if detected_objects:
             self._draw_detected_objects(original_panel, detected_objects)
+        if (
+            car_avoidance_result is not None
+            and car_avoidance_result.warning_zones
+        ):
+            original_panel = self._draw_car_avoidance(
+                original_panel,
+                car_avoidance_result,
+                roi_offset=(x1, y1),
+            )
         if show_ocr_bbox and ocr_result is not None and ocr_result.source_bbox is not None:
             bx1, by1, bx2, by2 = ocr_result.source_bbox
             cv2.rectangle(original_panel, (bx1, by1), (bx2, by2), (255, 0, 255), 3)
-        if gold_result is not None and gold_result.active:
+        if gold_result is not None and gold_result.active and not avoidance_active:
             self._draw_target_point(
                 original_panel,
                 gold_result.target_point_roi,
@@ -284,7 +306,7 @@ class Visualizer:
                 color=(0, 215, 255),
                 label="G",
             )
-        if path_marker_result is not None and path_marker_result.active:
+        if path_marker_result is not None and path_marker_result.active and not avoidance_active:
             self._draw_target_point(
                 original_panel,
                 path_marker_result.target_point_roi,
@@ -353,6 +375,42 @@ class Visualizer:
                 2,
                 cv2.LINE_AA,
             )
+
+    def _draw_car_avoidance(
+        self,
+        image: np.ndarray,
+        result: CarAvoidanceResult,
+        roi_offset: tuple[int, int],
+    ) -> np.ndarray:
+        """Draw expanded warning boxes and the final constrained route."""
+
+        output = image
+        if result.active:
+            output = draw_centerline(
+                image,
+                result.shifted_centerline_points,
+                color=(0, 255, 255),
+                radius=2,
+                thickness=3,
+                offset=roi_offset,
+            )
+        color = (0, 0, 255) if result.stop_required else (0, 128, 255)
+        for zone in result.warning_zones:
+            x1, y1, x2, y2 = zone.bbox_frame
+            top_left = (int(round(x1)), int(round(y1)))
+            bottom_right = (int(round(x2)), int(round(y2)))
+            cv2.rectangle(output, top_left, bottom_right, color, 2)
+            cv2.putText(
+                output,
+                f"CAR {zone.avoid_side.upper()}",
+                (top_left[0], max(18, top_left[1] - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+        return output
 
     def _draw_pedestrian_regions(
         self,
@@ -427,6 +485,7 @@ class Visualizer:
         path_marker_result: PathMarkerTargetResult | None = None,
         detection_result: LaneDetectionResult | None = None,
         ocr_result: OcrResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | None = None,
     ) -> np.ndarray:
         """Build an opaque, auto-sized two-column status panel."""
 
@@ -526,6 +585,20 @@ class Visualizer:
             ),
             pedestrian_reason,
         ]
+        if car_avoidance_result is None:
+            right_source_lines.append("car avoidance: unavailable")
+        else:
+            right_source_lines.extend(
+                [
+                    (
+                        f"car avoidance: mode={car_avoidance_result.mode} "
+                        f"cars={len(car_avoidance_result.warning_zones)} "
+                        f"edge={car_avoidance_result.edge_limited} "
+                        f"stop={car_avoidance_result.stop_required}"
+                    ),
+                    f"car reason: {car_avoidance_result.reason}",
+                ]
+            )
         right_source_lines.extend(self._ocr_status_lines(ocr_result))
         right_lines = wrap_text_lines(
             right_source_lines,

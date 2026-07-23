@@ -37,6 +37,7 @@ from core.object.pedestrian_safety import (
     PedestrianSafetyAnalyzer,
     PedestrianSafetyResult,
 )
+from core.planning.car_avoidance import CarAvoidancePlanner, CarAvoidanceResult
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
 from core.planning.path_marker_target import PathMarkerTargetPlanner, PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult, LaneDetector
@@ -47,6 +48,7 @@ from core.planning.high_level import (
     ControlCommand,
     HighLevelPlanner,
     ModuleHints,
+    build_car_avoidance_hint,
     build_safety_stop_hint,
 )
 from core.planning.road_sign_analyzer import (
@@ -799,6 +801,10 @@ class UpperMachineApp:
         self.path_marker_target_planner = PathMarkerTargetPlanner(
             config.get("path_marker_target", {})
         )
+        self.car_avoidance_planner = CarAvoidancePlanner(
+            config.get("car_avoidance", {}),
+            target_selector=self.target_selector,
+        )
         self.pedestrian_safety_analyzer = PedestrianSafetyAnalyzer(
             config.get("pedestrian_safety", {})
         )
@@ -828,6 +834,7 @@ class UpperMachineApp:
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
         self.last_path_marker_result: PathMarkerTargetResult | None = None
+        self.last_car_avoidance_result: CarAvoidanceResult | None = None
         self.last_confirmed_fork_detected = False
         self.last_ocr_result = OcrResult()
         self.last_ocr_attempt = OcrResult()
@@ -1226,6 +1233,7 @@ class UpperMachineApp:
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
                         "path_marker_result": self.last_path_marker_result,
+                        "car_avoidance_result": self.last_car_avoidance_result,
                         "ocr_result": (
                             self.last_ocr_attempt
                             if self.last_ocr_attempt.frame_id > 0
@@ -1524,6 +1532,12 @@ class UpperMachineApp:
         )
         if safety_stop_hint is not None:
             return safety_stop_hint
+        car_avoidance_hint = build_car_avoidance_hint(
+            self.last_car_avoidance_result,
+            min_speed=self.planner.min_speed,
+        )
+        if car_avoidance_hint is not None:
+            return car_avoidance_hint
         if (
             self.last_path_marker_result is not None
             and self.last_path_marker_result.active
@@ -1588,6 +1602,46 @@ class UpperMachineApp:
             roi_height=roi_height,
         )
         self.last_gold_result = gold_result
+
+        ego_point = (float(roi_width) * 0.5, float(max(0, roi_height - 1)))
+        if path_marker_result.active:
+            candidate_target = path_marker_result.target_point_roi
+            candidate_route = path_marker_result.connected_centerline_points
+        elif gold_result.active:
+            candidate_target = gold_result.target_point_roi
+            candidate_route = [ego_point, gold_result.target_point_roi]
+        else:
+            candidate_target = normal_target.target_point_roi
+            candidate_route = centerline_points
+
+        car_avoidance_result = self.car_avoidance_planner.plan(
+            objects=self.last_detected_objects,
+            centerline_points=centerline_points,
+            candidate_route_points=candidate_route,
+            candidate_target_roi=candidate_target,
+            roi_rect=roi_rect,
+            roi_width=roi_width,
+            roi_height=roi_height,
+            lane_confidence=tracked_state.confidence,
+            normal_target=normal_target,
+        )
+        self.last_car_avoidance_result = car_avoidance_result
+
+        if car_avoidance_result.active:
+            self.last_target_result = car_avoidance_result.target_result
+            return replace(
+                tracked_state,
+                centerline_points=[
+                    (int(round(x)), int(round(y)))
+                    for x, y in car_avoidance_result.shifted_centerline_points
+                ],
+                lateral_error_px=car_avoidance_result.target_result.target_lateral_error_px,
+                heading_error_deg=car_avoidance_result.target_result.target_heading_error_deg,
+                confidence=min(
+                    tracked_state.confidence,
+                    car_avoidance_result.target_result.confidence,
+                ),
+            )
 
         if path_marker_result.active:
             return replace(

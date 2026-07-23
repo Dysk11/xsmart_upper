@@ -177,6 +177,31 @@ def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     assert tuple(frame[60, 45]) == (0, 0, 255)
 
 
+def test_car_warning_zone_and_avoidance_route_are_drawn() -> None:
+    visualizer = Visualizer({"show_window": False})
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    result = SimpleNamespace(
+        active=True,
+        shifted_centerline_points=[(69.0, 150.0), (69.0, 50.0)],
+        stop_required=False,
+        warning_zones=[
+            SimpleNamespace(
+                bbox_frame=(70.0, 50.0, 130.0, 110.0),
+                avoid_side="left",
+            )
+        ],
+    )
+
+    output = visualizer._draw_car_avoidance(
+        frame,
+        result,  # type: ignore[arg-type]
+        roi_offset=(0, 0),
+    )
+
+    assert tuple(output[50, 70]) == (0, 128, 255)
+    assert tuple(output[150, 69]) == (0, 255, 255)
+
+
 def test_debug_panel_handles_missing_optional_results() -> None:
     visualizer = Visualizer({"show_window": False})
     panel = visualizer._build_debug_panel(
