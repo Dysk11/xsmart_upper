@@ -1,11 +1,9 @@
-"""Tests for fixed-height lane and avoidance target selection."""
+"""Tests for fixed-height lane target selection."""
 
 from __future__ import annotations
 
 import pytest
 
-from core.object.blocking import BlockingAnalysisResult, DetectedObject
-from core.planning.avoidance import AvoidanceTargetPlanner
 from core.planning.target_selector import TargetSelector
 
 
@@ -97,51 +95,3 @@ def test_no_centerline_preserves_lost_fallback() -> None:
     assert result.target_point_roi == pytest.approx((100.0, 199.0))
     assert result.lookahead_px == 0.0
     assert result.confidence == 0.0
-
-
-def test_avoidance_keeps_fixed_height_when_obstacle_is_ahead() -> None:
-    selector = make_selector()
-    planner = AvoidanceTargetPlanner(
-        {
-            "enabled": True,
-            "max_avoid_bias_px": 20,
-            "bias_alpha": 1.0,
-            "front_margin_px": 45,
-            "rear_margin_px": 35,
-            "min_lane_confidence_to_start_avoid": 0.45,
-        },
-        target_selector=selector,
-    )
-    centerline = [(100, 180), (100, 140), (100, 100), (100, 60), (100, 20)]
-    normal_target = selector.select(centerline, 200, 200, 0.9)
-    obstacle = DetectedObject(
-        class_name="car",
-        confidence=0.9,
-        bbox_frame=(80, 100, 120, 140),
-        bbox_roi=(80, 100, 120, 140),
-    )
-    blocking = BlockingAnalysisResult(
-        need_avoid=True,
-        blocking_object=obstacle,
-        blocking_score=0.9,
-        obstacle_center_x=100.0,
-        lane_center_x_at_obstacle=100.0,
-        danger_left=10.0,
-        danger_right=190.0,
-        recommended_avoid_side="right",
-        too_close=False,
-        reason="test obstacle",
-    )
-
-    result = planner.plan(
-        centerline_points=centerline,
-        normal_target=normal_target,
-        blocking_result=blocking,
-        roi_width=200,
-        roi_height=200,
-        lane_confidence=0.9,
-    )
-
-    assert result.mode == "avoid_right"
-    assert result.target_point_roi == pytest.approx((120.0, 80.0))
-    assert result.avoid_bias_px == pytest.approx(20.0)

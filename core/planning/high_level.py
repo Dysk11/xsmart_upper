@@ -43,6 +43,34 @@ def build_off_track_stop_hint(track_mask_visible: bool) -> ModuleHints | None:
     )
 
 
+def build_safety_stop_hint(
+    track_mask_visible: bool,
+    pedestrian_safety_result: Any | None = None,
+    road_sign_waiting: bool = False,
+) -> ModuleHints | None:
+    """Select the active stop request in safety-priority order."""
+
+    off_track_hint = build_off_track_stop_hint(track_mask_visible)
+    if off_track_hint is not None:
+        return off_track_hint
+    if (
+        pedestrian_safety_result is not None
+        and bool(getattr(pedestrian_safety_result, "stop_required", False))
+    ):
+        return ModuleHints(
+            stop=True,
+            force_mode="PEDESTRIAN_WAIT",
+            note=str(getattr(pedestrian_safety_result, "reason", "")),
+        )
+    if road_sign_waiting:
+        return ModuleHints(
+            stop=True,
+            force_mode="ROAD_SIGN_WAIT",
+            note="waiting for OCR and road-sign API decision",
+        )
+    return None
+
+
 class HighLevelPlanner:
     """根据巡线状态生成目标速度与目标转向。"""
 

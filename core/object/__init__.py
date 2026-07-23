@@ -1,1 +1,1 @@
-"""Object perception and blocking analysis."""
+"""Object perception and pedestrian safety analysis."""

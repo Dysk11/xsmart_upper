@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from core.object.pedestrian_safety import PedestrianSafetyResult
 from core.visualization.visualizer import Visualizer
 from utils.image_utils import measure_text_width, wrap_text_lines
 
@@ -53,12 +54,12 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
     visualizer = Visualizer({"show_window": False, "debug_panel_font_size": 18})
     common = {
         "width": 640,
-        "avoidance_result": SimpleNamespace(
-            mode="lane_follow",
-            avoid_bias_px=0.0,
-            final_lateral_error_px=-107.0,
+        "target_result": SimpleNamespace(
+            target_point_roi=(213.0, 80.0),
+            target_lateral_error_px=-107.0,
+            reason="fixed-height lane target",
         ),
-        "control_command": SimpleNamespace(steer_deg=-35.0),
+        "control_command": SimpleNamespace(mode="NORMAL", steer_deg=-35.0),
         "fps_value": 59.9,
         "gold_result": SimpleNamespace(active=True, reason="coin target active"),
         "path_marker_result": SimpleNamespace(active=True, reason="Go/Stop path marker active"),
@@ -74,7 +75,12 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
     short_panel = visualizer._build_debug_panel(
         **common,
         detection_result=make_detection("ok"),
-        blocking_result=SimpleNamespace(reason="no blocking"),
+        pedestrian_safety_result=SimpleNamespace(
+            latched=False,
+            human_count=0,
+            overlapping_count=0,
+            reason="no qualifying pedestrian overlaps danger zone",
+        ),
     )
     long_panel = visualizer._build_debug_panel(
         **common,
@@ -82,8 +88,14 @@ def test_debug_panel_auto_grows_for_full_long_status() -> None:
             "geometry selected by frame center because candidate distances remained stable "
             "through_multiple_consecutive_bottom_track_regions"
         ),
-        blocking_result=SimpleNamespace(
-            reason="blocking object overlaps the projected lane corridor for multiple rows"
+        pedestrian_safety_result=SimpleNamespace(
+            latched=True,
+            human_count=2,
+            overlapping_count=1,
+            reason=(
+                "latched pedestrian still overlaps the configured danger zone "
+                "through_multiple_consecutive_detection_results"
+            ),
         ),
     )
 
@@ -109,12 +121,36 @@ def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
     assert np.array_equal(canvas[:100, :100], frame[:100, :100])
 
 
+def test_pedestrian_danger_zone_changes_from_yellow_to_red_when_stopped() -> None:
+    visualizer = Visualizer({"show_window": False})
+    safe_frame = np.zeros((100, 100, 3), dtype=np.uint8)
+    stop_frame = safe_frame.copy()
+    common = {
+        "danger_zone_frame": (30.0, 10.0, 70.0, 90.0),
+        "human_count": 1,
+        "overlapping_count": 1,
+        "reason": "test",
+    }
+
+    visualizer._draw_pedestrian_danger_zone(
+        safe_frame,
+        PedestrianSafetyResult(stop_required=False, latched=False, **common),
+    )
+    visualizer._draw_pedestrian_danger_zone(
+        stop_frame,
+        PedestrianSafetyResult(stop_required=True, latched=True, **common),
+    )
+
+    assert tuple(safe_frame[10, 30]) == (0, 255, 255)
+    assert tuple(stop_frame[10, 30]) == (0, 0, 255)
+
+
 def test_debug_panel_handles_missing_optional_results() -> None:
     visualizer = Visualizer({"show_window": False})
     panel = visualizer._build_debug_panel(
         width=640,
-        avoidance_result=None,
-        blocking_result=None,
+        target_result=None,
+        pedestrian_safety_result=None,
         control_command=None,  # type: ignore[arg-type]
         fps_value=0.0,
         gold_result=None,

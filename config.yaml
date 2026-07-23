@@ -153,27 +153,14 @@ path_marker_target:
   interpolation_step_px: 4
   release_y_ratio: 0.92
 
-blocking_analyzer:
+pedestrian_safety:
   enabled: true
-  allowed_class_names: [car, human]
-  corridor_half_width_px: 90
-  confidence_threshold: 0.45
-  min_box_area: 600
-  near_y_ratio: 0.42
-  too_close_y_ratio: 0.82
-  blocking_score_threshold: 0.25
-  side_deadband_px: 25
-
-avoidance_target_planner:
-  enabled: true
-  max_avoid_bias_px: 110
-  bias_alpha: 0.25
-  return_decay: 0.85
-  clear_frames: 8
-  front_margin_px: 45
-  rear_margin_px: 35
-  min_lane_confidence_to_start_avoid: 0.45
-  max_target_jump_px: 50
+  min_box_area_px: 600
+  danger_zone:
+    left_ratio: 0.30
+    right_ratio: 0.70
+    top_ratio: 0.00
+    bottom_ratio: 1.00
 
 road_sign_analyzer:
   enable: true

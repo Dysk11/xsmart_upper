@@ -9,8 +9,8 @@ from typing import Any
 import cv2
 import numpy as np
 
-from core.planning.avoidance import AvoidanceTargetResult
-from core.object.blocking import BlockingAnalysisResult, DetectedObject
+from core.object.blocking import DetectedObject
+from core.object.pedestrian_safety import PedestrianSafetyResult
 from core.planning.gold_target import GoldTargetResult
 from core.planning.path_marker_target import PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult
@@ -63,8 +63,7 @@ class Visualizer:
         control_command: ControlCommand,
         fps_value: float,
         target_result: TargetPointResult | None = None,
-        blocking_result: BlockingAnalysisResult | None = None,
-        avoidance_result: AvoidanceTargetResult | None = None,
+        pedestrian_safety_result: PedestrianSafetyResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
@@ -92,8 +91,7 @@ class Visualizer:
             control_command=control_command,
             fps_value=fps_value,
             target_result=target_result,
-            blocking_result=blocking_result,
-            avoidance_result=avoidance_result,
+            pedestrian_safety_result=pedestrian_safety_result,
             detected_objects=detected_objects,
             gold_result=gold_result,
             path_marker_result=path_marker_result,
@@ -109,8 +107,8 @@ class Visualizer:
             cv2.imshow(self.window_name, canvas)
             debug_panel = self._build_debug_panel(
                 width=frame.shape[1],
-                avoidance_result=avoidance_result,
-                blocking_result=blocking_result,
+                target_result=target_result,
+                pedestrian_safety_result=pedestrian_safety_result,
                 control_command=control_command,
                 fps_value=fps_value,
                 gold_result=gold_result,
@@ -152,8 +150,7 @@ class Visualizer:
         control_command: ControlCommand,
         fps_value: float,
         target_result: TargetPointResult | None = None,
-        blocking_result: BlockingAnalysisResult | None = None,
-        avoidance_result: AvoidanceTargetResult | None = None,
+        pedestrian_safety_result: PedestrianSafetyResult | None = None,
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
@@ -236,13 +233,6 @@ class Visualizer:
                     color,
                     1,
                 )
-        if avoidance_result is not None:
-            original_panel = draw_centerline(
-                original_panel,
-                avoidance_result.shifted_centerline_points,
-                color=(255, 255, 0),
-                offset=(x1, y1),
-            )
         if path_marker_result is not None and path_marker_result.active:
             original_panel = draw_centerline(
                 original_panel,
@@ -276,13 +266,10 @@ class Visualizer:
                 color=(0, 180, 255),
                 label="N",
             )
-        if avoidance_result is not None:
-            self._draw_target_point(
+        if pedestrian_safety_result is not None:
+            self._draw_pedestrian_danger_zone(
                 original_panel,
-                avoidance_result.target_point_roi,
-                offset=(x1, y1),
-                color=(0, 255, 255),
-                label="A",
+                pedestrian_safety_result,
             )
         if detected_objects:
             self._draw_detected_objects(original_panel, detected_objects)
@@ -304,13 +291,6 @@ class Visualizer:
                 offset=(x1, y1),
                 color=(200, 0, 255),
                 label="P",
-            )
-        if blocking_result is not None and blocking_result.blocking_object is not None:
-            self._draw_blocking_debug(
-                original_panel,
-                blocking_result,
-                roi_offset=(x1, y1),
-                roi_height=y2 - y1,
             )
         return original_panel
 
@@ -374,42 +354,37 @@ class Visualizer:
                 cv2.LINE_AA,
             )
 
-    def _draw_blocking_debug(
+    def _draw_pedestrian_danger_zone(
         self,
         image: np.ndarray,
-        blocking_result: BlockingAnalysisResult,
-        roi_offset: tuple[int, int],
-        roi_height: int,
+        result: PedestrianSafetyResult,
     ) -> None:
-        obj = blocking_result.blocking_object
-        if obj is None:
-            return
-        frame_x1, frame_y1, frame_x2, frame_y2 = obj.bbox_frame
-        roi_x1, roi_y1, roi_x2, roi_y2 = obj.bbox_roi or (0, 0, 0, 0)
-        ox, oy = roi_offset
+        x1, y1, x2, y2 = result.danger_zone_frame
+        color = (0, 0, 255) if result.stop_required else (0, 255, 255)
+        thickness = 3 if result.stop_required else 2
         cv2.rectangle(
             image,
-            (int(frame_x1), int(frame_y1)),
-            (int(frame_x2), int(frame_y2)),
-            (0, 165, 255),
-            2,
+            (int(round(x1)), int(round(y1))),
+            (int(round(x2)), int(round(y2))),
+            color,
+            thickness,
         )
-        lane_x = int(round(blocking_result.lane_center_x_at_obstacle + ox))
-        y_bottom = int(round(roi_y2 + oy))
-        cv2.circle(image, (lane_x, y_bottom), 6, (255, 0, 255), -1)
-        cv2.line(image, (lane_x, oy), (lane_x, oy + roi_height - 1), (255, 0, 255), 1)
-        danger_left = int(round(blocking_result.danger_left + ox))
-        danger_right = int(round(blocking_result.danger_right + ox))
-        cv2.line(image, (danger_left, oy), (danger_left, oy + roi_height - 1), (0, 255, 255), 1)
-        cv2.line(image, (danger_right, oy), (danger_right, oy + roi_height - 1), (0, 255, 255), 1)
-        _ = roi_x1
-        _ = roi_y1
+        cv2.putText(
+            image,
+            "DANGER",
+            (int(round(x1)) + 4, max(18, int(round(y1)) + 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
 
     def _build_debug_panel(
         self,
         width: int,
-        avoidance_result: AvoidanceTargetResult | None,
-        blocking_result: BlockingAnalysisResult | None,
+        target_result: TargetPointResult | None,
+        pedestrian_safety_result: PedestrianSafetyResult | None,
         control_command: ControlCommand,
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
@@ -436,11 +411,10 @@ class Visualizer:
             self.debug_panel_font_size,
         )
 
-        mode = avoidance_result.mode if avoidance_result is not None else "n/a"
-        bias = f"{avoidance_result.avoid_bias_px:.1f}" if avoidance_result is not None else "n/a"
+        mode = getattr(control_command, "mode", "n/a")
         final_error = (
-            f"{avoidance_result.final_lateral_error_px:.1f}"
-            if avoidance_result is not None
+            f"{target_result.target_lateral_error_px:.1f}"
+            if target_result is not None
             else "n/a"
         )
         steer_deg = getattr(control_command, "steer_deg", None)
@@ -456,19 +430,18 @@ class Visualizer:
             if segmentation_confidence is not None
             else f"track: {segmentation_status} instances={segmentation_instance_count}"
         )
-        target_point = getattr(avoidance_result, "target_point_roi", None)
+        target_point = getattr(target_result, "target_point_roi", None)
         target_text = (
             f"target: x={float(target_point[0]):.1f} y={float(target_point[1]):.1f}"
             if target_point is not None
             else "target: n/a"
         )
-        lane_reason = getattr(avoidance_result, "reason", "n/a")
+        lane_reason = getattr(target_result, "reason", "n/a")
         left_lines = wrap_text_lines(
             [
                 "运行 / 控制",
                 f"mode: {mode}  FPS: {fps_value:.1f}",
                 track_text,
-                f"bias_px: {bias}",
                 f"final_error: {final_error}",
                 f"steer_deg: {steer_text}",
                 target_text,
@@ -479,7 +452,16 @@ class Visualizer:
             self.debug_panel_font_size,
         )
 
-        blocking_reason = blocking_result.reason if blocking_result is not None else "no blocking"
+        if pedestrian_safety_result is None:
+            pedestrian_status = "pedestrian: unavailable"
+            pedestrian_reason = "pedestrian reason: unavailable"
+        else:
+            pedestrian_status = (
+                f"pedestrian: latched={pedestrian_safety_result.latched} "
+                f"humans={pedestrian_safety_result.human_count} "
+                f"overlaps={pedestrian_safety_result.overlapping_count}"
+            )
+            pedestrian_reason = f"pedestrian reason: {pedestrian_safety_result.reason}"
         gold_reason = gold_result.reason if gold_result is not None and gold_result.active else "no coin"
         path_marker_reason = (
             path_marker_result.reason
@@ -501,7 +483,8 @@ class Visualizer:
             fork_reason,
             f"{path_marker_reason}",
             f"{gold_reason}",
-            f"{blocking_reason}",
+            pedestrian_status,
+            pedestrian_reason,
         ]
         right_source_lines.extend(self._ocr_status_lines(ocr_result))
         right_lines = wrap_text_lines(

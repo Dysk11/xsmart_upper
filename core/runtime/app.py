@@ -32,8 +32,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.io.bridge import BaseVehicleBridge, build_vehicle_bridge
 from core.io.camera import CameraReader
 from core.io.protocol import resolve_configured_speed_state, validate_drive_speed_state
-from core.planning.avoidance import AvoidanceTargetPlanner, AvoidanceTargetResult
-from core.object.blocking import BlockingAnalyzer, BlockingAnalysisResult, DetectedObject, attach_roi_bboxes
+from core.object.blocking import DetectedObject
+from core.object.pedestrian_safety import (
+    PedestrianSafetyAnalyzer,
+    PedestrianSafetyResult,
+)
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
 from core.planning.path_marker_target import PathMarkerTargetPlanner, PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult, LaneDetector
@@ -44,7 +47,7 @@ from core.planning.high_level import (
     ControlCommand,
     HighLevelPlanner,
     ModuleHints,
-    build_off_track_stop_hint,
+    build_safety_stop_hint,
 )
 from core.planning.road_sign_analyzer import (
     RoadSignAnalysisLogger,
@@ -796,15 +799,8 @@ class UpperMachineApp:
         self.path_marker_target_planner = PathMarkerTargetPlanner(
             config.get("path_marker_target", {})
         )
-        self.blocking_config = config.get("blocking_analyzer", {})
-        self.blocking_class_names = {
-            str(name).casefold()
-            for name in self.blocking_config.get("allowed_class_names", ["car", "human"])
-        }
-        self.blocking_analyzer = BlockingAnalyzer(self.blocking_config)
-        self.avoidance_planner = AvoidanceTargetPlanner(
-            config.get("avoidance_target_planner", {}),
-            target_selector=self.target_selector,
+        self.pedestrian_safety_analyzer = PedestrianSafetyAnalyzer(
+            config.get("pedestrian_safety", {})
         )
         self.planner = HighLevelPlanner(config.get("planner", {}))
         bridge_config = config.get("bridge", {})
@@ -828,8 +824,7 @@ class UpperMachineApp:
         self.lane_timing_bridge_ms = 0.0
         self.lane_timing_max_ms = 0.0
         self.last_target_result: TargetPointResult | None = None
-        self.last_blocking_result: BlockingAnalysisResult | None = None
-        self.last_avoidance_result: AvoidanceTargetResult | None = None
+        self.last_pedestrian_safety_result: PedestrianSafetyResult | None = None
         self.last_detected_objects: list[DetectedObject] = []
         self.last_gold_result: GoldTargetResult | None = None
         self.last_path_marker_result: PathMarkerTargetResult | None = None
@@ -1227,8 +1222,7 @@ class UpperMachineApp:
                         "control_command": control_command,
                         "fps_value": fps_value,
                         "target_result": self.last_target_result,
-                        "blocking_result": self.last_blocking_result,
-                        "avoidance_result": self.last_avoidance_result,
+                        "pedestrian_safety_result": self.last_pedestrian_safety_result,
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
                         "path_marker_result": self.last_path_marker_result,
@@ -1523,20 +1517,16 @@ class UpperMachineApp:
         _ = frame
         _ = roi_rect
         _ = tracked_state
-        off_track_hint = build_off_track_stop_hint(track_mask_visible)
-        if off_track_hint is not None:
-            return off_track_hint
-        if self.ocr_stop_latch.active:
-            return ModuleHints(
-                stop=True,
-                force_mode="ROAD_SIGN_WAIT",
-                note="waiting for OCR and road-sign API decision",
-            )
+        safety_stop_hint = build_safety_stop_hint(
+            track_mask_visible=track_mask_visible,
+            pedestrian_safety_result=self.last_pedestrian_safety_result,
+            road_sign_waiting=self.ocr_stop_latch.active,
+        )
+        if safety_stop_hint is not None:
+            return safety_stop_hint
         if (
             self.last_path_marker_result is not None
             and self.last_path_marker_result.active
-            and self.last_avoidance_result is not None
-            and self.last_avoidance_result.mode == "path_marker_target"
         ):
             return ModuleHints(
                 force_mode="PATH_TARGET",
@@ -1545,8 +1535,10 @@ class UpperMachineApp:
         if (
             self.last_gold_result is not None
             and self.last_gold_result.active
-            and self.last_avoidance_result is not None
-            and self.last_avoidance_result.mode == "gold_target"
+            and not (
+                self.last_path_marker_result is not None
+                and self.last_path_marker_result.active
+            )
         ):
             return ModuleHints(
                 speed_limit=self.last_gold_result.speed_limit,
@@ -1554,34 +1546,6 @@ class UpperMachineApp:
                 note=self.last_gold_result.reason,
             )
         return ModuleHints()
-
-    def _detect_objects_for_roi(
-        self,
-        roi_rect: tuple[int, int, int, int],
-        detection_result: LaneDetectionResult,
-        tracked_state: TrackedLaneState,
-    ) -> list[DetectedObject]:
-        """Return vehicle/person boxes with ROI coordinates attached.
-
-        This hook intentionally defaults to no detections. A real ObjectDetector should
-        provide DetectedObject(class_name, confidence, bbox_frame) in resized_frame
-        coordinates; this method clips each bbox into bbox_roi for BlockingAnalyzer.
-        """
-
-        _ = detection_result
-        _ = tracked_state
-        objects_from_detector = [
-            obj for obj in self.last_detected_objects
-            if obj.class_name.casefold() in self.blocking_class_names
-        ]
-        x1, y1, x2, y2 = roi_rect
-        roi_width, roi_height = x2 - x1, y2 - y1
-        return attach_roi_bboxes(
-            objects=objects_from_detector,
-            roi_rect=roi_rect,
-            roi_width=roi_width,
-            roi_height=roi_height,
-        )
 
     def _build_planning_state(
         self,
@@ -1600,6 +1564,11 @@ class UpperMachineApp:
             roi_height=roi_height,
             lane_confidence=tracked_state.confidence,
         )
+        self.last_target_result = normal_target
+        self.last_pedestrian_safety_result = self.pedestrian_safety_analyzer.analyze(
+            objects=self.last_detected_objects,
+            roi_rect=roi_rect,
+        )
         path_marker_result = self.path_marker_target_planner.plan(
             objects=self.last_detected_objects,
             centerline_points=detection_result.centerline_points,
@@ -1616,54 +1585,8 @@ class UpperMachineApp:
             roi_height=roi_height,
         )
         self.last_gold_result = gold_result
-        objects = self._detect_objects_for_roi(
-            roi_rect=roi_rect,
-            detection_result=detection_result,
-            tracked_state=tracked_state,
-        )
-        blocking_result = self.blocking_analyzer.analyze(
-            objects=objects,
-            centerline_points=centerline_points,
-            roi_width=roi_width,
-            roi_height=roi_height,
-        )
-        avoidance_result = self.avoidance_planner.plan(
-            centerline_points=centerline_points,
-            normal_target=normal_target,
-            blocking_result=blocking_result,
-            roi_width=roi_width,
-            roi_height=roi_height,
-            lane_confidence=tracked_state.confidence,
-        )
-
-        if blocking_result.need_avoid or blocking_result.too_close:
-            self.last_target_result = normal_target
-            self.last_blocking_result = blocking_result
-            self.last_avoidance_result = avoidance_result
-            return replace(
-                tracked_state,
-                centerline_points=[
-                    (int(round(x)), int(round(y)))
-                    for x, y in avoidance_result.shifted_centerline_points
-                ],
-                lateral_error_px=avoidance_result.final_lateral_error_px,
-                heading_error_deg=avoidance_result.final_heading_error_deg,
-                confidence=min(tracked_state.confidence, avoidance_result.confidence),
-            )
 
         if path_marker_result.active:
-            self.last_target_result = normal_target
-            self.last_blocking_result = blocking_result
-            self.last_avoidance_result = AvoidanceTargetResult(
-                mode="path_marker_target",
-                shifted_centerline_points=path_marker_result.connected_centerline_points,
-                target_point_roi=path_marker_result.target_point_roi,
-                avoid_bias_px=0.0,
-                final_lateral_error_px=path_marker_result.final_lateral_error_px,
-                final_heading_error_deg=path_marker_result.final_heading_error_deg,
-                confidence=path_marker_result.confidence,
-                reason=path_marker_result.reason,
-            )
             return replace(
                 tracked_state,
                 centerline_points=[
@@ -1680,21 +1603,6 @@ class UpperMachineApp:
             )
 
         if gold_result.active:
-            self.last_target_result = normal_target
-            self.last_blocking_result = blocking_result
-            self.last_avoidance_result = AvoidanceTargetResult(
-                mode="gold_target",
-                shifted_centerline_points=[
-                    (float(x), float(y))
-                    for x, y in centerline_points
-                ],
-                target_point_roi=gold_result.target_point_roi,
-                avoid_bias_px=0.0,
-                final_lateral_error_px=gold_result.final_lateral_error_px,
-                final_heading_error_deg=gold_result.final_heading_error_deg,
-                confidence=gold_result.confidence,
-                reason=gold_result.reason,
-            )
             return replace(
                 tracked_state,
                 lateral_error_px=gold_result.final_lateral_error_px,
@@ -1703,19 +1611,11 @@ class UpperMachineApp:
                 is_lane_lost=False,
             )
 
-        self.last_target_result = normal_target
-        self.last_blocking_result = blocking_result
-        self.last_avoidance_result = avoidance_result
-
         return replace(
             tracked_state,
-            centerline_points=[
-                (int(round(x)), int(round(y)))
-                for x, y in avoidance_result.shifted_centerline_points
-            ],
-            lateral_error_px=avoidance_result.final_lateral_error_px,
-            heading_error_deg=avoidance_result.final_heading_error_deg,
-            confidence=min(tracked_state.confidence, avoidance_result.confidence),
+            lateral_error_px=normal_target.target_lateral_error_px,
+            heading_error_deg=normal_target.target_heading_error_deg,
+            confidence=min(tracked_state.confidence, normal_target.confidence),
         )
 
 
