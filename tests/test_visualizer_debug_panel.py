@@ -124,7 +124,8 @@ def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
 
     assert canvas.shape[1] == frame.shape[1]
     assert canvas.shape[0] == frame.shape[0]
-    assert np.array_equal(canvas[:100, :100], frame[:100, :100])
+    assert not np.array_equal(canvas[:45, :160], frame[:45, :160])
+    assert np.array_equal(canvas[50:100, :100], frame[50:100, :100])
 
 
 def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
@@ -151,7 +152,7 @@ def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     assert tuple(frame[60, 45]) == (0, 0, 255)
 
 
-def test_original_car_box_and_avoidance_route_are_drawn() -> None:
+def test_car_warning_box_is_hidden_but_avoidance_route_is_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
     frame = np.zeros((200, 200, 3), dtype=np.uint8)
     result = SimpleNamespace(
@@ -176,9 +177,23 @@ def test_original_car_box_and_avoidance_route_are_drawn() -> None:
         roi_offset=(0, 0),
     )
 
-    assert tuple(output[60, 80]) == (0, 128, 255)
+    assert tuple(output[60, 80]) == (0, 0, 0)
     assert tuple(output[150, 69]) == (0, 255, 255)
     assert tuple(output[150, 40]) == (255, 0, 255)
+
+
+def test_detected_car_box_is_hidden_but_other_objects_are_drawn() -> None:
+    visualizer = Visualizer({"show_window": False})
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    objects = [
+        SimpleNamespace(class_name="car", confidence=0.9, bbox_frame=(10, 20, 50, 60)),
+        SimpleNamespace(class_name="human", confidence=0.8, bbox_frame=(90, 20, 140, 60)),
+    ]
+
+    visualizer._draw_detected_objects(frame, objects)  # type: ignore[arg-type]
+
+    assert tuple(frame[20, 10]) == (0, 0, 0)
+    assert tuple(frame[20, 90]) == (0, 165, 255)
 
 
 def test_debug_panel_handles_missing_optional_results() -> None:

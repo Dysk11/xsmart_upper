@@ -751,7 +751,9 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dic
     if args.bridge:
         runtime_config.setdefault("bridge", {})["type"] = args.bridge
     if args.no_gui:
-        runtime_config.setdefault("visualizer", {})["show_window"] = False
+        visualizer_config = runtime_config.setdefault("visualizer", {})
+        visualizer_config["show_window"] = False
+        visualizer_config["show_debug_window"] = False
     if args.save_video:
         runtime_config.setdefault("visualizer", {})["save_video"] = True
 
@@ -963,6 +965,7 @@ class UpperMachineApp:
         visualizer_config = config.get("visualizer", {})
         self.ui_active = bool(
             visualizer_config.get("show_window", True)
+            or visualizer_config.get("show_debug_window", False)
             or visualizer_config.get("save_video", False)
             or visualizer_config.get("save_screenshot", False)
         )

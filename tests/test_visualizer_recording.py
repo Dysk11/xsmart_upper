@@ -51,6 +51,7 @@ def test_raw_recording_keeps_annotated_window(
     visualizer = Visualizer(
         {
             "show_window": True,
+            "show_debug_window": True,
             "save_video": True,
             "record_without_ui": True,
             "save_dir": ".",
@@ -68,6 +69,29 @@ def test_raw_recording_keeps_annotated_window(
         ("X-SmartCar Upper", canvas),
         ("X-SmartCar Debug", debug_panel),
     ]
+
+
+def test_debug_window_can_be_enabled_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.full((4, 6, 3), 10, dtype=np.uint8)
+    canvas = np.full((8, 12, 3), 20, dtype=np.uint8)
+    debug_panel = np.full((5, 12, 3), 30, dtype=np.uint8)
+    displayed: list[tuple[str, np.ndarray]] = []
+    visualizer = Visualizer(
+        {
+            "show_window": False,
+            "show_debug_window": True,
+            "save_video": False,
+        }
+    )
+    monkeypatch.setattr(visualizer, "_build_canvas", lambda **_: canvas)
+    monkeypatch.setattr(visualizer, "_build_debug_panel", lambda **_: debug_panel)
+    monkeypatch.setattr(cv2, "imshow", lambda name, image: displayed.append((name, image)))
+    monkeypatch.setattr(cv2, "waitKey", lambda _delay: -1)
+
+    assert render_once(visualizer, frame)
+    assert displayed == [("X-SmartCar Debug", debug_panel)]
 
 
 def test_raw_recording_continues_without_window(

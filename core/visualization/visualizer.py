@@ -36,6 +36,7 @@ class Visualizer:
         """
 
         self.show_window = bool(config.get("show_window", True))
+        self.show_debug_window = bool(config.get("show_debug_window", False))
         self.window_name = str(config.get("window_name", "X-SmartCar Upper"))
         self.debug_window_name = str(config.get("debug_window_name", "X-SmartCar Debug"))
         self.save_video = bool(config.get("save_video", False))
@@ -108,6 +109,7 @@ class Visualizer:
 
         if self.show_window:
             cv2.imshow(self.window_name, canvas)
+        if self.show_debug_window:
             debug_panel = self._build_debug_panel(
                 width=frame.shape[1],
                 target_result=target_result,
@@ -121,6 +123,7 @@ class Visualizer:
                 ocr_result=ocr_result,
             )
             cv2.imshow(self.debug_window_name, debug_panel)
+        if self.show_window or self.show_debug_window:
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
                 return False
@@ -142,7 +145,7 @@ class Visualizer:
         if self.video_writer is not None:
             self.video_writer.release()
             self.video_writer = None
-        if self.show_window:
+        if self.show_window or self.show_debug_window:
             cv2.destroyAllWindows()
 
     def _build_canvas(
@@ -314,7 +317,35 @@ class Visualizer:
                 color=(200, 0, 255),
                 label="P",
             )
+        self._draw_fps(original_panel, fps_value)
         return original_panel
+
+    @staticmethod
+    def _draw_fps(image: np.ndarray, fps_value: float) -> None:
+        """Draw the main-loop FPS in the upper-left corner of the live frame."""
+
+        label = f"FPS: {max(0.0, float(fps_value)):.1f}"
+        origin = (12, 30)
+        cv2.putText(
+            image,
+            label,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 0, 0),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            image,
+            label,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (80, 255, 80),
+            2,
+            cv2.LINE_AA,
+        )
 
     def _overlay_roi_mask(
         self,
@@ -359,6 +390,8 @@ class Visualizer:
         objects: list[DetectedObject],
     ) -> None:
         for obj in objects:
+            if obj.class_name.casefold() == "car":
+                continue
             x1, y1, x2, y2 = obj.bbox_frame
             is_gold = obj.class_name.casefold() in {"gold", "coin"}
             color = (0, 215, 255) if is_gold else (0, 165, 255)
@@ -382,7 +415,7 @@ class Visualizer:
         result: CarAvoidanceResult,
         roi_offset: tuple[int, int],
     ) -> np.ndarray:
-        """Draw original car boxes, the locked boundary, and the blended route."""
+        """Draw the locked boundary and blended route without car warning boxes."""
 
         output = image
         boundary_route = getattr(result, "boundary_route_points", [])
@@ -403,22 +436,6 @@ class Visualizer:
                 radius=2,
                 thickness=3,
                 offset=roi_offset,
-            )
-        color = (0, 0, 255) if result.stop_required else (0, 128, 255)
-        for zone in result.warning_zones:
-            x1, y1, x2, y2 = zone.bbox_frame
-            top_left = (int(round(x1)), int(round(y1)))
-            bottom_right = (int(round(x2)), int(round(y2)))
-            cv2.rectangle(output, top_left, bottom_right, color, 2)
-            cv2.putText(
-                output,
-                f"CAR {zone.avoid_side.upper()}",
-                (top_left[0], max(18, top_left[1] - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-                cv2.LINE_AA,
             )
         return output
 

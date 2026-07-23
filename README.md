@@ -125,7 +125,8 @@ camera:
 
 ### 6. `visualizer`
 
-- `show_window`: 是否显示调试窗口
+- `show_window`: 是否显示实时画面窗口；画面左上角固定显示主循环 FPS
+- `show_debug_window`: 是否独立显示详细 Debug 信息窗口，默认 `false`
 - `debug_window_name`: 独立调试信息窗口的名称
 - `debug_panel_font_size`: 独立调试窗口的双列面板字号，默认 `18`；长状态和原因会按面板列宽自动换行
 - `save_video`: 是否保存调试视频

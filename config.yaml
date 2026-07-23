@@ -207,6 +207,7 @@ bridge:
 
 visualizer:
   show_window: true
+  show_debug_window: false
   window_name: X-SmartCar Upper
   debug_window_name: X-SmartCar Debug
   font_path: "C:/Windows/Fonts/msyh.ttc"
