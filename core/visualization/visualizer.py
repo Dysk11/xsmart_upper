@@ -436,17 +436,6 @@ class Visualizer:
         content_width = max(1, int(width) - padding * 2)
         column_width = max(1, (content_width - column_gap) // 2)
 
-        header_lines = wrap_text_lines(
-            [
-                "窗口1：原始画面",
-                "绿线=原中心线 青线=最终路径 紫线=Go/Stop连接 N=普通 A=最终 G=coin P=路径目标",
-                "洋红线=左岔中线 橙线=右岔中线 LF/RF=左右岔路拐点",
-            ],
-            content_width,
-            self.font_path,
-            self.debug_panel_font_size,
-        )
-
         mode = getattr(control_command, "mode", "n/a")
         final_error = (
             f"{target_result.target_lateral_error_px:.1f}"
@@ -545,21 +534,9 @@ class Visualizer:
             self.debug_panel_font_size,
         )
 
-        header_height = len(header_lines) * line_height
-        columns_top = padding + header_height + 10
+        columns_top = padding
         panel_height = columns_top + max(len(left_lines), len(right_lines)) * line_height + padding
         panel = np.full((panel_height, int(width), 3), (24, 24, 24), dtype=np.uint8)
-        panel = draw_text_lines(
-            panel,
-            header_lines,
-            origin=(padding, padding + self.debug_panel_font_size),
-            line_height=line_height,
-            background_alpha=0.0,
-            font_path=self.font_path,
-            font_size=self.debug_panel_font_size,
-        )
-        separator_y = padding + header_height + 3
-        cv2.line(panel, (padding, separator_y), (int(width) - padding - 1, separator_y), (80, 80, 80), 1)
         panel = draw_text_lines(
             panel,
             left_lines,
