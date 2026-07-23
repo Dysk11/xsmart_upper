@@ -390,8 +390,6 @@ class Visualizer:
         objects: list[DetectedObject],
     ) -> None:
         for obj in objects:
-            if obj.class_name.casefold() == "car":
-                continue
             x1, y1, x2, y2 = obj.bbox_frame
             is_gold = obj.class_name.casefold() in {"gold", "coin"}
             color = (0, 215, 255) if is_gold else (0, 165, 255)

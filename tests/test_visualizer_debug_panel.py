@@ -182,7 +182,7 @@ def test_car_warning_box_is_hidden_but_avoidance_route_is_drawn() -> None:
     assert tuple(output[150, 40]) == (255, 0, 255)
 
 
-def test_detected_car_box_is_hidden_but_other_objects_are_drawn() -> None:
+def test_detected_car_and_other_object_boxes_are_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
     frame = np.zeros((120, 160, 3), dtype=np.uint8)
     objects = [
@@ -192,7 +192,7 @@ def test_detected_car_box_is_hidden_but_other_objects_are_drawn() -> None:
 
     visualizer._draw_detected_objects(frame, objects)  # type: ignore[arg-type]
 
-    assert tuple(frame[20, 10]) == (0, 0, 0)
+    assert tuple(frame[20, 10]) == (0, 165, 255)
     assert tuple(frame[20, 90]) == (0, 165, 255)
 
 
