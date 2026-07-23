@@ -238,6 +238,7 @@ class CarAvoidancePlanner:
             base_route=base_route,
             boundary_rows=track_boundary_rows,
             side=self._locked_side,
+            roi_height=roi_height,
         )
         if not boundary_route:
             return self._stop(
@@ -352,20 +353,21 @@ class CarAvoidancePlanner:
 
         remaining_weight = 1.0 - self._smoothstep(progress)
         max_x = float(max(0, roi_width - 1))
+        offset_xs = self._aligned_x_values(
+            self._transition_start_offsets,
+            base_route,
+        )
         route = [
             (
                 clamp(
-                    base_x
-                    + remaining_weight
-                    * self._interpolate_x(self._transition_start_offsets, y),
+                    base_x + remaining_weight * offset_x,
                     0.0,
                     max_x,
                 ),
                 y,
             )
-            for base_x, y in base_route
+            for (base_x, y), offset_x in zip(base_route, offset_xs)
         ]
-        route = self._deduplicate_rows(route)
         self._last_output_route = list(route)
         target = self.target_selector.select(
             centerline_points=route,
@@ -465,60 +467,70 @@ class CarAvoidancePlanner:
         base_route: Sequence[Point],
         boundary_rows: Sequence[LaneBoundaryRow],
         side: str,
+        roi_height: int,
     ) -> tuple[list[Point], str]:
+        dense_boundary = self._build_dense_boundary(
+            boundary_rows,
+            side=side,
+            roi_height=roi_height,
+        )
         route: list[Point] = []
         for _, y in base_route:
-            boundary_x = self._interpolate_boundary_x(
-                boundary_rows,
-                target_y=y,
-                side=side,
-            )
+            boundary_x = self._sample_dense_boundary(dense_boundary, y)
             if boundary_x is None:
                 return [], f"missing {side} track boundary at roi_y={y:.1f}"
             route.append((float(boundary_x), float(y)))
-        return self._deduplicate_rows(route), ""
+        return route, ""
 
-    def _interpolate_boundary_x(
+    def _build_dense_boundary(
         self,
         rows: Sequence[LaneBoundaryRow],
-        target_y: float,
         side: str,
-    ) -> float | None:
-        if side not in {"left", "right"}:
-            return None
-        samples = sorted(
-            (
-                (
-                    float(row.left_x if side == "left" else row.right_x),
-                    float(row.y),
-                )
-                for row in rows
-                if (row.left_valid if side == "left" else row.right_valid)
-            ),
-            key=lambda point: point[1],
-        )
-        if not samples:
-            return None
-        for x, y in samples:
-            if abs(y - target_y) <= 1e-6:
-                return x
-
-        lower: Point | None = None
-        upper: Point | None = None
-        for sample in samples:
-            if sample[1] < target_y:
-                lower = sample
+        roi_height: int,
+    ) -> list[float | None]:
+        if side not in {"left", "right"} or roi_height <= 0:
+            return []
+        dense: list[float | None] = [None] * roi_height
+        for row in rows:
+            y = int(row.y)
+            valid = row.left_valid if side == "left" else row.right_valid
+            if not valid or y < 0 or y >= roi_height:
                 continue
-            if sample[1] > target_y:
-                upper = sample
-                break
-        if lower is None or upper is None:
+            dense[y] = float(row.left_x if side == "left" else row.right_x)
+
+        valid_ys = [y for y, value in enumerate(dense) if value is not None]
+        for lower_y, upper_y in zip(valid_ys, valid_ys[1:]):
+            missing_rows = upper_y - lower_y - 1
+            if missing_rows <= 0 or missing_rows > self.max_boundary_gap_rows:
+                continue
+            lower_x = dense[lower_y]
+            upper_x = dense[upper_y]
+            assert lower_x is not None and upper_x is not None
+            span = float(upper_y - lower_y)
+            for y in range(lower_y + 1, upper_y):
+                ratio = float(y - lower_y) / span
+                dense[y] = lower_x + (upper_x - lower_x) * ratio
+        return dense
+
+    @staticmethod
+    def _sample_dense_boundary(
+        dense: Sequence[float | None],
+        target_y: float,
+    ) -> float | None:
+        if not dense or target_y < 0.0 or target_y > float(len(dense) - 1):
             return None
-        missing_rows = max(0, int(round(upper[1] - lower[1])) - 1)
-        if missing_rows > self.max_boundary_gap_rows:
+        lower_y = int(target_y)
+        upper_y = min(lower_y + 1, len(dense) - 1)
+        lower_x = dense[lower_y]
+        if abs(target_y - float(lower_y)) <= 1e-6:
+            return float(lower_x) if lower_x is not None else None
+        upper_x = dense[upper_y]
+        if lower_x is None or upper_x is None:
             return None
-        ratio = (target_y - lower[1]) / (upper[1] - lower[1])
-        return float(lower[0] + (upper[0] - lower[0]) * ratio)
+        if lower_y == upper_y:
+            return float(lower_x)
+        ratio = target_y - float(lower_y)
+        return float(lower_x + (upper_x - lower_x) * ratio)
 
     def _start_transition(
         self,
@@ -529,12 +541,10 @@ class CarAvoidancePlanner:
     ) -> None:
         self._phase = phase
         self._transition_start_monotonic = float(now_monotonic)
+        start_xs = self._aligned_x_values(start_route, base_route)
         self._transition_start_offsets = [
-            (
-                self._interpolate_x(start_route, y) - base_x,
-                y,
-            )
-            for base_x, y in base_route
+            (start_x - base_x, y)
+            for (base_x, y), start_x in zip(base_route, start_xs)
         ]
 
     def _transition_progress(
@@ -554,17 +564,38 @@ class CarAvoidancePlanner:
         start_offsets: Sequence[Point],
         destination_weight: float,
     ) -> list[Point]:
-        route = []
-        for base_x, y in base_route:
-            start_x = base_x + self._interpolate_x(start_offsets, y)
-            destination_x = self._interpolate_x(destination_route, y)
-            route.append(
-                (
-                    start_x + destination_weight * (destination_x - start_x),
-                    y,
-                )
+        offset_xs = self._aligned_x_values(start_offsets, base_route)
+        destination_xs = self._aligned_x_values(destination_route, base_route)
+        return [
+            (
+                (base_x + offset_x)
+                + destination_weight
+                * (destination_x - (base_x + offset_x)),
+                y,
             )
-        return self._deduplicate_rows(route)
+            for (base_x, y), offset_x, destination_x in zip(
+                base_route,
+                offset_xs,
+                destination_xs,
+            )
+        ]
+
+    @classmethod
+    def _aligned_x_values(
+        cls,
+        points: Sequence[Point],
+        reference_route: Sequence[Point],
+    ) -> list[float]:
+        if len(points) == len(reference_route) and all(
+            abs(point[1] - reference[1]) <= 1e-6
+            for point, reference in zip(points, reference_route)
+        ):
+            return [float(x) for x, _ in points]
+        ordered = sorted(points, key=lambda point: point[1], reverse=True)
+        return [
+            cls._interpolate_ordered_x(ordered, y)
+            for _, y in reference_route
+        ]
 
     @staticmethod
     def _smoothstep(value: float) -> float:
@@ -606,9 +637,16 @@ class CarAvoidancePlanner:
 
     @staticmethod
     def _interpolate_x(points: Sequence[Point], target_y: float) -> float:
-        if not points:
-            return 0.0
         ordered = sorted(points, key=lambda point: point[1], reverse=True)
+        return CarAvoidancePlanner._interpolate_ordered_x(ordered, target_y)
+
+    @staticmethod
+    def _interpolate_ordered_x(
+        ordered: Sequence[Point],
+        target_y: float,
+    ) -> float:
+        if not ordered:
+            return 0.0
         if target_y >= ordered[0][1]:
             return float(ordered[0][0])
         if target_y <= ordered[-1][1]:

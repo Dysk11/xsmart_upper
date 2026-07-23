@@ -320,6 +320,39 @@ def test_short_invalid_boundary_gap_is_interpolated() -> None:
     assert route_x(result) == pytest.approx(40.0)
 
 
+def test_dense_boundary_preserves_fractional_y_interpolation() -> None:
+    planner = make_planner()
+    rows = [
+        LaneBoundaryRow(80, 40, 160, True, True),
+        LaneBoundaryRow(81, 42, 158, True, True),
+    ]
+
+    route, reason = planner._build_boundary_route(
+        [(0.0, 80.5)],
+        rows,
+        side="left",
+        roi_height=200,
+    )
+
+    assert reason == ""
+    assert route == pytest.approx([(41.0, 80.5)])
+
+
+def test_exact_valid_boundary_does_not_require_an_adjacent_valid_row() -> None:
+    planner = make_planner()
+    rows = [LaneBoundaryRow(80, 40, 160, True, True)]
+
+    route, reason = planner._build_boundary_route(
+        [(0.0, 80.0)],
+        rows,
+        side="left",
+        roi_height=200,
+    )
+
+    assert reason == ""
+    assert route == pytest.approx([(40.0, 80.0)])
+
+
 @pytest.mark.parametrize(
     "boundaries",
     [

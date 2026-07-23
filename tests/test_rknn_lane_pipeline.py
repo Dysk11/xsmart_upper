@@ -131,6 +131,7 @@ def test_lane_timing_summary_includes_wait_geometry_and_bridge(capsys) -> None:
     app.lane_timing_roi_ms = 0.0
     app.lane_timing_detect_ms = 0.0
     app.lane_timing_track_ms = 0.0
+    app.lane_timing_planning_ms = 0.0
     app.lane_timing_camera_wait_ms = 0.0
     app.lane_timing_segmentation_wait_ms = 0.0
     app.lane_timing_geometry_ms = 0.0
@@ -147,6 +148,7 @@ def test_lane_timing_summary_includes_wait_geometry_and_bridge(capsys) -> None:
         roi_ms=1.0,
         detect_ms=17.0,
         track_ms=2.0,
+        planning_ms=1.5,
         camera_wait_ms=3.0,
         segmentation_wait_ms=8.0,
         geometry_ms=6.0,
@@ -157,9 +159,11 @@ def test_lane_timing_summary_includes_wait_geometry_and_bridge(capsys) -> None:
     assert "camera_wait_ms=3.00" in output
     assert "segmentation_wait_ms=8.00" in output
     assert "geometry_ms=6.00" in output
+    assert "planning_ms=1.50" in output
     assert "bridge_ms=4.00" in output
     assert app.lane_timing_count == 0
     assert app.lane_timing_camera_wait_ms == 0.0
     assert app.lane_timing_segmentation_wait_ms == 0.0
     assert app.lane_timing_geometry_ms == 0.0
+    assert app.lane_timing_planning_ms == 0.0
     assert app.lane_timing_bridge_ms == 0.0

@@ -830,6 +830,7 @@ class UpperMachineApp:
         self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
+        self.lane_timing_planning_ms = 0.0
         self.lane_timing_camera_wait_ms = 0.0
         self.lane_timing_segmentation_wait_ms = 0.0
         self.lane_timing_geometry_ms = 0.0
@@ -1173,6 +1174,7 @@ class UpperMachineApp:
                 prefer_current=detection_result.fork_result.selected_direction is not None,
             )
             lane_track_time = time.perf_counter()
+            planning_started = lane_track_time
             planning_state = self._build_planning_state(
                 roi_rect=roi_rect,
                 detection_result=detection_result,
@@ -1188,6 +1190,7 @@ class UpperMachineApp:
             )
             # 第 5 步：把视觉结果变成“高层目标速度、目标转向”。
             control_command = self.planner.plan(planning_state, module_hints=module_hints)
+            planning_finished = time.perf_counter()
 
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
             payload = self._build_payload(control_command, planning_state)
@@ -1195,10 +1198,11 @@ class UpperMachineApp:
             self.bridge.send(payload)
             bridge_ms = (time.perf_counter() - bridge_started) * 1000.0
             self._record_lane_timing(
-                total_ms=(lane_track_time - lane_start_time) * 1000.0,
+                total_ms=(planning_finished - lane_start_time) * 1000.0,
                 roi_ms=(lane_roi_time - lane_start_time) * 1000.0,
                 detect_ms=(lane_detect_time - lane_roi_time) * 1000.0,
                 track_ms=(lane_track_time - lane_detect_time) * 1000.0,
+                planning_ms=(planning_finished - planning_started) * 1000.0,
                 camera_wait_ms=camera_wait_ms,
                 segmentation_wait_ms=segmentation_wait_ms,
                 geometry_ms=geometry_ms,
@@ -1376,6 +1380,7 @@ class UpperMachineApp:
         roi_ms: float,
         detect_ms: float,
         track_ms: float,
+        planning_ms: float,
         camera_wait_ms: float,
         segmentation_wait_ms: float,
         geometry_ms: float,
@@ -1391,6 +1396,7 @@ class UpperMachineApp:
         self.lane_timing_roi_ms += roi_ms
         self.lane_timing_detect_ms += detect_ms
         self.lane_timing_track_ms += track_ms
+        self.lane_timing_planning_ms += planning_ms
         self.lane_timing_camera_wait_ms += camera_wait_ms
         self.lane_timing_segmentation_wait_ms += segmentation_wait_ms
         self.lane_timing_geometry_ms += geometry_ms
@@ -1408,6 +1414,7 @@ class UpperMachineApp:
             f"roi={self.lane_timing_roi_ms / count:.2f} ms, "
             f"detect={self.lane_timing_detect_ms / count:.2f} ms, "
             f"track={self.lane_timing_track_ms / count:.2f} ms, "
+            f"planning_ms={self.lane_timing_planning_ms / count:.2f}, "
             f"camera_wait_ms={self.lane_timing_camera_wait_ms / count:.2f}, "
             f"segmentation_wait_ms={self.lane_timing_segmentation_wait_ms / count:.2f}, "
             f"geometry_ms={self.lane_timing_geometry_ms / count:.2f}, "
@@ -1432,6 +1439,7 @@ class UpperMachineApp:
         self.lane_timing_roi_ms = 0.0
         self.lane_timing_detect_ms = 0.0
         self.lane_timing_track_ms = 0.0
+        self.lane_timing_planning_ms = 0.0
         self.lane_timing_camera_wait_ms = 0.0
         self.lane_timing_segmentation_wait_ms = 0.0
         self.lane_timing_geometry_ms = 0.0
