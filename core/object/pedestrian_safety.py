@@ -93,6 +93,9 @@ class PedestrianSafetyAnalyzer:
         self.target_stability_count = 0
         self.last_target_jump_px: float | None = None
         self.crossing_baseline_ready = False
+        self.target_relock_pending = False
+        self.last_locked_target_offset_px: float | None = None
+        self.last_lock_was_relock = False
 
     def analyze(
         self,
@@ -178,6 +181,9 @@ class PedestrianSafetyAnalyzer:
         self.target_stability_count = 0
         self.last_target_jump_px = None
         self.crossing_baseline_ready = False
+        self.target_relock_pending = False
+        self.last_locked_target_offset_px = None
+        self.last_lock_was_relock = False
         self.tracked_center_frame = self._bbox_center(trigger.bbox_frame)
         self.latched = True
         trigger_area = self._bbox_area(trigger.bbox_frame)
@@ -273,10 +279,41 @@ class PedestrianSafetyAnalyzer:
         target_x_frame: float,
         center_region: BBox,
     ) -> None:
-        if self.frozen_target_x_frame is not None:
+        target_x = float(target_x_frame)
+        if self.target_relock_pending:
+            if not math.isfinite(target_x):
+                return
+            self.frozen_target_x_frame = target_x
+            self.target_region = self._classify_target_region(
+                target_x_frame=target_x,
+                center_region=center_region,
+            )
+            self.previous_target_x_frame = target_x
+            self.target_relock_pending = False
+            self.last_locked_target_offset_px = None
+            self.last_lock_was_relock = True
+            self.crossing_baseline_ready = False
             return
 
-        target_x = float(target_x_frame)
+        frozen_target_x = self.frozen_target_x_frame
+        if frozen_target_x is not None:
+            if not math.isfinite(target_x):
+                self.last_locked_target_offset_px = None
+                return
+            offset_px = abs(target_x - frozen_target_x)
+            self.last_locked_target_offset_px = offset_px
+            if offset_px < self.target_stability_threshold_px:
+                return
+            self.frozen_target_x_frame = None
+            self.target_region = "none"
+            self.previous_target_x_frame = None
+            self.target_stability_count = 0
+            self.last_target_jump_px = None
+            self.crossing_baseline_ready = False
+            self.target_relock_pending = True
+            self.last_lock_was_relock = False
+            return
+
         previous_target_x = self.previous_target_x_frame
         if not math.isfinite(target_x):
             self.previous_target_x_frame = None
@@ -305,12 +342,37 @@ class PedestrianSafetyAnalyzer:
             target_x_frame=target_x,
             center_region=center_region,
         )
+        self.last_locked_target_offset_px = 0.0
+        self.last_lock_was_relock = False
         self.crossing_baseline_ready = False
 
     def _latched_wait_reason(self, detail: str) -> str:
         if self.frozen_target_x_frame is not None:
+            lock_label = (
+                "target relocked"
+                if self.last_lock_was_relock
+                else "target locked"
+            )
+            offset_text = (
+                "n/a"
+                if self.last_locked_target_offset_px is None
+                else f"{self.last_locked_target_offset_px:.1f}px"
+            )
             return (
-                f"latched; target locked region={self.target_region}; {detail}"
+                f"latched; {lock_label} region={self.target_region} "
+                f"offset={offset_text}; {detail}"
+            )
+        if self.target_relock_pending:
+            offset_text = (
+                "n/a"
+                if self.last_locked_target_offset_px is None
+                else f"{self.last_locked_target_offset_px:.1f}px"
+            )
+            return (
+                "latched; target relock pending "
+                f"offset={offset_text} "
+                f"threshold>={self.target_stability_threshold_px:.1f}px; "
+                f"{detail}"
             )
         jump_text = (
             "n/a"
@@ -421,6 +483,9 @@ class PedestrianSafetyAnalyzer:
         self.target_stability_count = 0
         self.last_target_jump_px = None
         self.crossing_baseline_ready = False
+        self.target_relock_pending = False
+        self.last_locked_target_offset_px = None
+        self.last_lock_was_relock = False
         self.cooldown_until = 0.0
 
     def _reset(self, clear_processed_result: bool) -> None:

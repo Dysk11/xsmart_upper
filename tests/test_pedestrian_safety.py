@@ -404,6 +404,193 @@ def test_movement_before_target_lock_cannot_release_pedestrian_wait() -> None:
     assert not released.stop_required
 
 
+def test_locked_target_offset_below_threshold_keeps_frozen_line() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=2,
+        now=0.1,
+    )
+
+    result = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=109.0,
+        result_id=2,
+        now=0.2,
+    )
+
+    assert result.frozen_target_x_frame == pytest.approx(100.0)
+    assert result.target_region == "center"
+    assert result.tracked_center_frame == (80.0, 60.0)
+    assert "offset=19.0px" in result.reason
+
+
+def test_exact_locked_target_offset_relocks_on_next_cached_lane_frame() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.01,
+    )
+
+    invalidated = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=110.0,
+        result_id=1,
+        now=0.1,
+    )
+    relocked = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=170.0,
+        result_id=1,
+        now=0.2,
+    )
+
+    assert invalidated.stop_required
+    assert invalidated.frozen_target_x_frame is None
+    assert invalidated.target_region == "none"
+    assert invalidated.tracked_center_frame == (80.0, 60.0)
+    assert "target relock pending" in invalidated.reason
+    assert "offset=20.0px" in invalidated.reason
+    assert relocked.frozen_target_x_frame == pytest.approx(180.0)
+    assert relocked.target_region == "right"
+    assert relocked.tracked_center_frame == (80.0, 60.0)
+    assert "target relocked" in relocked.reason
+
+
+def test_relock_discards_old_crossing_and_requires_new_baseline() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=2,
+        now=0.1,
+    )
+
+    crossed_old_line = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=110.0,
+        result_id=3,
+        now=0.2,
+    )
+    relocked = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=150.0,
+        result_id=3,
+        now=0.21,
+    )
+    baseline = analyze(
+        analyzer,
+        [detected_center(140)],
+        target_x_roi=150.0,
+        result_id=4,
+        now=0.3,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(180)],
+        target_x_roi=150.0,
+        result_id=5,
+        now=0.4,
+    )
+
+    assert crossed_old_line.stop_required
+    assert crossed_old_line.frozen_target_x_frame is None
+    assert relocked.frozen_target_x_frame == pytest.approx(160.0)
+    assert baseline.stop_required
+    assert "crossing baseline established" in baseline.reason
+    assert not released.stop_required
+
+
+def test_relock_waits_for_finite_target_on_following_lane_frames() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.01,
+    )
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=110.0,
+        result_id=1,
+        now=0.1,
+    )
+
+    still_pending = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=float("nan"),
+        result_id=1,
+        now=0.2,
+    )
+    relocked = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=130.0,
+        result_id=1,
+        now=0.3,
+    )
+
+    assert still_pending.frozen_target_x_frame is None
+    assert "target relock pending" in still_pending.reason
+    assert relocked.frozen_target_x_frame == pytest.approx(140.0)
+
+
 @pytest.mark.parametrize(
     ("start_x", "end_x"),
     [
@@ -506,14 +693,14 @@ def test_left_region_requires_right_to_left_crossing() -> None:
     wrong_direction = analyze(
         analyzer,
         [detected_center(70)],
-        target_x_roi=150.0,
+        target_x_roi=40.0,
         result_id=3,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(40)],
-        target_x_roi=150.0,
+        target_x_roi=40.0,
         result_id=4,
         now=1.0,
     )
@@ -551,6 +738,7 @@ def test_left_region_releases_when_starting_on_target_line() -> None:
     released = analyze(
         analyzer,
         [detected_center(40)],
+        target_x_roi=40.0,
         result_id=3,
         now=1.0,
     )
@@ -584,14 +772,14 @@ def test_right_region_requires_left_to_right_crossing() -> None:
     wrong_direction = analyze(
         analyzer,
         [detected_center(150)],
-        target_x_roi=20.0,
+        target_x_roi=170.0,
         result_id=3,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(190)],
-        target_x_roi=20.0,
+        target_x_roi=170.0,
         result_id=4,
         now=1.0,
     )
@@ -629,6 +817,7 @@ def test_right_region_releases_when_starting_on_target_line() -> None:
     released = analyze(
         analyzer,
         [detected_center(190)],
+        target_x_roi=170.0,
         result_id=3,
         now=1.0,
     )
