@@ -68,6 +68,12 @@ from core.visualization.visualizer import (
     TrackedLaneUiSnapshot,
     Visualizer,
 )
+from core.visualization.visualizer import (
+    CarAvoidanceUiSnapshot,
+    LaneUiSnapshot,
+    TrackedLaneUiSnapshot,
+    Visualizer,
+)
 from utils.fps import FPSCounter
 from utils.roi import compute_normalized_roi_rect
 
