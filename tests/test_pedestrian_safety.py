@@ -63,8 +63,8 @@ def analyze(
 ) -> PedestrianSafetyResult:
     return analyzer.analyze(
         objects=objects,
-        roi_rect=ROI_RECT,
-        target_point_roi=(target_x_roi, 80.0),
+        avoidance_roi_rect=ROI_RECT,
+        target_x_frame=float(ROI_RECT[0]) + target_x_roi,
         detection_result_id=result_id,
         now_monotonic=now,
     )
@@ -130,6 +130,36 @@ def test_exact_area_threshold_triggers_when_center_is_inside_roi() -> None:
 
     assert result.stop_required
     assert result.tracked_center_frame == (100.0, 60.0)
+
+
+def test_trigger_and_regions_use_dedicated_avoidance_roi() -> None:
+    analyzer = make_analyzer()
+    result = analyzer.analyze(
+        objects=[detected_center(100, center_y=60)],
+        avoidance_roi_rect=(50, 20, 150, 120),
+        target_x_frame=170.0,
+        detection_result_id=1,
+        now_monotonic=0.0,
+    )
+
+    assert result.stop_required
+    assert result.center_region_frame == pytest.approx((80.0, 20.0, 120.0, 120.0))
+    assert result.frozen_target_x_frame == pytest.approx(170.0)
+    assert result.target_region == "right"
+
+
+def test_human_inside_lane_roi_but_outside_avoidance_roi_does_not_trigger() -> None:
+    analyzer = make_analyzer()
+    result = analyzer.analyze(
+        objects=[detected_center(100, center_y=80)],
+        avoidance_roi_rect=(0, 0, 60, 60),
+        target_x_frame=100.0,
+        detection_result_id=1,
+        now_monotonic=0.0,
+    )
+
+    assert result.armed
+    assert not result.stop_required
 
 
 def test_largest_qualifying_human_is_selected_deterministically() -> None:

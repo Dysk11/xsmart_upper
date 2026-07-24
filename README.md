@@ -127,6 +127,7 @@ camera:
 
 - `show_window`: 是否显示实时画面窗口；画面左上角固定显示主循环 FPS
 - `show_debug_window`: 是否独立显示详细 Debug 信息窗口，默认 `false`
+- `debug_refresh_hz`: 独立 Debug 信息面板的重建频率，默认 `10` Hz；窗口仍逐帧显示缓存面板
 - `debug_window_name`: 独立调试信息窗口的名称
 - `debug_panel_font_size`: 独立调试窗口的双列面板字号，默认 `18`；长状态和原因会按面板列宽自动换行
 - `save_video`: 是否保存调试视频
@@ -243,9 +244,21 @@ car 避让 > Go/Stop 路径 > 吃 coin > 普通巡线
 
 ## 6. human 目标点穿越停车逻辑
 
-`center_region` 由 ROI 相对横坐标配置并贯穿 ROI 全高；其左侧是 `left`
+Car 与 pedestrian 共用独立于巡线区域的安全触发范围。默认配置复制巡线 ROI；
+旧配置未声明 `avoidance_roi` 时也会回退到当前 `lane_geometry.roi`：
+
+```yaml
+avoidance_roi:
+  top_ratio: 0.585
+  bottom_ratio: 1.0
+  left_ratio: 0.05
+  right_ratio: 0.95
+```
+
+调试画面用青色 `AVOID ROI` 矩形标出该范围，黄色矩形仍表示巡线 ROI。
+`center_region` 由 avoidance ROI 相对横坐标配置并贯穿 avoidance ROI 全高；其左侧是 `left`
 区域，右侧是 `right` 区域。完整 `human` 框面积达到 `min_box_area_px: 600`
-且框中心位于 ROI 时，车辆选择面积最大的合格行人并立即停车。
+且框中心位于 avoidance ROI 时，车辆选择面积最大的合格行人并立即停车。
 
 ```yaml
 pedestrian_safety:
@@ -265,7 +278,7 @@ pedestrian_safety:
 
 ## 7. car 原始检测框避让
 
-`car` 的原始检测框只要与巡线 ROI 接触或重叠就触发避让，不再放大检测框。
+`car` 的原始检测框只要与 avoidance ROI 接触或重叠就触发避让，不再放大检测框。
 一个避让过程开始时，先选择框底边最大（相同时置信度最高）的 car 作为主目标，
 在其垂直中心对应的 ROI 行比较原巡线中心线与 car 中心：中心线在左侧或同 x
 时锁定 track 左边界，中心线在右侧时锁定 track 右边界。该方向保持到退出平滑
@@ -280,13 +293,15 @@ car_avoidance:
 ```
 
 规划器在相同 ROI 行上对齐正常中心线与锁定侧 track 边界，进入时用 1 秒时间
-smoothstep 从正常路线过渡到边界路线；新 AI 检测结果确认 ROI 内已无 car 后，
+smoothstep 从正常路线过渡到边界路线；新 AI 检测结果确认 avoidance ROI 内已无 car 后，
 模式切换为 `CAR_AVOID_RECOVERY`，再用 1 秒 smoothstep 回到当前正常中心线。
 锁定侧边界每帧只做一次稠密化和短缺口线性插值，所有目标行复用该结果；进入和
 恢复阶段对齐相同 y 行后直接逐点混合，不重复排序边界。该方法不进行栅格搜索或
 曲线拟合。
 
-最终折线路线会与 ROI 内所有原始 car 框做线段相交检查。过渡路线仍碰框、指定侧
+最终折线路线只会与 car 框和巡线 ROI 的实际交集做线段相交检查。位于 avoidance ROI
+内但尚未进入巡线 ROI 的 car 会提前触发边界避让，不会被投影到巡线 ROI 边缘制造
+假碰撞。过渡路线仍碰框、指定侧
 边界缺失或无法连续插值时进入 `CAR_AVOID_STOP` 并发送零速度；路线安全后自动恢复
 避让。安全路线进入 ROI 左右边缘 20 px 时模式为 `CAR_AVOID_EDGE`，速度限制为
 `planner.min_speed`。避让目标点仍固定在 ROI `y=80`。调试画面中的橙/红框为原始

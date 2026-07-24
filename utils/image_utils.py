@@ -154,9 +154,16 @@ def draw_text_lines(
     left = max(0, x - 10)
     right = min(output.shape[1] - 1, x + max_width + 20)
 
-    overlay = output.copy()
-    cv2.rectangle(overlay, (left, top), (right, bottom), background_color, -1)
-    output = cv2.addWeighted(overlay, background_alpha, output, 1.0 - background_alpha, 0.0)
+    if background_alpha > 0.0:
+        overlay = output.copy()
+        cv2.rectangle(overlay, (left, top), (right, bottom), background_color, -1)
+        output = cv2.addWeighted(
+            overlay,
+            background_alpha,
+            output,
+            1.0 - background_alpha,
+            0.0,
+        )
 
     if pil_font is not None and Image is not None and ImageDraw is not None:
         rgb_image = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)

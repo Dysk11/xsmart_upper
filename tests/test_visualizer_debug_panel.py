@@ -128,6 +128,23 @@ def test_canvas_keeps_camera_frame_size_without_embedded_debug_panel() -> None:
     assert np.array_equal(canvas[50:100, :100], frame[50:100, :100])
 
 
+def test_canvas_draws_lane_and_avoidance_rois_independently() -> None:
+    visualizer = Visualizer({"show_window": False})
+    frame = np.zeros((120, 160, 3), dtype=np.uint8)
+    canvas = visualizer._build_canvas(
+        frame=frame,
+        roi_rect=(20, 50, 140, 110),
+        avoidance_roi_rect=(10, 20, 150, 100),
+        detection_result=make_detection(),
+        tracked_state=SimpleNamespace(centerline_points=[]),
+        control_command=SimpleNamespace(steer_deg=0.0),
+        fps_value=60.0,
+    )
+
+    assert tuple(canvas[50, 20]) == (0, 255, 255)
+    assert tuple(canvas[20, 10]) == (255, 255, 0)
+
+
 def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
     frame = np.zeros((100, 100, 3), dtype=np.uint8)

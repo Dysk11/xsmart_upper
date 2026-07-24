@@ -151,3 +151,17 @@ def test_alternating_large_track_candidates_never_confirm() -> None:
         )
         assert held == previous
         assert "confirm=1/3" in str(reason)
+
+
+def test_track_boundary_rows_can_be_skipped_without_changing_display_edges() -> None:
+    mask = np.zeros((80, WIDTH), dtype=np.uint8)
+    mask[:, 2 : WIDTH - 2] = 255
+
+    result = make_detector().detect_from_mask(
+        mask,
+        include_track_boundary_rows=False,
+    )
+
+    assert result.track_boundary_rows == []
+    assert result.left_boundary_points
+    assert result.right_boundary_points

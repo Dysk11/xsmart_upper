@@ -65,6 +65,8 @@ def plan(
     planner: CarAvoidancePlanner | None = None,
     centerline: list[tuple[float, float]] = CENTERLINE,
     boundaries: list[LaneBoundaryRow] | None = None,
+    lane_roi_rect: tuple[int, int, int, int] = ROI_RECT,
+    avoidance_roi_rect: tuple[int, int, int, int] = ROI_RECT,
     detection_id: int = 1,
     now: float = 0.0,
 ):
@@ -75,7 +77,8 @@ def plan(
         track_boundary_rows=boundaries or boundary_rows(),
         detection_result_id=detection_id,
         now_monotonic=now,
-        roi_rect=ROI_RECT,
+        lane_roi_rect=lane_roi_rect,
+        avoidance_roi_rect=avoidance_roi_rect,
         roi_width=200,
         roi_height=200,
         lane_confidence=0.9,
@@ -89,6 +92,8 @@ def fully_entered(
     planner: CarAvoidancePlanner | None = None,
     centerline: list[tuple[float, float]] = CENTERLINE,
     boundaries: list[LaneBoundaryRow] | None = None,
+    lane_roi_rect: tuple[int, int, int, int] = ROI_RECT,
+    avoidance_roi_rect: tuple[int, int, int, int] = ROI_RECT,
     detection_id: int = 1,
 ):
     planner = planner or make_planner()
@@ -97,6 +102,8 @@ def fully_entered(
         planner=planner,
         centerline=centerline,
         boundaries=boundaries,
+        lane_roi_rect=lane_roi_rect,
+        avoidance_roi_rect=avoidance_roi_rect,
         detection_id=detection_id,
         now=0.0,
     )
@@ -105,6 +112,8 @@ def fully_entered(
         planner=planner,
         centerline=centerline,
         boundaries=boundaries,
+        lane_roi_rect=lane_roi_rect,
+        avoidance_roi_rect=avoidance_roi_rect,
         detection_id=detection_id,
         now=1.0,
     )
@@ -119,6 +128,8 @@ def route_x(result, y: float = 80.0) -> float:
 
 def assert_route_clear(result) -> None:
     for zone in result.warning_zones:
+        if zone.bbox_roi is None:
+            continue
         assert not CarAvoidancePlanner.polyline_intersects_rect(
             result.shifted_centerline_points,
             zone.bbox_roi,
@@ -130,6 +141,76 @@ def test_original_box_is_used_without_expansion() -> None:
 
     assert result.warning_zones[0].bbox_frame == pytest.approx((80, 60, 120, 100))
     assert result.warning_zones[0].bbox_roi == pytest.approx((80, 60, 120, 100))
+
+
+def test_boundary_rows_are_requested_only_for_roi_overlapping_car() -> None:
+    planner = make_planner()
+
+    assert not planner.needs_track_boundary_rows(
+        [],
+        lane_roi_rect=ROI_RECT,
+        avoidance_roi_rect=ROI_RECT,
+        roi_width=200,
+        roi_height=200,
+    )
+    assert not planner.needs_track_boundary_rows(
+        [car((220, 60, 260, 100))],
+        lane_roi_rect=ROI_RECT,
+        avoidance_roi_rect=ROI_RECT,
+        roi_width=200,
+        roi_height=200,
+    )
+    assert planner.needs_track_boundary_rows(
+        [car((80, 60, 120, 100))],
+        lane_roi_rect=ROI_RECT,
+        avoidance_roi_rect=ROI_RECT,
+        roi_width=200,
+        roi_height=200,
+    )
+    assert not make_planner(enabled=False).needs_track_boundary_rows(
+        [car((80, 60, 120, 100))],
+        lane_roi_rect=ROI_RECT,
+        avoidance_roi_rect=ROI_RECT,
+        roi_width=200,
+        roi_height=200,
+    )
+
+
+def test_car_in_avoidance_roi_above_lane_roi_triggers_without_fake_collision() -> None:
+    lane_roi = (50, 100, 250, 300)
+    avoidance_roi = (20, 20, 280, 300)
+    result = fully_entered(
+        [car((90, 40, 130, 80))],
+        lane_roi_rect=lane_roi,
+        avoidance_roi_rect=avoidance_roi,
+    )
+
+    assert result.active
+    assert len(result.warning_zones) == 1
+    assert result.warning_zones[0].bbox_roi is None
+    assert not result.stop_required
+
+
+def test_car_in_lane_roi_but_outside_avoidance_roi_does_not_trigger() -> None:
+    result = plan(
+        [car((80, 80, 120, 120))],
+        avoidance_roi_rect=(0, 0, 60, 60),
+    )
+
+    assert not result.active
+    assert result.warning_zones == []
+
+
+def test_boundary_rows_use_avoidance_roi_not_lane_roi() -> None:
+    planner = make_planner()
+
+    assert planner.needs_track_boundary_rows(
+        [car((220, 60, 260, 100))],
+        lane_roi_rect=ROI_RECT,
+        avoidance_roi_rect=(0, 0, 300, 200),
+        roi_width=200,
+        roi_height=200,
+    )
 
 
 def test_box_that_only_old_expansion_would_put_in_roi_does_not_trigger() -> None:
@@ -197,7 +278,8 @@ def test_side_comparison_maps_nonzero_frame_roi_to_roi_coordinates() -> None:
         track_boundary_rows=boundary_rows(),
         detection_result_id=1,
         now_monotonic=0.0,
-        roi_rect=(20, 50, 220, 250),
+        lane_roi_rect=(20, 50, 220, 250),
+        avoidance_roi_rect=(20, 50, 220, 250),
         roi_width=200,
         roi_height=200,
         lane_confidence=0.9,
@@ -209,7 +291,8 @@ def test_side_comparison_maps_nonzero_frame_roi_to_roi_coordinates() -> None:
         track_boundary_rows=boundary_rows(),
         detection_result_id=1,
         now_monotonic=1.0,
-        roi_rect=(20, 50, 220, 250),
+        lane_roi_rect=(20, 50, 220, 250),
+        avoidance_roi_rect=(20, 50, 220, 250),
         roi_width=200,
         roi_height=200,
         lane_confidence=0.9,
@@ -450,6 +533,38 @@ def test_cached_detection_cannot_start_recovery_and_new_clear_result_can() -> No
     assert cached.transition_phase == "hold"
     assert started.mode == "CAR_AVOID_RECOVERY"
     assert started.transition_progress == pytest.approx(0.0)
+
+
+def test_new_detection_with_car_outside_avoidance_roi_starts_recovery() -> None:
+    planner = make_planner()
+    avoidance_roi = (0, 0, 150, 150)
+    inside = car((80, 60, 120, 100))
+    outside = car((170, 60, 190, 100))
+    plan(
+        [inside],
+        planner=planner,
+        avoidance_roi_rect=avoidance_roi,
+        detection_id=10,
+        now=5.0,
+    )
+    active = plan(
+        [inside],
+        planner=planner,
+        avoidance_roi_rect=avoidance_roi,
+        detection_id=10,
+        now=6.0,
+    )
+    started = plan(
+        [outside],
+        planner=planner,
+        avoidance_roi_rect=avoidance_roi,
+        detection_id=11,
+        now=7.0,
+    )
+
+    assert active.transition_phase == "hold"
+    assert started.mode == "CAR_AVOID_RECOVERY"
+    assert started.warning_zones[0].bbox_frame == pytest.approx(inside.bbox_frame)
 
 
 def test_recovery_smoothstep_returns_to_current_centerline_in_one_second() -> None:

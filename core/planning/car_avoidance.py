@@ -17,10 +17,10 @@ BBox = Tuple[float, float, float, float]
 
 @dataclass(frozen=True)
 class CarWarningZone:
-    """One original car detection box in frame and lane-ROI coordinates."""
+    """One car selected by the avoidance ROI and its lane-ROI overlap."""
 
     bbox_frame: BBox
-    bbox_roi: BBox
+    bbox_roi: BBox | None
     car_center_x_frame: float
     avoid_side: str
     confidence: float
@@ -80,6 +80,28 @@ class CarAvoidancePlanner:
         self._transition_start_monotonic: float | None = None
         self._transition_start_offsets: list[Point] = []
 
+    def needs_track_boundary_rows(
+        self,
+        objects: Sequence[DetectedObject],
+        lane_roi_rect: tuple[int, int, int, int],
+        avoidance_roi_rect: tuple[int, int, int, int],
+        roi_width: int,
+        roi_height: int,
+    ) -> bool:
+        """Return whether this frame can enter live boundary-following avoidance."""
+
+        if not self.enabled:
+            return False
+        return bool(
+            self._build_original_zones(
+                objects=objects,
+                lane_roi_rect=lane_roi_rect,
+                avoidance_roi_rect=avoidance_roi_rect,
+                roi_width=roi_width,
+                roi_height=roi_height,
+            )
+        )
+
     def plan(
         self,
         objects: Sequence[DetectedObject],
@@ -87,7 +109,8 @@ class CarAvoidancePlanner:
         track_boundary_rows: Sequence[LaneBoundaryRow],
         detection_result_id: int,
         now_monotonic: float,
-        roi_rect: tuple[int, int, int, int],
+        lane_roi_rect: tuple[int, int, int, int],
+        avoidance_roi_rect: tuple[int, int, int, int],
         roi_width: int,
         roi_height: int,
         lane_confidence: float,
@@ -107,7 +130,8 @@ class CarAvoidancePlanner:
         new_detection = detection_id != self._last_detection_result_id
         detected_zones = self._build_original_zones(
             objects=objects,
-            roi_rect=roi_rect,
+            lane_roi_rect=lane_roi_rect,
+            avoidance_roi_rect=avoidance_roi_rect,
             roi_width=roi_width,
             roi_height=roi_height,
         )
@@ -124,7 +148,7 @@ class CarAvoidancePlanner:
                         normal_target=normal_target,
                         zones=zones,
                         reason=(
-                            "car box intersects ROI but no lane centerline is available"
+                            "car box intersects avoidance ROI but no lane centerline is available"
                         ),
                         route=[],
                         boundary_route=[],
@@ -135,8 +159,8 @@ class CarAvoidancePlanner:
                 self._locked_side = self._choose_avoid_side(
                     primary,
                     base_route=base_route,
-                    roi_x1=float(roi_rect[0]),
-                    roi_y1=float(roi_rect[1]),
+                    roi_x1=float(lane_roi_rect[0]),
+                    roi_y1=float(lane_roi_rect[1]),
                 )
                 self._start_transition(
                     phase="entry",
@@ -209,7 +233,11 @@ class CarAvoidancePlanner:
                 normal_target=normal_target,
             )
 
-        return self._inactive(base_route, normal_target, "no original car box in ROI")
+        return self._inactive(
+            base_route,
+            normal_target,
+            "no original car box in avoidance ROI",
+        )
 
     def _plan_live_avoidance(
         self,
@@ -281,7 +309,8 @@ class CarAvoidancePlanner:
         colliding = [
             zone
             for zone in zones
-            if self.polyline_intersects_rect(route, zone.bbox_roi)
+            if zone.bbox_roi is not None
+            and self.polyline_intersects_rect(route, zone.bbox_roi)
         ]
         if colliding:
             return self._stop(
@@ -394,11 +423,13 @@ class CarAvoidancePlanner:
     def _build_original_zones(
         self,
         objects: Sequence[DetectedObject],
-        roi_rect: tuple[int, int, int, int],
+        lane_roi_rect: tuple[int, int, int, int],
+        avoidance_roi_rect: tuple[int, int, int, int],
         roi_width: int,
         roi_height: int,
     ) -> list[CarWarningZone]:
-        roi_x1, roi_y1, _, _ = roi_rect
+        roi_x1, roi_y1, _, _ = lane_roi_rect
+        avoid_x1, avoid_y1, avoid_x2, avoid_y2 = avoidance_roi_rect
         max_x = float(max(0, roi_width - 1))
         max_y = float(max(0, roi_height - 1))
         roi_extent_x = float(max(0, roi_width))
@@ -410,22 +441,32 @@ class CarAvoidancePlanner:
             x1, y1, x2, y2 = [float(value) for value in obj.bbox_frame]
             if x2 <= x1 or y2 <= y1:
                 continue
+            # Edge contact counts as entering the dedicated avoidance ROI.
+            if x2 < float(avoid_x1) or x1 > float(avoid_x2):
+                continue
+            if y2 < float(avoid_y1) or y1 > float(avoid_y2):
+                continue
             raw_roi = (
                 x1 - float(roi_x1),
                 y1 - float(roi_y1),
                 x2 - float(roi_x1),
                 y2 - float(roi_y1),
             )
-            # Inclusive comparisons make edge contact count as entering the ROI.
-            if raw_roi[2] < 0.0 or raw_roi[0] > roi_extent_x:
-                continue
-            if raw_roi[3] < 0.0 or raw_roi[1] > roi_extent_y:
-                continue
+            overlaps_lane_roi = not (
+                raw_roi[2] < 0.0
+                or raw_roi[0] > roi_extent_x
+                or raw_roi[3] < 0.0
+                or raw_roi[1] > roi_extent_y
+            )
             clipped_roi = (
-                clamp(raw_roi[0], 0.0, max_x),
-                clamp(raw_roi[1], 0.0, max_y),
-                clamp(raw_roi[2], 0.0, max_x),
-                clamp(raw_roi[3], 0.0, max_y),
+                (
+                    clamp(raw_roi[0], 0.0, max_x),
+                    clamp(raw_roi[1], 0.0, max_y),
+                    clamp(raw_roi[2], 0.0, max_x),
+                    clamp(raw_roi[3], 0.0, max_y),
+                )
+                if overlaps_lane_roi
+                else None
             )
             zones.append(
                 CarWarningZone(

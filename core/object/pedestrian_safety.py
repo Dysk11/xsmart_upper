@@ -59,15 +59,15 @@ class PedestrianSafetyAnalyzer:
     def analyze(
         self,
         objects: Sequence[DetectedObject],
-        roi_rect: BBoxInt,
-        target_point_roi: Point,
+        avoidance_roi_rect: BBoxInt,
+        target_x_frame: float,
         detection_result_id: int,
         now_monotonic: float,
     ) -> PedestrianSafetyResult:
         """Update state only once per AI result while exposing live cooldown time."""
 
         now = float(now_monotonic)
-        center_region = self._center_region_frame(roi_rect)
+        center_region = self._center_region_frame(avoidance_roi_rect)
         humans = [
             obj for obj in objects
             if obj.class_name.casefold() == "human"
@@ -115,22 +115,21 @@ class PedestrianSafetyAnalyzer:
         triggering = [
             obj for obj in humans
             if self._bbox_area(obj.bbox_frame) >= self.min_box_area_px
-            and self._center_is_in_roi(self._bbox_center(obj.bbox_frame), roi_rect)
+            and self._center_is_in_roi(
+                self._bbox_center(obj.bbox_frame),
+                avoidance_roi_rect,
+            )
         ]
         if not triggering:
             return self._result(
                 center_region,
                 humans,
                 now,
-                "armed; no qualifying pedestrian center in ROI",
+                "armed; no qualifying pedestrian center in avoidance ROI",
             )
 
         trigger = min(triggering, key=self._trigger_sort_key)
-        roi_x1, _roi_y1, roi_x2, _roi_y2 = [float(value) for value in roi_rect]
-        target_x = max(
-            roi_x1,
-            min(roi_x2, roi_x1 + float(target_point_roi[0])),
-        )
+        target_x = float(target_x_frame)
         self.frozen_target_x_frame = target_x
         self.target_region = self._classify_target_region(
             target_x_frame=target_x,

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import cv2
 import numpy as np
 import pytest
 
-from core.visualization.visualizer import Visualizer
+from core.visualization.visualizer import (
+    CarAvoidanceUiSnapshot,
+    Visualizer,
+)
 
 
 def render_once(visualizer: Visualizer, frame: np.ndarray) -> bool:
@@ -92,6 +96,60 @@ def test_debug_window_can_be_enabled_independently(
 
     assert render_once(visualizer, frame)
     assert displayed == [("X-SmartCar Debug", debug_panel)]
+
+
+def test_debug_panel_is_reused_between_refresh_deadlines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = np.full((4, 6, 3), 10, dtype=np.uint8)
+    canvas = np.full((8, 12, 3), 20, dtype=np.uint8)
+    debug_panel = np.full((5, 12, 3), 30, dtype=np.uint8)
+    build_calls: list[int] = []
+    visualizer = Visualizer(
+        {
+            "show_window": False,
+            "show_debug_window": True,
+            "debug_refresh_hz": 10,
+        }
+    )
+    monkeypatch.setattr(visualizer, "_build_canvas", lambda **_: canvas)
+    monkeypatch.setattr(
+        visualizer,
+        "_build_debug_panel",
+        lambda **_: build_calls.append(1) or debug_panel,
+    )
+    monkeypatch.setattr(cv2, "imshow", lambda *_: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda _delay: -1)
+    monkeypatch.setattr(
+        "core.visualization.visualizer.time.monotonic",
+        iter([1.0, 1.05]).__next__,
+    )
+
+    assert render_once(visualizer, frame)
+    assert render_once(visualizer, frame)
+    assert len(build_calls) == 1
+
+
+def test_inactive_car_ui_snapshot_omits_duplicate_routes() -> None:
+    result = SimpleNamespace(
+        active=False,
+        mode="LANE_FOLLOW",
+        warning_zones=[],
+        shifted_centerline_points=[(10.0, 20.0)],
+        edge_limited=False,
+        stop_required=False,
+        reason="no car",
+        boundary_route_points=[],
+        locked_side=None,
+        transition_phase="inactive",
+        transition_progress=1.0,
+    )
+
+    snapshot = CarAvoidanceUiSnapshot.from_result(result)  # type: ignore[arg-type]
+
+    assert snapshot is not None
+    assert snapshot.shifted_centerline_points == []
+    assert snapshot.boundary_route_points == []
 
 
 def test_raw_recording_continues_without_window(
