@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,15 +12,99 @@ import numpy as np
 
 from core.object.blocking import DetectedObject
 from core.object.pedestrian_safety import PedestrianSafetyResult
-from core.planning.car_avoidance import CarAvoidanceResult
+from core.planning.car_avoidance import (
+    CarAvoidanceResult,
+    CarWarningZone,
+)
 from core.planning.gold_target import GoldTargetResult
 from core.planning.path_marker_target import PathMarkerTargetResult
-from core.lane.detector import LaneDetectionResult
+from core.lane.detector import ForkLaneResult, LaneDetectionResult
 from core.lane.tracker import TrackedLaneState
 from core.ocr.recognizer import OcrResult
 from core.planning.high_level import ControlCommand
 from core.planning.target_selector import TargetPointResult
 from utils.image_utils import draw_centerline, draw_text_lines, wrap_text_lines
+
+
+@dataclass(frozen=True)
+class LaneUiSnapshot:
+    """Only the lane fields consumed by the visualizer process."""
+
+    centerline_points: list[tuple[int, int]]
+    filtered_mask: np.ndarray
+    fork_result: ForkLaneResult
+    left_boundary_points: list[tuple[int, int]]
+    right_boundary_points: list[tuple[int, int]]
+    segmentation_confidence: float
+    segmentation_status: str
+    segmentation_instance_count: int
+
+    @classmethod
+    def from_result(cls, result: LaneDetectionResult) -> "LaneUiSnapshot":
+        return cls(
+            centerline_points=result.centerline_points,
+            filtered_mask=result.filtered_mask,
+            fork_result=result.fork_result,
+            left_boundary_points=result.left_boundary_points,
+            right_boundary_points=result.right_boundary_points,
+            segmentation_confidence=result.segmentation_confidence,
+            segmentation_status=result.segmentation_status,
+            segmentation_instance_count=result.segmentation_instance_count,
+        )
+
+
+@dataclass(frozen=True)
+class TrackedLaneUiSnapshot:
+    """Only the tracked centerline consumed by the visualizer process."""
+
+    centerline_points: list[tuple[int, int]]
+
+    @classmethod
+    def from_state(cls, state: TrackedLaneState) -> "TrackedLaneUiSnapshot":
+        return cls(centerline_points=state.centerline_points)
+
+
+@dataclass(frozen=True)
+class CarAvoidanceUiSnapshot:
+    """Compact car state without duplicated inactive routes or target results."""
+
+    active: bool
+    mode: str
+    warning_zones: list[CarWarningZone]
+    shifted_centerline_points: list[tuple[float, float]]
+    edge_limited: bool
+    stop_required: bool
+    reason: str
+    boundary_route_points: list[tuple[float, float]]
+    locked_side: str | None
+    transition_phase: str
+    transition_progress: float
+
+    @classmethod
+    def from_result(
+        cls,
+        result: CarAvoidanceResult | None,
+    ) -> "CarAvoidanceUiSnapshot | None":
+        if result is None:
+            return None
+        include_routes = bool(result.active or result.warning_zones)
+        return cls(
+            active=result.active,
+            mode=result.mode,
+            warning_zones=result.warning_zones,
+            shifted_centerline_points=(
+                result.shifted_centerline_points if include_routes else []
+            ),
+            edge_limited=result.edge_limited,
+            stop_required=result.stop_required,
+            reason=result.reason,
+            boundary_route_points=(
+                result.boundary_route_points if include_routes else []
+            ),
+            locked_side=result.locked_side,
+            transition_phase=result.transition_phase,
+            transition_progress=result.transition_progress,
+        )
 
 
 class Visualizer:
@@ -49,8 +134,14 @@ class Visualizer:
         self.font_path = str(config.get("font_path", ""))
         self.font_size = int(config.get("font_size", 22))
         self.debug_panel_font_size = int(config.get("debug_panel_font_size", 18))
+        self.debug_refresh_hz = max(0.0, float(config.get("debug_refresh_hz", 10.0)))
+        self.debug_refresh_interval_s = (
+            1.0 / self.debug_refresh_hz if self.debug_refresh_hz > 0.0 else 0.0
+        )
         self.mask_alpha = float(config.get("mask_alpha", 0.35))
         self.mask_color = tuple(int(value) for value in config.get("mask_color", [0, 180, 255]))
+        self._cached_debug_panel: np.ndarray | None = None
+        self._last_debug_refresh_monotonic = float("-inf")
 
         self.video_writer: cv2.VideoWriter | None = None
         if self.save_video or self.save_screenshot:
@@ -60,8 +151,8 @@ class Visualizer:
         self,
         frame: np.ndarray,
         roi_rect: tuple[int, int, int, int],
-        detection_result: LaneDetectionResult,
-        tracked_state: TrackedLaneState,
+        detection_result: LaneDetectionResult | LaneUiSnapshot,
+        tracked_state: TrackedLaneState | TrackedLaneUiSnapshot,
         control_command: ControlCommand,
         fps_value: float,
         target_result: TargetPointResult | None = None,
@@ -69,7 +160,7 @@ class Visualizer:
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
-        car_avoidance_result: CarAvoidanceResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | CarAvoidanceUiSnapshot | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> bool:
@@ -110,19 +201,28 @@ class Visualizer:
         if self.show_window:
             cv2.imshow(self.window_name, canvas)
         if self.show_debug_window:
-            debug_panel = self._build_debug_panel(
-                width=frame.shape[1],
-                target_result=target_result,
-                pedestrian_safety_result=pedestrian_safety_result,
-                control_command=control_command,
-                fps_value=fps_value,
-                gold_result=gold_result,
-                path_marker_result=path_marker_result,
-                car_avoidance_result=car_avoidance_result,
-                detection_result=detection_result,
-                ocr_result=ocr_result,
+            now = time.monotonic()
+            should_refresh_debug = (
+                self._cached_debug_panel is None
+                or self.debug_refresh_interval_s <= 0.0
+                or now - self._last_debug_refresh_monotonic
+                >= self.debug_refresh_interval_s
             )
-            cv2.imshow(self.debug_window_name, debug_panel)
+            if should_refresh_debug:
+                self._cached_debug_panel = self._build_debug_panel(
+                    width=frame.shape[1],
+                    target_result=target_result,
+                    pedestrian_safety_result=pedestrian_safety_result,
+                    control_command=control_command,
+                    fps_value=fps_value,
+                    gold_result=gold_result,
+                    path_marker_result=path_marker_result,
+                    car_avoidance_result=car_avoidance_result,
+                    detection_result=detection_result,
+                    ocr_result=ocr_result,
+                )
+                self._last_debug_refresh_monotonic = now
+            cv2.imshow(self.debug_window_name, self._cached_debug_panel)
         if self.show_window or self.show_debug_window:
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
@@ -152,8 +252,8 @@ class Visualizer:
         self,
         frame: np.ndarray,
         roi_rect: tuple[int, int, int, int],
-        detection_result: LaneDetectionResult,
-        tracked_state: TrackedLaneState,
+        detection_result: LaneDetectionResult | LaneUiSnapshot,
+        tracked_state: TrackedLaneState | TrackedLaneUiSnapshot,
         control_command: ControlCommand,
         fps_value: float,
         target_result: TargetPointResult | None = None,
@@ -161,7 +261,7 @@ class Visualizer:
         detected_objects: list[DetectedObject] | None = None,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
-        car_avoidance_result: CarAvoidanceResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | CarAvoidanceUiSnapshot | None = None,
         ocr_result: OcrResult | None = None,
         show_ocr_bbox: bool = True,
     ) -> np.ndarray:
@@ -297,6 +397,7 @@ class Visualizer:
                 original_panel,
                 car_avoidance_result,
                 roi_offset=(x1, y1),
+                draw_shifted_route=False,
             )
         if show_ocr_bbox and ocr_result is not None and ocr_result.source_bbox is not None:
             bx1, by1, bx2, by2 = ocr_result.source_bbox
@@ -410,8 +511,9 @@ class Visualizer:
     def _draw_car_avoidance(
         self,
         image: np.ndarray,
-        result: CarAvoidanceResult,
+        result: CarAvoidanceResult | CarAvoidanceUiSnapshot,
         roi_offset: tuple[int, int],
+        draw_shifted_route: bool = True,
     ) -> np.ndarray:
         """Draw the locked boundary and blended route without car warning boxes."""
 
@@ -426,7 +528,7 @@ class Visualizer:
                 thickness=2,
                 offset=roi_offset,
             )
-        if result.active:
+        if result.active and draw_shifted_route:
             output = draw_centerline(
                 output,
                 result.shifted_centerline_points,
@@ -508,9 +610,9 @@ class Visualizer:
         fps_value: float,
         gold_result: GoldTargetResult | None = None,
         path_marker_result: PathMarkerTargetResult | None = None,
-        detection_result: LaneDetectionResult | None = None,
+        detection_result: LaneDetectionResult | LaneUiSnapshot | None = None,
         ocr_result: OcrResult | None = None,
-        car_avoidance_result: CarAvoidanceResult | None = None,
+        car_avoidance_result: CarAvoidanceResult | CarAvoidanceUiSnapshot | None = None,
     ) -> np.ndarray:
         """Build an opaque, auto-sized two-column status panel."""
 

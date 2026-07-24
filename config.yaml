@@ -215,7 +215,7 @@ visualizer:
   debug_panel_font_size: 18
   mask_alpha: 0.35
   mask_color: [0, 180, 255]
-  save_video: true
+  save_video: false
   record_without_ui: true
   save_screenshot: false
   save_dir: outputs/visual

@@ -80,6 +80,26 @@ class CarAvoidancePlanner:
         self._transition_start_monotonic: float | None = None
         self._transition_start_offsets: list[Point] = []
 
+    def needs_track_boundary_rows(
+        self,
+        objects: Sequence[DetectedObject],
+        roi_rect: tuple[int, int, int, int],
+        roi_width: int,
+        roi_height: int,
+    ) -> bool:
+        """Return whether this frame can enter live boundary-following avoidance."""
+
+        if not self.enabled:
+            return False
+        return bool(
+            self._build_original_zones(
+                objects=objects,
+                roi_rect=roi_rect,
+                roi_width=roi_width,
+                roi_height=roi_height,
+            )
+        )
+
     def plan(
         self,
         objects: Sequence[DetectedObject],

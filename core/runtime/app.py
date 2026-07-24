@@ -62,7 +62,12 @@ from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
-from core.visualization.visualizer import Visualizer
+from core.visualization.visualizer import (
+    CarAvoidanceUiSnapshot,
+    LaneUiSnapshot,
+    TrackedLaneUiSnapshot,
+    Visualizer,
+)
 from utils.fps import FPSCounter
 
 
@@ -249,10 +254,12 @@ def _release_shared_payload(value: Any, pools: Dict[str, SharedArrayPool] | None
 
 def _share_ui_frame(
     frame: np.ndarray,
+    filtered_mask: np.ndarray,
     roi_rect: tuple[int, int, int, int],
     frame_pool: SharedArrayPool,
+    mask_pool: SharedArrayPool,
 ) -> Dict[str, Any] | None:
-    """Move the camera frame into shared memory with ROI metadata."""
+    """Move the camera frame and visualizer mask into shared memory."""
 
     descriptor: Dict[str, Any] = {
         SHARED_FRAME_MARKER: True,
@@ -261,11 +268,33 @@ def _share_ui_frame(
     try:
         descriptor["frame"] = frame_pool.write(frame)
         if descriptor["frame"] is None:
-            _release_shared_payload(descriptor, {frame_pool.pool_id: frame_pool})
+            _release_shared_payload(
+                descriptor,
+                {
+                    frame_pool.pool_id: frame_pool,
+                    mask_pool.pool_id: mask_pool,
+                },
+            )
+            return None
+        descriptor["filtered_mask"] = mask_pool.write(filtered_mask)
+        if descriptor["filtered_mask"] is None:
+            _release_shared_payload(
+                descriptor,
+                {
+                    frame_pool.pool_id: frame_pool,
+                    mask_pool.pool_id: mask_pool,
+                },
+            )
             return None
         return descriptor
     except Exception:
-        _release_shared_payload(descriptor, {frame_pool.pool_id: frame_pool})
+        _release_shared_payload(
+            descriptor,
+            {
+                frame_pool.pool_id: frame_pool,
+                mask_pool.pool_id: mask_pool,
+            },
+        )
         raise
 
 
@@ -328,13 +357,17 @@ def _take_shared_ai_frames(
 def _take_shared_ui_frame(
     descriptor: Dict[str, Any],
     ack_queues: Dict[str, Any],
-) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    """Rebuild a camera frame and its ROI metadata."""
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]:
+    """Rebuild a camera frame, filtered mask, and ROI metadata."""
 
     remaining = dict(descriptor)
     try:
         frame = _take_shared_ndarray(remaining.pop("frame"), ack_queues)
-        return frame, tuple(descriptor["roi_rect"])
+        filtered_mask = _take_shared_ndarray(
+            remaining.pop("filtered_mask"),
+            ack_queues,
+        )
+        return frame, filtered_mask, tuple(descriptor["roi_rect"])
     except Exception:
         _ack_shared_payload(remaining, ack_queues)
         raise
@@ -619,12 +652,16 @@ def _ui_worker(
     visualizer_config: Dict[str, Any],
     input_queue: Any,
     frame_ack_queue: Any,
+    mask_ack_queue: Any,
     stop_event: Any,
 ) -> None:
     """Render OpenCV UI and video output in an independent process."""
 
     visualizer = Visualizer(visualizer_config)
-    ack_queues = {"ui_frame": frame_ack_queue}
+    ack_queues = {
+        "ui_frame": frame_ack_queue,
+        "ui_mask": mask_ack_queue,
+    }
     try:
         while not stop_event.is_set():
             try:
@@ -638,7 +675,17 @@ def _ui_worker(
                 packet = dict(packet)
                 frame_payload = packet.get("frame")
                 if isinstance(frame_payload, dict) and frame_payload.get(SHARED_FRAME_MARKER):
-                    packet["frame"], packet["roi_rect"] = _take_shared_ui_frame(frame_payload, ack_queues)
+                    (
+                        packet["frame"],
+                        filtered_mask,
+                        packet["roi_rect"],
+                    ) = _take_shared_ui_frame(frame_payload, ack_queues)
+                    lane_snapshot = packet.get("detection_result")
+                    if isinstance(lane_snapshot, LaneUiSnapshot):
+                        packet["detection_result"] = replace(
+                            lane_snapshot,
+                            filtered_mask=filtered_mask,
+                        )
                 should_continue = visualizer.render(**packet)
             except Exception:
                 traceback.print_exc()
@@ -896,13 +943,16 @@ class UpperMachineApp:
         self.ai_completed_count = 0
         self.ai_timing_totals: dict[str, float] = {}
         self.ui_frame_ack_queue = self.mp_context.Queue()
+        self.ui_mask_ack_queue = self.mp_context.Queue()
         self.ai_rgb_frame_pool = SharedArrayPool("ai_rgb_frame", self.ai_rgb_ack_queue)
         self.ai_bgr_frame_pool = SharedArrayPool("ai_bgr_frame", self.ai_bgr_ack_queue)
         self.ui_frame_pool = SharedArrayPool("ui_frame", self.ui_frame_ack_queue)
+        self.ui_mask_pool = SharedArrayPool("ui_mask", self.ui_mask_ack_queue)
         self.shared_pools = {
             self.ai_rgb_frame_pool.pool_id: self.ai_rgb_frame_pool,
             self.ai_bgr_frame_pool.pool_id: self.ai_bgr_frame_pool,
             self.ui_frame_pool.pool_id: self.ui_frame_pool,
+            self.ui_mask_pool.pool_id: self.ui_mask_pool,
         }
         if self.lane_parallel_enabled:
             for worker_index, core_mask in enumerate(worker_core_masks):
@@ -958,6 +1008,7 @@ class UpperMachineApp:
                 config.get("visualizer", {}),
                 self.ui_queue,
                 self.ui_frame_ack_queue,
+                self.ui_mask_ack_queue,
                 self.stop_event,
             ),
             name="xsmart-ui",
@@ -1157,6 +1208,14 @@ class UpperMachineApp:
                 ),
             )
             geometry_started = time.perf_counter()
+            include_track_boundary_rows = (
+                self.car_avoidance_planner.needs_track_boundary_rows(
+                    objects=self.last_detected_objects,
+                    roi_rect=roi_rect,
+                    roi_width=roi_x2 - roi_x1,
+                    roi_height=roi_y2 - roi_y1,
+                )
+            )
             detection_result = self.detector.detect_from_mask(
                 roi_mask,
                 route_direction=self.road_sign_analysis_state.route_direction,
@@ -1164,6 +1223,7 @@ class UpperMachineApp:
                 segmentation_confidence=segmentation_result.confidence,
                 segmentation_status=segmentation_result.status,
                 segmentation_instance_count=len(segmentation_result.instances),
+                include_track_boundary_rows=include_track_boundary_rows,
             )
             geometry_ms = (time.perf_counter() - geometry_started) * 1000.0
             self.last_confirmed_fork_detected = bool(
@@ -1230,15 +1290,28 @@ class UpperMachineApp:
             ui_frame_payload = None
             should_render_ui = self.ui_active and self.frame_id % self.ui_frame_stride == 0
             if should_render_ui:
-                ui_frame_payload = _share_ui_frame(frame_bgr, roi_rect, self.ui_frame_pool)
+                ui_frame_payload = _share_ui_frame(
+                    frame_bgr,
+                    detection_result.filtered_mask,
+                    roi_rect,
+                    self.ui_frame_pool,
+                    self.ui_mask_pool,
+                )
             if should_render_ui and ui_frame_payload is not None:
+                lane_ui_snapshot = LaneUiSnapshot.from_result(detection_result)
+                lane_ui_snapshot = replace(
+                    lane_ui_snapshot,
+                    filtered_mask=np.empty((0, 0), dtype=np.uint8),
+                )
                 _put_latest(
                     self.ui_queue,
                     {
                         "frame": ui_frame_payload,
                         "roi_rect": roi_rect,
-                        "detection_result": detection_result,
-                        "tracked_state": planning_state,
+                        "detection_result": lane_ui_snapshot,
+                        "tracked_state": TrackedLaneUiSnapshot.from_state(
+                            planning_state
+                        ),
                         "control_command": control_command,
                         "fps_value": fps_value,
                         "target_result": self.last_target_result,
@@ -1246,7 +1319,11 @@ class UpperMachineApp:
                         "detected_objects": self.last_detected_objects,
                         "gold_result": self.last_gold_result,
                         "path_marker_result": self.last_path_marker_result,
-                        "car_avoidance_result": self.last_car_avoidance_result,
+                        "car_avoidance_result": (
+                            CarAvoidanceUiSnapshot.from_result(
+                                self.last_car_avoidance_result
+                            )
+                        ),
                         "ocr_result": (
                             self.last_ocr_attempt
                             if self.last_ocr_attempt.frame_id > 0

@@ -307,6 +307,7 @@ class LaneDetector:
         segmentation_confidence: float = 0.0,
         segmentation_status: str = "ok",
         segmentation_instance_count: int = 0,
+        include_track_boundary_rows: bool = True,
     ) -> LaneDetectionResult:
         """Extract lane geometry from an externally produced binary ROI mask."""
 
@@ -324,6 +325,7 @@ class LaneDetector:
             segmentation_confidence=segmentation_confidence,
             segmentation_status=segmentation_status,
             segmentation_instance_count=segmentation_instance_count,
+            include_track_boundary_rows=include_track_boundary_rows,
         )
 
     def _detect_from_boundaries(
@@ -334,6 +336,7 @@ class LaneDetector:
         segmentation_confidence: float,
         segmentation_status: str,
         segmentation_instance_count: int,
+        include_track_boundary_rows: bool,
     ) -> LaneDetectionResult:
         """Build the driving centerline directly from row-wise track boundaries."""
 
@@ -544,50 +547,57 @@ class LaneDetector:
             self.last_lane_width_px = lane_width_px
             self.last_centerline_points = centerline_points
 
-        extracted_by_y = {
-            int(left[1]): (
-                int(left[0]),
-                int(right[0]),
-                not bool(left_is_lost),
-                not bool(right_is_lost),
-            )
-            for left, right, left_is_lost, right_is_lost in zip(
-                left_points,
-                right_points,
-                left_lost,
-                right_lost,
-            )
-        }
-        selected_mask_ys = set(
-            int(y)
-            for y in np.flatnonzero(np.any(selected_mask > 0, axis=1))
-        )
         track_boundary_rows: list[LaneBoundaryRow] = []
-        for y in sorted(set(extracted_by_y) | selected_mask_ys, reverse=True):
-            row_x = np.flatnonzero(selected_mask[int(y)] > 0)
-            if row_x.size:
+        if include_track_boundary_rows:
+            extracted_by_y = {
+                int(left[1]): (
+                    int(left[0]),
+                    int(right[0]),
+                    not bool(left_is_lost),
+                    not bool(right_is_lost),
+                )
+                for left, right, left_is_lost, right_is_lost in zip(
+                    left_points,
+                    right_points,
+                    left_lost,
+                    right_lost,
+                )
+            }
+            selected_binary = selected_mask > 0
+            selected_row_valid = np.any(selected_binary, axis=1)
+            selected_left_x = np.argmax(selected_binary, axis=1)
+            selected_right_x = (
+                selected_binary.shape[1]
+                - 1
+                - np.argmax(selected_binary[:, ::-1], axis=1)
+            )
+            selected_mask_ys = {
+                int(y) for y in np.flatnonzero(selected_row_valid)
+            }
+            for y in sorted(set(extracted_by_y) | selected_mask_ys, reverse=True):
+                if selected_row_valid[y]:
+                    track_boundary_rows.append(
+                        LaneBoundaryRow(
+                            y=int(y),
+                            left_x=int(selected_left_x[y]),
+                            right_x=int(selected_right_x[y]),
+                            left_valid=True,
+                            right_valid=True,
+                        )
+                    )
+                    continue
+                if y not in extracted_by_y:
+                    continue
+                left_x, right_x, left_valid, right_valid = extracted_by_y[y]
                 track_boundary_rows.append(
                     LaneBoundaryRow(
                         y=int(y),
-                        left_x=int(row_x[0]),
-                        right_x=int(row_x[-1]),
-                        left_valid=True,
-                        right_valid=True,
+                        left_x=left_x,
+                        right_x=right_x,
+                        left_valid=left_valid,
+                        right_valid=right_valid,
                     )
                 )
-                continue
-            if y not in extracted_by_y:
-                continue
-            left_x, right_x, left_valid, right_valid = extracted_by_y[y]
-            track_boundary_rows.append(
-                LaneBoundaryRow(
-                    y=int(y),
-                    left_x=left_x,
-                    right_x=right_x,
-                    left_valid=left_valid,
-                    right_valid=right_valid,
-                )
-            )
 
         return LaneDetectionResult(
             centerline_points=centerline_points,
