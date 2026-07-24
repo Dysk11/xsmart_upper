@@ -37,11 +37,45 @@ class PedestrianSafetyAnalyzer:
         self.enabled = bool(config.get("enabled", True))
         self.min_box_area_px = float(config.get("min_box_area_px", 600.0))
         self.rearm_cooldown_sec = float(config.get("rearm_cooldown_sec", 3.0))
+        self.target_stability_threshold_px = float(
+            config.get("target_stability_threshold_px", 20.0)
+        )
+        stability_confirm_frames = config.get(
+            "target_stability_confirm_frames",
+            2,
+        )
+        try:
+            self.target_stability_confirm_frames = int(stability_confirm_frames)
+            stability_confirm_frames_value = float(stability_confirm_frames)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "pedestrian_safety.target_stability_confirm_frames "
+                "must be a positive integer"
+            ) from exc
         if self.min_box_area_px < 0.0:
             raise ValueError("pedestrian_safety.min_box_area_px must be non-negative")
         if self.rearm_cooldown_sec < 0.0:
             raise ValueError(
                 "pedestrian_safety.rearm_cooldown_sec must be non-negative"
+            )
+        if (
+            not math.isfinite(self.target_stability_threshold_px)
+            or self.target_stability_threshold_px <= 0.0
+        ):
+            raise ValueError(
+                "pedestrian_safety.target_stability_threshold_px "
+                "must be finite and greater than zero"
+            )
+        if (
+            isinstance(stability_confirm_frames, bool)
+            or not math.isfinite(stability_confirm_frames_value)
+            or stability_confirm_frames_value
+            != float(self.target_stability_confirm_frames)
+            or self.target_stability_confirm_frames <= 0
+        ):
+            raise ValueError(
+                "pedestrian_safety.target_stability_confirm_frames "
+                "must be a positive integer"
             )
 
         region_config = config.get("center_region", {})
@@ -55,6 +89,10 @@ class PedestrianSafetyAnalyzer:
         self.frozen_target_x_frame: float | None = None
         self.target_region = "none"
         self.tracked_center_frame: Point | None = None
+        self.previous_target_x_frame: float | None = None
+        self.target_stability_count = 0
+        self.last_target_jump_px: float | None = None
+        self.crossing_baseline_ready = False
 
     def analyze(
         self,
@@ -64,7 +102,7 @@ class PedestrianSafetyAnalyzer:
         detection_result_id: int,
         now_monotonic: float,
     ) -> PedestrianSafetyResult:
-        """Update state only once per AI result while exposing live cooldown time."""
+        """Update target stability per lane frame and tracking per AI result."""
 
         now = float(now_monotonic)
         center_region = self._center_region_frame(avoidance_roi_rect)
@@ -96,9 +134,15 @@ class PedestrianSafetyAnalyzer:
                 f"cooldown; remaining={cooldown_remaining:.2f}s",
             )
 
+        if self.latched:
+            self._update_target_lock(
+                target_x_frame=float(target_x_frame),
+                center_region=center_region,
+            )
+
         if not is_new_result:
             reason = (
-                "latched; waiting for a new AI result"
+                self._latched_wait_reason("waiting for a new AI result")
                 if self.latched
                 else "armed; waiting for a new AI result"
             )
@@ -130,11 +174,10 @@ class PedestrianSafetyAnalyzer:
 
         trigger = min(triggering, key=self._trigger_sort_key)
         target_x = float(target_x_frame)
-        self.frozen_target_x_frame = target_x
-        self.target_region = self._classify_target_region(
-            target_x_frame=target_x,
-            center_region=center_region,
-        )
+        self.previous_target_x_frame = target_x
+        self.target_stability_count = 0
+        self.last_target_jump_px = None
+        self.crossing_baseline_ready = False
         self.tracked_center_frame = self._bbox_center(trigger.bbox_frame)
         self.latched = True
         trigger_area = self._bbox_area(trigger.bbox_frame)
@@ -144,7 +187,8 @@ class PedestrianSafetyAnalyzer:
             now,
             (
                 f"triggered; area={trigger_area:.0f}px^2 "
-                f"region={self.target_region} target_x={target_x:.1f}"
+                f"target stabilizing=0/{self.target_stability_confirm_frames} "
+                f"candidate_x={target_x:.1f}"
             ),
         )
 
@@ -159,7 +203,7 @@ class PedestrianSafetyAnalyzer:
                 center_region,
                 humans,
                 now,
-                "latched; triggering pedestrian missing",
+                self._latched_wait_reason("triggering pedestrian missing"),
             )
 
         previous_center = self.tracked_center_frame
@@ -171,6 +215,30 @@ class PedestrianSafetyAnalyzer:
             ),
         )
         current_center = self._bbox_center(tracked.bbox_frame)
+        if self.frozen_target_x_frame is None:
+            self.tracked_center_frame = current_center
+            return self._result(
+                center_region,
+                humans,
+                now,
+                self._latched_wait_reason(
+                    f"tracking pedestrian x={current_center[0]:.1f}"
+                ),
+            )
+
+        if not self.crossing_baseline_ready:
+            self.tracked_center_frame = current_center
+            self.crossing_baseline_ready = True
+            return self._result(
+                center_region,
+                humans,
+                now,
+                (
+                    f"latched; crossing baseline established "
+                    f"region={self.target_region} x={current_center[0]:.1f}"
+                ),
+            )
+
         crossed = self._has_crossed_target(
             previous_x=previous_center[0],
             current_x=current_center[0],
@@ -198,6 +266,63 @@ class PedestrianSafetyAnalyzer:
                 f"released; pedestrian crossed {released_region} target; "
                 f"cooldown={self.rearm_cooldown_sec:.1f}s"
             ),
+        )
+
+    def _update_target_lock(
+        self,
+        target_x_frame: float,
+        center_region: BBox,
+    ) -> None:
+        if self.frozen_target_x_frame is not None:
+            return
+
+        target_x = float(target_x_frame)
+        previous_target_x = self.previous_target_x_frame
+        if not math.isfinite(target_x):
+            self.previous_target_x_frame = None
+            self.target_stability_count = 0
+            self.last_target_jump_px = None
+            return
+        if previous_target_x is None or not math.isfinite(previous_target_x):
+            self.previous_target_x_frame = target_x
+            self.target_stability_count = 0
+            self.last_target_jump_px = None
+            return
+
+        jump_px = abs(target_x - previous_target_x)
+        self.last_target_jump_px = jump_px
+        self.previous_target_x_frame = target_x
+        if jump_px < self.target_stability_threshold_px:
+            self.target_stability_count += 1
+        else:
+            self.target_stability_count = 0
+
+        if self.target_stability_count < self.target_stability_confirm_frames:
+            return
+
+        self.frozen_target_x_frame = target_x
+        self.target_region = self._classify_target_region(
+            target_x_frame=target_x,
+            center_region=center_region,
+        )
+        self.crossing_baseline_ready = False
+
+    def _latched_wait_reason(self, detail: str) -> str:
+        if self.frozen_target_x_frame is not None:
+            return (
+                f"latched; target locked region={self.target_region}; {detail}"
+            )
+        jump_text = (
+            "n/a"
+            if self.last_target_jump_px is None
+            else f"{self.last_target_jump_px:.1f}px"
+        )
+        return (
+            "latched; target stabilizing "
+            f"{self.target_stability_count}/"
+            f"{self.target_stability_confirm_frames} "
+            f"jump={jump_text} "
+            f"threshold<{self.target_stability_threshold_px:.1f}px; {detail}"
         )
 
     def _has_crossed_target(self, previous_x: float, current_x: float) -> bool:
@@ -292,6 +417,10 @@ class PedestrianSafetyAnalyzer:
         self.frozen_target_x_frame = None
         self.target_region = "none"
         self.tracked_center_frame = None
+        self.previous_target_x_frame = None
+        self.target_stability_count = 0
+        self.last_target_jump_px = None
+        self.crossing_baseline_ready = False
         self.cooldown_until = 0.0
 
     def _reset(self, clear_processed_result: bool) -> None:

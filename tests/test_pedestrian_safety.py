@@ -21,6 +21,8 @@ def make_analyzer(**overrides: object) -> PedestrianSafetyAnalyzer:
         "enabled": True,
         "min_box_area_px": 600,
         "rearm_cooldown_sec": 3.0,
+        "target_stability_threshold_px": 20,
+        "target_stability_confirm_frames": 2,
         "center_region": {
             "left_ratio": 0.30,
             "right_ratio": 0.70,
@@ -70,6 +72,48 @@ def analyze(
     )
 
 
+def lock_target(
+    analyzer: PedestrianSafetyAnalyzer,
+    objects: list[DetectedObject],
+    *,
+    target_x_roi: float = 90.0,
+    result_id: int,
+    now: float,
+) -> PedestrianSafetyResult:
+    result = analyze(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=result_id,
+        now=now,
+    )
+    result = analyze(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=result_id,
+        now=now + 0.01,
+    )
+    return result
+
+
+def establish_crossing_baseline(
+    analyzer: PedestrianSafetyAnalyzer,
+    objects: list[DetectedObject],
+    *,
+    target_x_roi: float = 90.0,
+    result_id: int,
+    now: float,
+) -> PedestrianSafetyResult:
+    return analyze(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=result_id,
+        now=now,
+    )
+
+
 def stop_result() -> PedestrianSafetyResult:
     return PedestrianSafetyResult(
         stop_required=True,
@@ -95,6 +139,10 @@ def test_center_region_and_cooldown_are_strictly_validated() -> None:
         )
     with pytest.raises(ValueError, match="rearm_cooldown_sec"):
         make_analyzer(rearm_cooldown_sec=-1)
+    with pytest.raises(ValueError, match="target_stability_threshold_px"):
+        make_analyzer(target_stability_threshold_px=float("inf"))
+    with pytest.raises(ValueError, match="target_stability_confirm_frames"):
+        make_analyzer(target_stability_confirm_frames=1.5)
 
 
 @pytest.mark.parametrize(
@@ -129,6 +177,8 @@ def test_exact_area_threshold_triggers_when_center_is_inside_roi() -> None:
     )
 
     assert result.stop_required
+    assert result.frozen_target_x_frame is None
+    assert result.target_region == "none"
     assert result.tracked_center_frame == (100.0, 60.0)
 
 
@@ -144,6 +194,15 @@ def test_trigger_and_regions_use_dedicated_avoidance_roi() -> None:
 
     assert result.stop_required
     assert result.center_region_frame == pytest.approx((80.0, 20.0, 120.0, 120.0))
+    assert result.frozen_target_x_frame is None
+    for now in (0.01, 0.02):
+        result = analyzer.analyze(
+            objects=[detected_center(100, center_y=60)],
+            avoidance_roi_rect=(50, 20, 150, 120),
+            target_x_frame=170.0,
+            detection_result_id=1,
+            now_monotonic=now,
+        )
     assert result.frozen_target_x_frame == pytest.approx(170.0)
     assert result.target_region == "right"
 
@@ -191,16 +250,158 @@ def test_target_region_uses_fixed_center_boundaries(
     target_x_roi: float,
     expected_region: str,
 ) -> None:
-    result = analyze(
-        make_analyzer(),
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
         [detected_center(100)],
         target_x_roi=target_x_roi,
         result_id=1,
         now=0.0,
     )
+    result = lock_target(
+        analyzer,
+        [detected_center(100)],
+        target_x_roi=target_x_roi,
+        result_id=1,
+        now=0.01,
+    )
 
     assert result.target_region == expected_region
     assert result.frozen_target_x_frame == pytest.approx(10.0 + target_x_roi)
+
+
+def test_cached_lane_frames_lock_after_two_strictly_small_target_jumps() -> None:
+    analyzer = make_analyzer()
+    trigger = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    first_stable = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=109.0,
+        result_id=1,
+        now=0.01,
+    )
+    locked = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=128.0,
+        result_id=1,
+        now=0.02,
+    )
+
+    assert trigger.stop_required
+    assert trigger.frozen_target_x_frame is None
+    assert first_stable.frozen_target_x_frame is None
+    assert "target stabilizing 1/2" in first_stable.reason
+    assert locked.frozen_target_x_frame == pytest.approx(138.0)
+    assert locked.tracked_center_frame == (80.0, 60.0)
+
+
+def test_exact_threshold_resets_target_stability_count() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=109.0,
+        result_id=1,
+        now=0.01,
+    )
+    exact_threshold = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=129.0,
+        result_id=1,
+        now=0.02,
+    )
+    first_after_reset = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=148.0,
+        result_id=1,
+        now=0.03,
+    )
+    locked = analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=167.0,
+        result_id=1,
+        now=0.04,
+    )
+
+    assert exact_threshold.frozen_target_x_frame is None
+    assert "target stabilizing 0/2" in exact_threshold.reason
+    assert "target stabilizing 1/2" in first_after_reset.reason
+    assert locked.frozen_target_x_frame == pytest.approx(177.0)
+
+
+def test_movement_before_target_lock_cannot_release_pedestrian_wait() -> None:
+    analyzer = make_analyzer()
+    analyze(
+        analyzer,
+        [detected_center(80)],
+        target_x_roi=90.0,
+        result_id=1,
+        now=0.0,
+    )
+    moved_before_lock = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=120.0,
+        result_id=2,
+        now=0.1,
+    )
+    analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=90.0,
+        result_id=2,
+        now=0.11,
+    )
+    analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=90.0,
+        result_id=2,
+        now=0.12,
+    )
+    locked = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=90.0,
+        result_id=2,
+        now=0.13,
+    )
+    baseline = analyze(
+        analyzer,
+        [detected_center(80)],
+        result_id=3,
+        now=0.2,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=4,
+        now=0.3,
+    )
+
+    assert moved_before_lock.stop_required
+    assert moved_before_lock.frozen_target_x_frame is None
+    assert locked.frozen_target_x_frame == pytest.approx(100.0)
+    assert baseline.stop_required
+    assert "crossing baseline established" in baseline.reason
+    assert not released.stop_required
 
 
 @pytest.mark.parametrize(
@@ -221,14 +422,27 @@ def test_center_region_releases_on_strict_crossing(
         result_id=1,
         now=0.0,
     )
+    lock_target(
+        analyzer,
+        [detected_center(start_x)],
+        result_id=1,
+        now=0.01,
+    )
+    baseline = establish_crossing_baseline(
+        analyzer,
+        [detected_center(start_x)],
+        result_id=2,
+        now=0.1,
+    )
 
     released = analyze(
         analyzer,
         [detected_center(end_x)],
-        result_id=2,
+        result_id=3,
         now=1.0,
     )
 
+    assert baseline.stop_required
     assert not released.stop_required
     assert released.cooldown_remaining_sec == pytest.approx(3.0)
 
@@ -236,17 +450,29 @@ def test_center_region_releases_on_strict_crossing(
 def test_center_region_online_start_requires_a_side_then_opposite_side() -> None:
     analyzer = make_analyzer()
     analyze(analyzer, [detected_center(100)], result_id=1, now=0.0)
+    lock_target(
+        analyzer,
+        [detected_center(100)],
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(100)],
+        result_id=2,
+        now=0.1,
+    )
 
     first_side = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=2,
+        result_id=3,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(80)],
-        result_id=3,
+        result_id=4,
         now=1.0,
     )
 
@@ -263,18 +489,32 @@ def test_left_region_requires_right_to_left_crossing() -> None:
         result_id=1,
         now=0.0,
     )
+    lock_target(
+        analyzer,
+        [detected_center(30)],
+        target_x_roi=40.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(30)],
+        target_x_roi=40.0,
+        result_id=2,
+        now=0.1,
+    )
     wrong_direction = analyze(
         analyzer,
         [detected_center(70)],
         target_x_roi=150.0,
-        result_id=2,
+        result_id=3,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(40)],
         target_x_roi=150.0,
-        result_id=3,
+        result_id=4,
         now=1.0,
     )
 
@@ -293,11 +533,25 @@ def test_left_region_releases_when_starting_on_target_line() -> None:
         result_id=1,
         now=0.0,
     )
+    lock_target(
+        analyzer,
+        [detected_center(50)],
+        target_x_roi=40.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(50)],
+        target_x_roi=40.0,
+        result_id=2,
+        now=0.1,
+    )
 
     released = analyze(
         analyzer,
         [detected_center(40)],
-        result_id=2,
+        result_id=3,
         now=1.0,
     )
 
@@ -313,18 +567,32 @@ def test_right_region_requires_left_to_right_crossing() -> None:
         result_id=1,
         now=0.0,
     )
+    lock_target(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=2,
+        now=0.1,
+    )
     wrong_direction = analyze(
         analyzer,
         [detected_center(150)],
         target_x_roi=20.0,
-        result_id=2,
+        result_id=3,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(190)],
         target_x_roi=20.0,
-        result_id=3,
+        result_id=4,
         now=1.0,
     )
 
@@ -343,11 +611,25 @@ def test_right_region_releases_when_starting_on_target_line() -> None:
         result_id=1,
         now=0.0,
     )
+    lock_target(
+        analyzer,
+        [detected_center(180)],
+        target_x_roi=170.0,
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(180)],
+        target_x_roi=170.0,
+        result_id=2,
+        now=0.1,
+    )
 
     released = analyze(
         analyzer,
         [detected_center(190)],
-        result_id=2,
+        result_id=3,
         now=1.0,
     )
 
@@ -382,12 +664,24 @@ def test_nearest_human_is_associated_without_distance_limit() -> None:
 def test_missing_triggering_pedestrian_holds_stop_until_reappearance() -> None:
     analyzer = make_analyzer()
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(80)],
+        result_id=2,
+        now=0.1,
+    )
 
-    missing = analyze(analyzer, [], result_id=2, now=1.0)
+    missing = analyze(analyzer, [], result_id=3, now=1.0)
     released = analyze(
         analyzer,
         [detected_center(120, width=10, height=10)],
-        result_id=3,
+        result_id=4,
         now=2.0,
     )
 
@@ -399,17 +693,29 @@ def test_missing_triggering_pedestrian_holds_stop_until_reappearance() -> None:
 def test_cached_ai_result_cannot_update_or_release_track() -> None:
     analyzer = make_analyzer()
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(80)],
+        result_id=2,
+        now=0.1,
+    )
 
     cached = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=1,
+        result_id=2,
         now=0.5,
     )
     released = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=2,
+        result_id=3,
         now=1.0,
     )
 
@@ -421,28 +727,40 @@ def test_cached_ai_result_cannot_update_or_release_track() -> None:
 def test_three_second_cooldown_ignores_results_and_requires_new_result_after_expiry() -> None:
     analyzer = make_analyzer()
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
+    lock_target(
+        analyzer,
+        [detected_center(80)],
+        result_id=1,
+        now=0.01,
+    )
+    establish_crossing_baseline(
+        analyzer,
+        [detected_center(80)],
+        result_id=2,
+        now=0.1,
+    )
     released = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=2,
+        result_id=3,
         now=1.0,
     )
     during_cooldown = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=3,
+        result_id=4,
         now=3.5,
     )
     expired_cached = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=3,
+        result_id=4,
         now=4.1,
     )
     retriggered = analyze(
         analyzer,
         [detected_center(120)],
-        result_id=4,
+        result_id=5,
         now=4.1,
     )
 

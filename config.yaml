@@ -169,6 +169,8 @@ pedestrian_safety:
   enabled: true
   min_box_area_px: 10
   rearm_cooldown_sec: 3.0
+  target_stability_threshold_px: 20
+  target_stability_confirm_frames: 2
   center_region:
     left_ratio: 0.35
     right_ratio: 0.65

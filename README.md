@@ -265,15 +265,23 @@ pedestrian_safety:
   enabled: true
   min_box_area_px: 600
   rearm_cooldown_sec: 3.0
+  target_stability_threshold_px: 20
+  target_stability_confirm_frames: 2
   center_region:
     left_ratio: 0.30
     right_ratio: 0.70
 ```
 
-停车时冻结普通巡线目标点 x 和它所属的 `left/center/right` 区域。后续结果
-始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时无限
-保持停车。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标只
-接受左到右。完成穿越后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发。
+检测到行人后立即停车，但先不冻结目标线。每个巡线帧比较普通目标点 x 与上一帧
+的跳变；连续 `target_stability_confirm_frames` 次严格小于
+`target_stability_threshold_px` 后，才冻结当前目标点 x 和它所属的
+`left/center/right` 区域。稳定期间继续关联行人但不判断穿越，锁线后的第一份
+新行人检测只建立穿越基线，后续检测才参与释放判断，因此锁线前的移动不会被误算
+为穿越。调试画面在稳定期间不绘制冻结目标线，并在原因文本中显示稳定计数。
+
+后续结果始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时
+无限保持停车。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标
+只接受左到右。完成穿越后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发。
 行人逻辑只处理 `human`，不会把 `car` 当作行人停车目标。
 
 ## 7. car 原始检测框避让
