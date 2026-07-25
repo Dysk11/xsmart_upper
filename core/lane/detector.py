@@ -1041,7 +1041,11 @@ class LaneDetector:
             start = max(0, index - 2)
             end = min(len(limited), index + 3)
             mean_x = sum(item[0] for item in limited[start:end]) / float(end - start)
-            if index % max(1, self.scan_step) == 0:
+            # Preserve an actual ROI-top endpoint even when the row count is
+            # not divisible by scan_step.  Steering validity depends on the
+            # distinction between touching y=0 and merely ending near it.
+            is_roi_top_endpoint = index == len(limited) - 1 and y == 0
+            if index % max(1, self.scan_step) == 0 or is_roi_top_endpoint:
                 smoothed.append((int(round(mean_x)), y))
         return smoothed
 

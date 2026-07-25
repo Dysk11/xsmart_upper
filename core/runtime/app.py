@@ -61,7 +61,11 @@ from core.planning.road_sign_analyzer import (
 from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
-from core.planning.target_selector import TargetPointResult, TargetSelector
+from core.planning.target_selector import (
+    TargetPointResult,
+    TargetSelector,
+    calculate_steer_angle,
+)
 from core.visualization.visualizer import (
     CarAvoidanceUiSnapshot,
     LaneUiSnapshot,
@@ -1748,6 +1752,7 @@ class UpperMachineApp:
                     tracked_state.confidence,
                     car_avoidance_result.target_result.confidence,
                 ),
+                steer_angle_deg=car_avoidance_result.target_result.steer_angle_deg,
             )
 
         if path_marker_result.active:
@@ -1764,6 +1769,10 @@ class UpperMachineApp:
                     min(1.0, path_marker_result.confidence),
                 ),
                 is_lane_lost=False,
+                steer_angle_deg=calculate_steer_angle(
+                    target_point=path_marker_result.target_point_roi,
+                    centerline_points=path_marker_result.connected_centerline_points,
+                ),
             )
 
         if gold_result.active:
@@ -1773,6 +1782,10 @@ class UpperMachineApp:
                 heading_error_deg=gold_result.final_heading_error_deg,
                 confidence=max(tracked_state.confidence, min(1.0, gold_result.confidence)),
                 is_lane_lost=False,
+                steer_angle_deg=calculate_steer_angle(
+                    target_point=gold_result.target_point_roi,
+                    centerline_points=centerline_points,
+                ),
             )
 
         return replace(
@@ -1780,6 +1793,7 @@ class UpperMachineApp:
             lateral_error_px=normal_target.target_lateral_error_px,
             heading_error_deg=normal_target.target_heading_error_deg,
             confidence=min(tracked_state.confidence, normal_target.confidence),
+            steer_angle_deg=normal_target.steer_angle_deg,
         )
 
 

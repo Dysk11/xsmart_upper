@@ -20,6 +20,7 @@ class TrackedLaneState:
     is_lane_lost: bool
     lane_lost_count: int
     used_prediction: bool
+    steer_angle_deg: float | None = None
 
 
 class LaneTracker:

@@ -24,6 +24,29 @@ def test_target_height_is_fixed_across_confidence(lane_confidence: float) -> Non
     assert result.lookahead_px == pytest.approx(119.0)
 
 
+def test_steer_angle_uses_target_to_roi_top_centerline_geometry() -> None:
+    result = make_selector().select(
+        centerline_points=[(140, 0), (120, 80), (100, 199)],
+        roi_width=200,
+        roi_height=200,
+        lane_confidence=0.9,
+    )
+
+    assert result.target_point_roi == pytest.approx((120.0, 80.0))
+    assert result.steer_angle_deg == pytest.approx(14.036243)
+
+
+def test_steer_angle_is_invalid_when_centerline_misses_roi_top() -> None:
+    result = make_selector().select(
+        centerline_points=[(140, 1), (120, 80), (100, 199)],
+        roi_width=200,
+        roi_height=200,
+        lane_confidence=0.9,
+    )
+
+    assert result.steer_angle_deg is None
+
+
 def test_unsorted_centerline_is_interpolated_at_fixed_height() -> None:
     result = make_selector().select(
         centerline_points=[(120, 20), (100, 140), (110, 80)],

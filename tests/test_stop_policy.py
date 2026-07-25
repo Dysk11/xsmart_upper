@@ -6,7 +6,11 @@ from core.lane.tracker import TrackedLaneState
 from core.planning.high_level import HighLevelPlanner, build_off_track_stop_hint
 
 
-def make_tracked_state(*, lane_lost: bool = False) -> TrackedLaneState:
+def make_tracked_state(
+    *,
+    lane_lost: bool = False,
+    steer_angle_deg: float | None = None,
+) -> TrackedLaneState:
     return TrackedLaneState(
         centerline_points=[(100, 100)],
         lateral_error_px=4.0,
@@ -15,6 +19,7 @@ def make_tracked_state(*, lane_lost: bool = False) -> TrackedLaneState:
         is_lane_lost=lane_lost,
         lane_lost_count=1 if lane_lost else 0,
         used_prediction=lane_lost,
+        steer_angle_deg=steer_angle_deg,
     )
 
 
@@ -47,11 +52,9 @@ def test_geometric_lane_loss_with_visible_mask_keeps_existing_lost_behavior() ->
     assert command.target_speed == 0.25
 
 
-def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
+def test_normal_control_uses_geometric_steer_angle_directly() -> None:
     planner = HighLevelPlanner(
         {
-            "lateral_gain": 0.1,
-            "heading_gain": 0.5,
             "base_speed": 1.6,
             "heading_speed_gain": 0.03,
             "confidence_speed_gain": 0.7,
@@ -59,8 +62,20 @@ def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
         }
     )
 
-    command = planner.plan(make_tracked_state())
+    command = planner.plan(make_tracked_state(steer_angle_deg=12.0))
 
     assert command.mode == "NORMAL"
-    assert command.steer_deg == pytest.approx(1.4)
+    assert command.steer_deg == pytest.approx(12.0)
     assert command.target_speed == pytest.approx(1.47)
+
+
+def test_normal_control_holds_last_angle_until_top_contact_returns() -> None:
+    planner = HighLevelPlanner({"max_steer_deg": 35.0})
+
+    first = planner.plan(make_tracked_state(steer_angle_deg=-11.5))
+    held = planner.plan(make_tracked_state(steer_angle_deg=None))
+    resumed = planner.plan(make_tracked_state(steer_angle_deg=7.25))
+
+    assert first.steer_deg == pytest.approx(-11.5)
+    assert held.steer_deg == pytest.approx(-11.5)
+    assert resumed.steer_deg == pytest.approx(7.25)
