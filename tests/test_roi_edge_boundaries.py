@@ -48,15 +48,6 @@ def test_left_roi_edge_is_a_valid_boundary() -> None:
     assert right_lost == [False]
 
 
-def test_centerline_sampling_preserves_actual_roi_top_endpoint() -> None:
-    detector = LaneDetector({"centerline": {"scan_step": 4}})
-    raw_points = [(10, y) for y in range(10, -1, -1)]
-
-    smoothed = detector._smooth_article_centerline(raw_points, width=20)
-
-    assert smoothed[-1][1] == 0
-
-
 def test_right_roi_edge_is_a_valid_boundary() -> None:
     mask = np.zeros((1, WIDTH), dtype=np.uint8)
     mask[0, 7:WIDTH] = 255

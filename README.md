@@ -111,7 +111,7 @@ camera:
 
 ### 4. `planner`
 
-- `steer_deg`: 目标点到 ROI 顶端中线最高点的连线相对向上竖直线的有符号夹角；中线未到达 ROI 顶端时保持上一次有效角度
+- `lateral_gain` / `heading_gain`: 高层转向合成权重
 - `base_speed` / `max_speed` / `min_speed`: 速度策略范围
 - `lost_speed`: 丢线时保守速度
 

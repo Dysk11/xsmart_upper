@@ -110,6 +110,8 @@ class HighLevelPlanner:
             无返回值。
         """
 
+        self.lateral_gain = float(config.get("lateral_gain", 0.065))
+        self.heading_gain = float(config.get("heading_gain", 0.85))
         self.max_steer_deg = float(config.get("max_steer_deg", 28.0))
 
         self.base_speed = float(config.get("base_speed", 1.6))
@@ -122,7 +124,6 @@ class HighLevelPlanner:
         self.lost_speed = float(config.get("lost_speed", 0.25))
         self.lost_steer_decay = float(config.get("lost_steer_decay", 0.6))
         self.last_steer_deg = 0.0
-        self.last_valid_geometry_steer_deg = 0.0
 
     def plan(
         self,
@@ -154,9 +155,10 @@ class HighLevelPlanner:
             mode = "LANE_LOST"
         else:
             # 这里只做高层合成，不做底层 PID。
-            if tracked_state.steer_angle_deg is not None:
-                self.last_valid_geometry_steer_deg = float(tracked_state.steer_angle_deg)
-            steer_deg = self.last_valid_geometry_steer_deg
+            steer_deg = (
+                tracked_state.lateral_error_px * self.lateral_gain
+                + tracked_state.heading_error_deg * self.heading_gain
+            )
             steer_deg = clamp(steer_deg, -self.max_steer_deg, self.max_steer_deg)
 
             target_speed = self.base_speed

@@ -23,7 +23,6 @@ class TargetPointResult:
     target_heading_error_deg: float
     confidence: float
     reason: str
-    steer_angle_deg: float | None = None
 
 
 class TargetSelector:
@@ -60,7 +59,6 @@ class TargetSelector:
                 target_heading_error_deg=0.0,
                 confidence=0.0,
                 reason="lost: no centerline points",
-                steer_angle_deg=None,
             )
 
         target_y = clamp(self.fixed_target_y, 0.0, float(max(0, roi_height - 1)))
@@ -79,7 +77,6 @@ class TargetSelector:
                 ego_point=ego_point,
                 confidence=lane_confidence * 0.45,
                 reason=f"fixed target y={target_y:.1f}; {sample_reason}",
-                centerline_points=points,
             )
 
         return self._build_result(
@@ -89,7 +86,6 @@ class TargetSelector:
             ego_point=ego_point,
             confidence=lane_confidence,
             reason=f"fixed target y={target_y:.1f}; {sample_reason}",
-            centerline_points=points,
         )
 
     def _build_result(
@@ -100,7 +96,6 @@ class TargetSelector:
         ego_point: Point,
         confidence: float,
         reason: str,
-        centerline_points: Sequence[Point],
     ) -> TargetPointResult:
         target_x, target_y = target_point
         ego_x, ego_y = ego_point
@@ -115,10 +110,6 @@ class TargetSelector:
             target_heading_error_deg=float(heading_error_deg),
             confidence=clamp(float(confidence), 0.0, 1.0),
             reason=reason,
-            steer_angle_deg=calculate_steer_angle(
-                target_point=(float(target_x), float(target_y)),
-                centerline_points=centerline_points,
-            ),
         )
 
     def _sort_near_to_far(
@@ -201,34 +192,3 @@ class TargetSelector:
     ) -> float:
         ratio = (target_y - y1) / (y2 - y1)
         return float(x1 + (x2 - x1) * ratio)
-
-
-def calculate_steer_angle(
-    target_point: Point,
-    centerline_points: Sequence[Tuple[float, float]],
-) -> float | None:
-    """Return the target-to-top-centerline angle relative to upward vertical.
-
-    The angle is valid only while the highest centerline point touches the
-    exact top row of the ROI.  A positive value means the far centerline is to
-    the right of the target point; a negative value means it is to the left.
-    """
-
-    finite_points = [
-        (float(x), float(y))
-        for x, y in centerline_points
-        if math.isfinite(float(x)) and math.isfinite(float(y))
-    ]
-    if not finite_points:
-        return None
-
-    top_x, top_y = min(finite_points, key=lambda point: point[1])
-    if top_y != 0.0:
-        return None
-
-    target_x, target_y = [float(value) for value in target_point]
-    vertical_span = target_y - top_y
-    if not math.isfinite(target_x) or not math.isfinite(target_y) or vertical_span <= 0.0:
-        return None
-
-    return float(math.degrees(math.atan2(top_x - target_x, vertical_span)))
