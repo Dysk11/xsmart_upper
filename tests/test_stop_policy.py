@@ -6,11 +6,16 @@ from core.lane.tracker import TrackedLaneState
 from core.planning.high_level import HighLevelPlanner, build_off_track_stop_hint
 
 
-def make_tracked_state(*, lane_lost: bool = False) -> TrackedLaneState:
+def make_tracked_state(
+    *,
+    lane_lost: bool = False,
+    lateral_error_px: float = 4.0,
+    heading_error_deg: float = 2.0,
+) -> TrackedLaneState:
     return TrackedLaneState(
         centerline_points=[(100, 100)],
-        lateral_error_px=4.0,
-        heading_error_deg=2.0,
+        lateral_error_px=lateral_error_px,
+        heading_error_deg=heading_error_deg,
         confidence=0.9,
         is_lane_lost=lane_lost,
         lane_lost_count=1 if lane_lost else 0,
@@ -62,5 +67,101 @@ def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
     command = planner.plan(make_tracked_state())
 
     assert command.mode == "NORMAL"
-    assert command.steer_deg == pytest.approx(1.4)
+    assert command.steer_deg == pytest.approx(1.0796)
     assert command.target_speed == pytest.approx(1.47)
+
+
+@pytest.mark.parametrize(
+    ("absolute_error", "multiplier"),
+    [
+        (0.0, 0.199),
+        (6.0, 0.199),
+        (6.0001, 0.529),
+        (13.0, 0.529),
+        (13.0001, 0.99),
+        (24.0, 0.99),
+        (24.0001, 1.39),
+        (32.0, 1.39),
+        (32.0001, 1.58),
+        (55.0, 1.58),
+        (55.0001, 1.88),
+        (80.0, 1.88),
+        (80.0001, 2.5),
+    ],
+)
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+def test_lateral_error_amplification_uses_inclusive_thresholds_and_preserves_sign(
+    absolute_error: float,
+    multiplier: float,
+    sign: float,
+) -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_gain": 1.0,
+            "heading_gain": 0.0,
+            "max_steer_deg": 1000.0,
+        }
+    )
+    lateral_error_px = sign * absolute_error
+
+    command = planner.plan(
+        make_tracked_state(
+            lateral_error_px=lateral_error_px,
+            heading_error_deg=0.0,
+        )
+    )
+
+    assert command.steer_deg == pytest.approx(lateral_error_px * multiplier)
+
+
+def test_custom_lateral_error_amplification_is_used_before_heading_term() -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_gain": 0.5,
+            "heading_gain": 2.0,
+            "max_steer_deg": 1000.0,
+            "lateral_error_amplification": {
+                "thresholds_px": [10.0],
+                "multipliers": [0.25, 3.0],
+            },
+        }
+    )
+
+    command = planner.plan(
+        make_tracked_state(lateral_error_px=12.0, heading_error_deg=4.0)
+    )
+
+    assert command.steer_deg == pytest.approx(12.0 * 3.0 * 0.5 + 4.0 * 2.0)
+
+
+@pytest.mark.parametrize(
+    ("amplification_config", "message"),
+    [
+        ([], "must be a mapping"),
+        ({"thresholds_px": "6,13"}, "thresholds_px must be a sequence"),
+        ({"multipliers": "0.2,0.5"}, "multipliers must be a sequence"),
+        ({"thresholds_px": [6, "bad"]}, "thresholds_px must contain numbers"),
+        (
+            {"thresholds_px": [6, 6], "multipliers": [1, 2, 3]},
+            "thresholds_px must be strictly increasing",
+        ),
+        (
+            {"thresholds_px": [-1], "multipliers": [1, 2]},
+            "thresholds_px must be finite and non-negative",
+        ),
+        (
+            {"thresholds_px": [6], "multipliers": [1]},
+            "multipliers must contain exactly one more value",
+        ),
+        (
+            {"thresholds_px": [6], "multipliers": [1, float("inf")]},
+            "multipliers must be finite and non-negative",
+        ),
+    ],
+)
+def test_invalid_lateral_error_amplification_config_is_rejected(
+    amplification_config: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        HighLevelPlanner({"lateral_error_amplification": amplification_config})

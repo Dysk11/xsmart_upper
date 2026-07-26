@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from core.lane.tracker import TrackedLaneState
 from utils.math_utils import clamp
+
+
+DEFAULT_LATERAL_ERROR_THRESHOLDS_PX = (6.0, 13.0, 24.0, 32.0, 55.0, 80.0)
+DEFAULT_LATERAL_ERROR_MULTIPLIERS = (0.199, 0.529, 0.99, 1.39, 1.58, 1.88, 2.5)
 
 
 @dataclass
@@ -113,6 +118,12 @@ class HighLevelPlanner:
         self.lateral_gain = float(config.get("lateral_gain", 0.065))
         self.heading_gain = float(config.get("heading_gain", 0.85))
         self.max_steer_deg = float(config.get("max_steer_deg", 28.0))
+        (
+            self.lateral_error_thresholds_px,
+            self.lateral_error_multipliers,
+        ) = self._parse_lateral_error_amplification(
+            config.get("lateral_error_amplification", {})
+        )
 
         self.base_speed = float(config.get("base_speed", 1.6))
         self.max_speed = float(config.get("max_speed", 2.2))
@@ -124,6 +135,75 @@ class HighLevelPlanner:
         self.lost_speed = float(config.get("lost_speed", 0.25))
         self.lost_steer_decay = float(config.get("lost_steer_decay", 0.6))
         self.last_steer_deg = 0.0
+
+    @staticmethod
+    def _parse_lateral_error_amplification(
+        config: Any,
+    ) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        if not isinstance(config, dict):
+            raise ValueError("planner.lateral_error_amplification must be a mapping")
+
+        raw_thresholds = config.get(
+            "thresholds_px", DEFAULT_LATERAL_ERROR_THRESHOLDS_PX
+        )
+        raw_multipliers = config.get(
+            "multipliers", DEFAULT_LATERAL_ERROR_MULTIPLIERS
+        )
+        if not isinstance(raw_thresholds, (list, tuple)):
+            raise ValueError(
+                "planner.lateral_error_amplification.thresholds_px must be a sequence"
+            )
+        if not isinstance(raw_multipliers, (list, tuple)):
+            raise ValueError(
+                "planner.lateral_error_amplification.multipliers must be a sequence"
+            )
+
+        try:
+            thresholds = tuple(float(value) for value in raw_thresholds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "planner.lateral_error_amplification.thresholds_px must contain numbers"
+            ) from exc
+        try:
+            multipliers = tuple(float(value) for value in raw_multipliers)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "planner.lateral_error_amplification.multipliers must contain numbers"
+            ) from exc
+
+        if any(not math.isfinite(value) or value < 0.0 for value in thresholds):
+            raise ValueError(
+                "planner.lateral_error_amplification.thresholds_px must be finite and non-negative"
+            )
+        if any(
+            current <= previous
+            for previous, current in zip(thresholds, thresholds[1:])
+        ):
+            raise ValueError(
+                "planner.lateral_error_amplification.thresholds_px must be strictly increasing"
+            )
+        if len(multipliers) != len(thresholds) + 1:
+            raise ValueError(
+                "planner.lateral_error_amplification.multipliers must contain exactly one more value than thresholds_px"
+            )
+        if any(not math.isfinite(value) or value < 0.0 for value in multipliers):
+            raise ValueError(
+                "planner.lateral_error_amplification.multipliers must be finite and non-negative"
+            )
+        return thresholds, multipliers
+
+    def _amplify_lateral_error(self, lateral_error_px: float) -> float:
+        error = float(lateral_error_px)
+        absolute_error = abs(error)
+        multiplier = self.lateral_error_multipliers[-1]
+        for threshold, candidate in zip(
+            self.lateral_error_thresholds_px,
+            self.lateral_error_multipliers,
+        ):
+            if absolute_error <= threshold:
+                multiplier = candidate
+                break
+        return error * multiplier
 
     def plan(
         self,
@@ -155,8 +235,11 @@ class HighLevelPlanner:
             mode = "LANE_LOST"
         else:
             # 这里只做高层合成，不做底层 PID。
+            amplified_lateral_error_px = self._amplify_lateral_error(
+                tracked_state.lateral_error_px
+            )
             steer_deg = (
-                tracked_state.lateral_error_px * self.lateral_gain
+                amplified_lateral_error_px * self.lateral_gain
                 + tracked_state.heading_error_deg * self.heading_gain
             )
             steer_deg = clamp(steer_deg, -self.max_steer_deg, self.max_steer_deg)

@@ -193,6 +193,9 @@ road_sign_analyzer:
 planner:
   lateral_gain: 0.065
   heading_gain: 0.85
+  lateral_error_amplification:
+    thresholds_px: [9, 20, 36, 48, 83, 120]
+    multipliers: [0.199, 0.529, 0.99, 1.39, 1.58, 1.88, 2.5]
   max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2
