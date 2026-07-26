@@ -171,6 +171,8 @@ pedestrian_safety:
   rearm_cooldown_sec: 3.0
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2
+  moving_away_min_delta_px: 3
+  moving_away_confirm_frames: 2
   center_region:
     left_ratio: 0.35
     right_ratio: 0.65

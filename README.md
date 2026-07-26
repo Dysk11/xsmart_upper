@@ -267,6 +267,8 @@ pedestrian_safety:
   rearm_cooldown_sec: 3.0
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2
+  moving_away_min_delta_px: 3
+  moving_away_confirm_frames: 2
   center_region:
     left_ratio: 0.30
     right_ratio: 0.70
@@ -286,8 +288,16 @@ pedestrian_safety:
 建立穿越基线，旧线失效前后的行人移动不会触发释放。
 
 后续结果始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时
-无限保持停车。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标
-只接受左到右。完成穿越后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发。
+无限保持停车。原有跨线放行规则保持不变：center 目标允许任意方向跨越，left 目标
+只接受右到左，right 目标只接受左到右。
+
+锁线并建立行人基线后，还会用连续的新 AI 结果判断行人是否正在远离冻结线。相邻
+结果中，行人中心到冻结线的距离至少增加 `moving_away_min_delta_px`，才累计一次
+有效远离；连续达到 `moving_away_confirm_frames` 次后放行。center 目标允许行人在
+任一侧远离，left 目标只允许行人在线左侧继续向左，right 目标只允许行人在线右侧
+继续向右。停滞、靠近、增量不足、侧别不符、漏检或目标线重锁都会清零累计；缓存
+AI 结果不推进累计。完成跨线或确认远离后立即恢复并进入 3 秒冷却，冷却期间 human
+不再触发。
 行人逻辑只处理 `human`，不会把 `car` 当作行人停车目标。
 
 ## 7. car 原始检测框避让

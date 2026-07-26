@@ -23,6 +23,8 @@ def make_analyzer(**overrides: object) -> PedestrianSafetyAnalyzer:
         "rearm_cooldown_sec": 3.0,
         "target_stability_threshold_px": 20,
         "target_stability_confirm_frames": 2,
+        "moving_away_min_delta_px": 3,
+        "moving_away_confirm_frames": 2,
         "center_region": {
             "left_ratio": 0.30,
             "right_ratio": 0.70,
@@ -114,6 +116,36 @@ def establish_crossing_baseline(
     )
 
 
+def trigger_lock_and_establish_baseline(
+    analyzer: PedestrianSafetyAnalyzer,
+    start_x: int,
+    *,
+    target_x_roi: float = 90.0,
+) -> PedestrianSafetyResult:
+    objects = [detected_center(start_x)]
+    analyze(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=1,
+        now=0.0,
+    )
+    lock_target(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=1,
+        now=0.01,
+    )
+    return establish_crossing_baseline(
+        analyzer,
+        objects,
+        target_x_roi=target_x_roi,
+        result_id=2,
+        now=0.1,
+    )
+
+
 def stop_result() -> PedestrianSafetyResult:
     return PedestrianSafetyResult(
         stop_required=True,
@@ -143,6 +175,12 @@ def test_center_region_and_cooldown_are_strictly_validated() -> None:
         make_analyzer(target_stability_threshold_px=float("inf"))
     with pytest.raises(ValueError, match="target_stability_confirm_frames"):
         make_analyzer(target_stability_confirm_frames=1.5)
+    with pytest.raises(ValueError, match="moving_away_min_delta_px"):
+        make_analyzer(moving_away_min_delta_px=float("inf"))
+    with pytest.raises(ValueError, match="moving_away_min_delta_px"):
+        make_analyzer(moving_away_min_delta_px=-1)
+    with pytest.raises(ValueError, match="moving_away_confirm_frames"):
+        make_analyzer(moving_away_confirm_frames=1.5)
 
 
 @pytest.mark.parametrize(
@@ -822,6 +860,220 @@ def test_right_region_releases_when_starting_on_target_line() -> None:
         now=1.0,
     )
 
+    assert not released.stop_required
+
+
+@pytest.mark.parametrize(
+    ("start_x", "middle_x", "end_x", "target_x_roi", "expected_region"),
+    [
+        (90, 87, 84, 90.0, "center"),
+        (110, 113, 116, 90.0, "center"),
+        (40, 37, 34, 40.0, "left"),
+        (190, 193, 196, 170.0, "right"),
+    ],
+)
+def test_releases_after_two_confirmed_movements_away_from_target(
+    start_x: int,
+    middle_x: int,
+    end_x: int,
+    target_x_roi: float,
+    expected_region: str,
+) -> None:
+    analyzer = make_analyzer()
+    baseline = trigger_lock_and_establish_baseline(
+        analyzer,
+        start_x,
+        target_x_roi=target_x_roi,
+    )
+
+    first_away = analyze(
+        analyzer,
+        [detected_center(middle_x)],
+        target_x_roi=target_x_roi,
+        result_id=3,
+        now=0.5,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(end_x)],
+        target_x_roi=target_x_roi,
+        result_id=4,
+        now=1.0,
+    )
+
+    assert baseline.target_region == expected_region
+    assert first_away.stop_required
+    assert "moving_away=1/2" in first_away.reason
+    assert "delta=3.0px" in first_away.reason
+    assert not released.stop_required
+    assert f"moved away from {expected_region} target 2/2" in released.reason
+    assert released.cooldown_remaining_sec == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize(
+    (
+        "start_x",
+        "middle_x",
+        "end_x",
+        "target_x_roi",
+        "expected_count",
+    ),
+    [
+        (90, 88, 84, 90.0, 1),
+        (90, 87, 89, 90.0, 0),
+        (90, 87, 87, 90.0, 0),
+        (60, 63, 66, 40.0, 0),
+        (170, 167, 164, 170.0, 0),
+    ],
+)
+def test_noise_approach_stall_and_wrong_side_do_not_release(
+    start_x: int,
+    middle_x: int,
+    end_x: int,
+    target_x_roi: float,
+    expected_count: int,
+) -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(
+        analyzer,
+        start_x,
+        target_x_roi=target_x_roi,
+    )
+
+    analyze(
+        analyzer,
+        [detected_center(middle_x)],
+        target_x_roi=target_x_roi,
+        result_id=3,
+        now=0.5,
+    )
+    result = analyze(
+        analyzer,
+        [detected_center(end_x)],
+        target_x_roi=target_x_roi,
+        result_id=4,
+        now=1.0,
+    )
+
+    assert result.stop_required
+    assert f"moving_away={expected_count}/2" in result.reason
+
+
+def test_cached_ai_result_does_not_advance_moving_away_confirmation() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 90)
+
+    first_away = analyze(
+        analyzer,
+        [detected_center(87)],
+        result_id=3,
+        now=0.5,
+    )
+    cached = analyze(
+        analyzer,
+        [detected_center(84)],
+        result_id=3,
+        now=0.6,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(84)],
+        result_id=4,
+        now=1.0,
+    )
+
+    assert "moving_away=1/2" in first_away.reason
+    assert cached.stop_required
+    assert cached.tracked_center_frame == (87.0, 60.0)
+    assert "moving_away=1/2" in cached.reason
+    assert "delta=3.0px" in cached.reason
+    assert not released.stop_required
+
+
+def test_missing_pedestrian_resets_moving_away_confirmation() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 90)
+
+    first_away = analyze(
+        analyzer,
+        [detected_center(87)],
+        result_id=3,
+        now=0.5,
+    )
+    missing = analyze(analyzer, [], result_id=4, now=0.7)
+    after_missing = analyze(
+        analyzer,
+        [detected_center(84)],
+        result_id=5,
+        now=1.0,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(81)],
+        result_id=6,
+        now=1.5,
+    )
+
+    assert "moving_away=1/2" in first_away.reason
+    assert missing.stop_required
+    assert "triggering pedestrian missing" in missing.reason
+    assert after_missing.stop_required
+    assert "moving_away=1/2" in after_missing.reason
+    assert not released.stop_required
+
+
+def test_target_relock_resets_moving_away_and_requires_a_new_baseline() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 90)
+
+    first_away = analyze(
+        analyzer,
+        [detected_center(87)],
+        result_id=3,
+        now=0.5,
+    )
+    invalidated = analyze(
+        analyzer,
+        [detected_center(84)],
+        target_x_roi=110.0,
+        result_id=3,
+        now=0.6,
+    )
+    relocked = analyze(
+        analyzer,
+        [detected_center(84)],
+        target_x_roi=130.0,
+        result_id=3,
+        now=0.7,
+    )
+    baseline = analyze(
+        analyzer,
+        [detected_center(130)],
+        target_x_roi=130.0,
+        result_id=4,
+        now=1.0,
+    )
+    after_relock_first_away = analyze(
+        analyzer,
+        [detected_center(127)],
+        target_x_roi=130.0,
+        result_id=5,
+        now=1.5,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(124)],
+        target_x_roi=130.0,
+        result_id=6,
+        now=2.0,
+    )
+
+    assert "moving_away=1/2" in first_away.reason
+    assert invalidated.frozen_target_x_frame is None
+    assert relocked.frozen_target_x_frame == pytest.approx(140.0)
+    assert baseline.stop_required
+    assert "crossing baseline established" in baseline.reason
+    assert "moving_away=1/2" in after_relock_first_away.reason
     assert not released.stop_required
 
 

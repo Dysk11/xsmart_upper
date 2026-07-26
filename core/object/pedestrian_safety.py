@@ -31,7 +31,7 @@ class PedestrianSafetyResult:
 
 
 class PedestrianSafetyAnalyzer:
-    """Wait for one triggering pedestrian to cross a frozen lane target."""
+    """Wait for one triggering pedestrian to cross or move away from a target."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.enabled = bool(config.get("enabled", True))
@@ -44,12 +44,27 @@ class PedestrianSafetyAnalyzer:
             "target_stability_confirm_frames",
             2,
         )
+        self.moving_away_min_delta_px = float(
+            config.get("moving_away_min_delta_px", 3.0)
+        )
+        moving_away_confirm_frames = config.get(
+            "moving_away_confirm_frames",
+            2,
+        )
         try:
             self.target_stability_confirm_frames = int(stability_confirm_frames)
             stability_confirm_frames_value = float(stability_confirm_frames)
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 "pedestrian_safety.target_stability_confirm_frames "
+                "must be a positive integer"
+            ) from exc
+        try:
+            self.moving_away_confirm_frames = int(moving_away_confirm_frames)
+            moving_away_confirm_frames_value = float(moving_away_confirm_frames)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "pedestrian_safety.moving_away_confirm_frames "
                 "must be a positive integer"
             ) from exc
         if self.min_box_area_px < 0.0:
@@ -77,6 +92,25 @@ class PedestrianSafetyAnalyzer:
                 "pedestrian_safety.target_stability_confirm_frames "
                 "must be a positive integer"
             )
+        if (
+            not math.isfinite(self.moving_away_min_delta_px)
+            or self.moving_away_min_delta_px < 0.0
+        ):
+            raise ValueError(
+                "pedestrian_safety.moving_away_min_delta_px "
+                "must be finite and non-negative"
+            )
+        if (
+            isinstance(moving_away_confirm_frames, bool)
+            or not math.isfinite(moving_away_confirm_frames_value)
+            or moving_away_confirm_frames_value
+            != float(self.moving_away_confirm_frames)
+            or self.moving_away_confirm_frames <= 0
+        ):
+            raise ValueError(
+                "pedestrian_safety.moving_away_confirm_frames "
+                "must be a positive integer"
+            )
 
         region_config = config.get("center_region", {})
         self.left_ratio = float(region_config.get("left_ratio", 0.30))
@@ -96,6 +130,8 @@ class PedestrianSafetyAnalyzer:
         self.target_relock_pending = False
         self.last_locked_target_offset_px: float | None = None
         self.last_lock_was_relock = False
+        self.moving_away_count = 0
+        self.last_moving_away_delta_px: float | None = None
 
     def analyze(
         self,
@@ -184,6 +220,7 @@ class PedestrianSafetyAnalyzer:
         self.target_relock_pending = False
         self.last_locked_target_offset_px = None
         self.last_lock_was_relock = False
+        self._reset_moving_away_state()
         self.tracked_center_frame = self._bbox_center(trigger.bbox_frame)
         self.latched = True
         trigger_area = self._bbox_area(trigger.bbox_frame)
@@ -205,6 +242,7 @@ class PedestrianSafetyAnalyzer:
         now: float,
     ) -> PedestrianSafetyResult:
         if not humans or self.tracked_center_frame is None:
+            self._reset_moving_away_state()
             return self._result(
                 center_region,
                 humans,
@@ -222,6 +260,7 @@ class PedestrianSafetyAnalyzer:
         )
         current_center = self._bbox_center(tracked.bbox_frame)
         if self.frozen_target_x_frame is None:
+            self._reset_moving_away_state()
             self.tracked_center_frame = current_center
             return self._result(
                 center_region,
@@ -233,6 +272,7 @@ class PedestrianSafetyAnalyzer:
             )
 
         if not self.crossing_baseline_ready:
+            self._reset_moving_away_state()
             self.tracked_center_frame = current_center
             self.crossing_baseline_ready = True
             return self._result(
@@ -249,19 +289,35 @@ class PedestrianSafetyAnalyzer:
             previous_x=previous_center[0],
             current_x=current_center[0],
         )
-        self.tracked_center_frame = current_center
+        moving_away = False
         if not crossed:
+            moving_away = self._update_moving_away_state(
+                previous_x=previous_center[0],
+                current_x=current_center[0],
+        )
+        self.tracked_center_frame = current_center
+        if not crossed and not moving_away:
             return self._result(
                 center_region,
                 humans,
                 now,
                 (
                     f"latched; tracking region={self.target_region} "
-                    f"x={current_center[0]:.1f}"
+                    f"x={current_center[0]:.1f} "
+                    f"{self._moving_away_debug_text()}"
                 ),
             )
 
         released_region = self.target_region
+        release_reason = (
+            f"pedestrian crossed {released_region} target"
+            if crossed
+            else (
+                f"pedestrian moved away from {released_region} target "
+                f"{self.moving_away_count}/"
+                f"{self.moving_away_confirm_frames}"
+            )
+        )
         self.latched = False
         self.cooldown_until = now + self.rearm_cooldown_sec
         return self._result(
@@ -269,7 +325,7 @@ class PedestrianSafetyAnalyzer:
             humans,
             now,
             (
-                f"released; pedestrian crossed {released_region} target; "
+                f"released; {release_reason}; "
                 f"cooldown={self.rearm_cooldown_sec:.1f}s"
             ),
         )
@@ -293,6 +349,7 @@ class PedestrianSafetyAnalyzer:
             self.last_locked_target_offset_px = None
             self.last_lock_was_relock = True
             self.crossing_baseline_ready = False
+            self._reset_moving_away_state()
             return
 
         frozen_target_x = self.frozen_target_x_frame
@@ -312,6 +369,7 @@ class PedestrianSafetyAnalyzer:
             self.crossing_baseline_ready = False
             self.target_relock_pending = True
             self.last_lock_was_relock = False
+            self._reset_moving_away_state()
             return
 
         previous_target_x = self.previous_target_x_frame
@@ -345,6 +403,7 @@ class PedestrianSafetyAnalyzer:
         self.last_locked_target_offset_px = 0.0
         self.last_lock_was_relock = False
         self.crossing_baseline_ready = False
+        self._reset_moving_away_state()
 
     def _latched_wait_reason(self, detail: str) -> str:
         if self.frozen_target_x_frame is not None:
@@ -360,7 +419,8 @@ class PedestrianSafetyAnalyzer:
             )
             return (
                 f"latched; {lock_label} region={self.target_region} "
-                f"offset={offset_text}; {detail}"
+                f"offset={offset_text} "
+                f"{self._moving_away_debug_text()}; {detail}"
             )
         if self.target_relock_pending:
             offset_text = (
@@ -401,6 +461,57 @@ class PedestrianSafetyAnalyzer:
                 or previous_x > target_x > current_x
             )
         return False
+
+    def _update_moving_away_state(
+        self,
+        previous_x: float,
+        current_x: float,
+    ) -> bool:
+        target_x = self.frozen_target_x_frame
+        if target_x is None:
+            self._reset_moving_away_state()
+            return False
+
+        distance_delta_px = (
+            abs(float(current_x) - target_x)
+            - abs(float(previous_x) - target_x)
+        )
+        self.last_moving_away_delta_px = distance_delta_px
+        side_allowed = (
+            self.target_region == "center"
+            or (
+                self.target_region == "left"
+                and float(current_x) < target_x
+            )
+            or (
+                self.target_region == "right"
+                and float(current_x) > target_x
+            )
+        )
+        if (
+            side_allowed
+            and distance_delta_px >= self.moving_away_min_delta_px
+        ):
+            self.moving_away_count += 1
+        else:
+            self.moving_away_count = 0
+        return self.moving_away_count >= self.moving_away_confirm_frames
+
+    def _reset_moving_away_state(self) -> None:
+        self.moving_away_count = 0
+        self.last_moving_away_delta_px = None
+
+    def _moving_away_debug_text(self) -> str:
+        delta_text = (
+            "n/a"
+            if self.last_moving_away_delta_px is None
+            else f"{self.last_moving_away_delta_px:.1f}px"
+        )
+        return (
+            f"moving_away={self.moving_away_count}/"
+            f"{self.moving_away_confirm_frames} "
+            f"delta={delta_text}"
+        )
 
     def _validate_region_ratios(self) -> None:
         if not 0.0 <= self.left_ratio < self.right_ratio <= 1.0:
@@ -486,6 +597,7 @@ class PedestrianSafetyAnalyzer:
         self.target_relock_pending = False
         self.last_locked_target_offset_px = None
         self.last_lock_was_relock = False
+        self._reset_moving_away_state()
         self.cooldown_until = 0.0
 
     def _reset(self, clear_processed_result: bool) -> None:
