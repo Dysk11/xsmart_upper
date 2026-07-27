@@ -74,6 +74,32 @@ def test_configured_drive_state_is_used_only_while_moving(configured_state: int)
     assert resolve_configured_speed_state(0.0, configured_state) == 0x00
 
 
+@pytest.mark.parametrize(
+    ("configured_state", "expected_state"),
+    ((0x01, 0x01), (0x02, 0x01), (0x03, 0x02)),
+)
+def test_hazard_slowdown_reduces_exactly_one_moving_gear(
+    configured_state: int,
+    expected_state: int,
+) -> None:
+    assert (
+        resolve_configured_speed_state(
+            1.6,
+            configured_state,
+            reduce_one_gear=True,
+        )
+        == expected_state
+    )
+    assert (
+        resolve_configured_speed_state(
+            0.0,
+            configured_state,
+            reduce_one_gear=True,
+        )
+        == 0x00
+    )
+
+
 @pytest.mark.parametrize("invalid_state", (-1, 0, 4, 255))
 def test_invalid_configured_drive_state_is_rejected(invalid_state: int) -> None:
     with pytest.raises(ValueError, match="drive_speed_state"):

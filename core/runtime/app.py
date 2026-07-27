@@ -39,6 +39,7 @@ from core.object.pedestrian_safety import (
 )
 from core.planning.car_avoidance import CarAvoidancePlanner, CarAvoidanceResult
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
+from core.planning.hazard_slowdown import HazardSlowdownController
 from core.planning.path_marker_target import PathMarkerTargetPlanner, PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult, LaneDetector
 from core.lane.tracker import LaneTracker, TrackedLaneState
@@ -886,6 +887,11 @@ class UpperMachineApp:
         self.pedestrian_safety_analyzer = PedestrianSafetyAnalyzer(
             config.get("pedestrian_safety", {})
         )
+        self.hazard_slowdown = HazardSlowdownController(
+            hold_sec=float(
+                config.get("hazard_slowdown", {}).get("hold_sec", 1.0)
+            )
+        )
         self.planner = HighLevelPlanner(config.get("planner", {}))
         bridge_config = config.get("bridge", {})
         self.drive_speed_state = validate_drive_speed_state(
@@ -1163,6 +1169,15 @@ class UpperMachineApp:
                 ):
                     self.last_ai_frame_id = int(ai_frame_id)
                     self.last_detected_objects = detected_objects
+                    self.hazard_slowdown.observe_ai_result(
+                        objects=detected_objects,
+                        avoidance_roi_rect=avoidance_roi_rect,
+                        pedestrian_min_box_area_px=(
+                            self.pedestrian_safety_analyzer.min_box_area_px
+                        ),
+                        detection_result_id=self.last_ai_frame_id,
+                        now_monotonic=time.monotonic(),
+                    )
                     self.last_ocr_result, self._last_ocr_event_id = consume_ocr_event(
                         self.last_ocr_result,
                         self._last_ocr_event_id,
@@ -1268,6 +1283,18 @@ class UpperMachineApp:
                 avoidance_roi_rect=avoidance_roi_rect,
                 detection_result=detection_result,
                 tracked_state=tracked_state,
+            )
+            self.hazard_slowdown.observe_stateful_hazards(
+                time.monotonic(),
+                pedestrian_active=bool(
+                    self.last_pedestrian_safety_result is not None
+                    and self.last_pedestrian_safety_result.latched
+                ),
+                car_avoidance_active=bool(
+                    self.last_car_avoidance_result is not None
+                    and self.last_car_avoidance_result.active
+                ),
+                road_sign_waiting=self.ocr_stop_latch.active,
             )
             # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
             module_hints = self._collect_future_module_hints(
@@ -1617,6 +1644,7 @@ class UpperMachineApp:
             "speed_state": resolve_configured_speed_state(
                 control_command.target_speed,
                 self.drive_speed_state,
+                reduce_one_gear=self.hazard_slowdown.active(time.monotonic()),
             ),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,

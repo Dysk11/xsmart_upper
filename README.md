@@ -386,7 +386,10 @@ TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读�
 
 正常行驶档位通过 `bridge.drive_speed_state` 配置，只允许 `1`（低速）、`2`（中速）
 或 `3`（高速），默认值为 `2`。无论正常档位为何值，只要规划结果要求停车，第 7
-字节都会发送 `0x00`。
+字节都会发送 `0x00`。检测到危险目标时按 `hazard_slowdown.hold_sec` 保持降一档：
+`3→2`、`2→1`、`1→1`。其中 `human` 必须满足行人面积门槛且中心进入 avoidance
+ROI，`car` 框接触 avoidance ROI 边界即生效，`road_sign` 在全画面生效；车辆避让、
+行人锁存或路牌等待结束后仍保持低档 1 秒。停车命令始终覆盖降档。
 
 ## RKNN 航道分割部署
 
@@ -429,13 +432,18 @@ python3 main.py --mode camera --bridge serial
 
 ## RK3588 PP-OCR 路牌识别
 
-目标检测在同一帧识别到 `road_sign` 且原始框至少为 `96x48` 像素时，AI
-子进程会按检测框中心扩展 10% 并送入 PP-OCRv4 Det/Rec RKNN 模型。只有整体
+目标检测在同一帧识别到 `road_sign` 且原始框满足配置的置信度、最小宽度和最小
+高度时，AI 子进程立即通知主循环进入 `ROAD_SIGN_WAIT`，并按检测框中心扩展 10%。
+系统选择置信度最高、面积最大的候选；相邻原始框面积变化不超过
+`bbox_area_stability_threshold_ratio: 0.10`，连续满足
+`bbox_area_stability_confirm_deltas: 2` 次且岔路已经确认后，才把裁剪送入
+PP-OCRv4 Det/Rec RKNN 模型。候选缺失或面积变化超限会重新累计稳定次数，但停车
+会话继续保持到流程完成或总超时。只有整体
 置信度达到 `0.60` 的非空文字才写入
 `outputs/logs/ocr/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后按
 `ocr.cooldown_seconds` 配置全局 OCR 冷却时间，默认 20 秒。
-OCR 模型真正开始推理时，主循环立即进入 `ROAD_SIGN_WAIT` 并持续向下位机发送
-`speed_state=0x00`。停车覆盖 OCR 重试和后续千帆 API 请求；API 正常返回或产生
+主循环在整个 `ROAD_SIGN_WAIT` 期间持续向下位机发送 `speed_state=0x00`。
+停车覆盖面积稳定等待、岔路确认、OCR 重试和后续千帆 API 请求；API 正常返回或产生
 fallback 决策后恢复配置档位。`ocr.stop_timeout_sec` 控制 OCR/API 总等待上限，默认
 20 秒；超时后取消 pending 请求、忽略迟到结果并保持当前分支。关闭路牌 API 时，
 OCR 完成后同样保持当前分支。

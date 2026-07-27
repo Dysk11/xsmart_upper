@@ -123,6 +123,8 @@ ocr:
   bbox_min_width_px: 100
   bbox_min_height_px: 50
   bbox_padding_ratio: 0.10
+  bbox_area_stability_threshold_ratio: 0.10
+  bbox_area_stability_confirm_deltas: 2
   input_width: 480
   input_height: 480
   min_score: 0.50
@@ -141,7 +143,7 @@ target_selector:
 
 car_avoidance:
   enabled: true
-  entry_duration_s: 1.0
+  entry_duration_s: 0.25
   edge_slow_margin_px: 20
   release_duration_s: 2.0
 
@@ -177,6 +179,9 @@ pedestrian_safety:
     left_ratio: 0.35
     right_ratio: 0.65
 
+hazard_slowdown:
+  hold_sec: 1.0
+
 road_sign_analyzer:
   enable: true
   api_url: https://qianfan.baidubce.com/v2/chat/completions
@@ -194,8 +199,8 @@ planner:
   lateral_gain: 0.065
   heading_gain: 0.85
   lateral_error_amplification:
-    thresholds_px: [9, 20, 36, 48, 83, 120]
-    multipliers: [0.9, 0.9, 0.9, 1.1, 1.5, 2.5, 3.5]
+    thresholds_px: [9, 20, 36, 48, 83, 140, 180]
+    multipliers: [0.2, 0.53, 1, 1.39, 1.58, 1.88, 2.5, 3.5]
   max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2

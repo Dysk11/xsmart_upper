@@ -49,13 +49,18 @@ def validate_drive_speed_state(value: Any) -> int:
     return state
 
 
-def resolve_configured_speed_state(target_speed: float, drive_speed_state: Any) -> int:
-    """Return stop for non-positive targets, otherwise the configured drive state."""
+def resolve_configured_speed_state(
+    target_speed: float,
+    drive_speed_state: Any,
+    reduce_one_gear: bool = False,
+) -> int:
+    """Resolve stop/configured speed, optionally reducing one moving gear."""
 
     speed = float(target_speed)
     if not math.isfinite(speed) or speed <= 0.0:
         return 0x00
-    return validate_drive_speed_state(drive_speed_state)
+    state = validate_drive_speed_state(drive_speed_state)
+    return max(0x01, state - 1) if reduce_one_gear else state
 
 
 def normalize_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
