@@ -25,6 +25,15 @@ class RoadSignCrop:
 
 
 @dataclass(frozen=True)
+class RoadSignCandidate:
+    """The strongest road-sign detection that meets OCR size/score gates."""
+
+    bbox: FrameBBox
+    detection_confidence: float
+    detection_area_px: float
+
+
+@dataclass(frozen=True)
 class OcrTrigger:
     """Notification emitted when a qualifying road sign starts a stop cycle."""
 
@@ -79,20 +88,14 @@ class OcrStopLatch:
         return expired_trigger_id
 
 
-def select_road_sign_crop(
-    frame: np.ndarray,
+def select_road_sign_candidate(
     detections: Sequence[DetectedObject],
     class_names: set[str],
     min_confidence: float,
     min_width_px: int,
     min_height_px: int,
-    padding_ratio: float,
-) -> RoadSignCrop | None:
-    """Choose the strongest sufficiently large road-sign box and crop it safely."""
-
-    shape = getattr(frame, "shape", ())
-    if len(shape) < 2 or shape[0] <= 0 or shape[1] <= 0:
-        return None
+) -> RoadSignCandidate | None:
+    """Choose the strongest road-sign box that meets OCR score and size gates."""
 
     accepted_names = {name.casefold() for name in class_names}
     candidates: list[tuple[float, float, DetectedObject]] = []
@@ -110,27 +113,70 @@ def select_road_sign_crop(
         candidates.append((confidence, float(box_width * box_height), obj))
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    if not candidates:
+        return None
+    confidence, area, obj = candidates[0]
+    return RoadSignCandidate(
+        bbox=obj.bbox_frame,
+        detection_confidence=confidence,
+        detection_area_px=area,
+    )
+
+
+def crop_road_sign_candidate(
+    frame: np.ndarray,
+    candidate: RoadSignCandidate,
+    padding_ratio: float,
+) -> RoadSignCrop | None:
+    """Crop one selected road sign while preserving its original detection data."""
+
+    shape = getattr(frame, "shape", ())
+    if len(shape) < 2 or shape[0] <= 0 or shape[1] <= 0:
+        return None
+
     frame_height, frame_width = int(shape[0]), int(shape[1])
     padding_ratio = max(0.0, float(padding_ratio))
-    for confidence, area, obj in candidates:
-        x1, y1, x2, y2 = obj.bbox_frame
-        pad_x = (x2 - x1) * padding_ratio
-        pad_y = (y2 - y1) * padding_ratio
-        left = max(0, min(frame_width, int(floor(x1 - pad_x))))
-        top = max(0, min(frame_height, int(floor(y1 - pad_y))))
-        right = max(0, min(frame_width, int(ceil(x2 + pad_x))))
-        bottom = max(0, min(frame_height, int(ceil(y2 + pad_y))))
-        if right <= left or bottom <= top:
-            continue
-        image = frame[top:bottom, left:right]
-        if image.size:
-            return RoadSignCrop(
-                image.copy(),
-                (left, top, right, bottom),
-                confidence,
-                area,
-            )
-    return None
+    x1, y1, x2, y2 = candidate.bbox
+    pad_x = (x2 - x1) * padding_ratio
+    pad_y = (y2 - y1) * padding_ratio
+    left = max(0, min(frame_width, int(floor(x1 - pad_x))))
+    top = max(0, min(frame_height, int(floor(y1 - pad_y))))
+    right = max(0, min(frame_width, int(ceil(x2 + pad_x))))
+    bottom = max(0, min(frame_height, int(ceil(y2 + pad_y))))
+    if right <= left or bottom <= top:
+        return None
+    image = frame[top:bottom, left:right]
+    if not image.size:
+        return None
+    return RoadSignCrop(
+        image.copy(),
+        (left, top, right, bottom),
+        candidate.detection_confidence,
+        candidate.detection_area_px,
+    )
+
+
+def select_road_sign_crop(
+    frame: np.ndarray,
+    detections: Sequence[DetectedObject],
+    class_names: set[str],
+    min_confidence: float,
+    min_width_px: int,
+    min_height_px: int,
+    padding_ratio: float,
+) -> RoadSignCrop | None:
+    """Choose and safely crop the strongest sufficiently large road sign."""
+
+    candidate = select_road_sign_candidate(
+        detections,
+        class_names,
+        min_confidence,
+        min_width_px,
+        min_height_px,
+    )
+    if candidate is None:
+        return None
+    return crop_road_sign_candidate(frame, candidate, padding_ratio)
 
 
 class RoadSignOcrSession:
@@ -228,16 +274,14 @@ class RoadSignOcrSession:
                 self._publish_pending(now)
             return self._last_result
 
-        crop = select_road_sign_crop(
-            frame,
+        candidate = select_road_sign_candidate(
             detections,
             self.class_names,
             self.bbox_min_confidence,
             self.bbox_min_width_px,
             self.bbox_min_height_px,
-            self.bbox_padding_ratio,
         )
-        if crop is None:
+        if candidate is None:
             self._reset_area_stability()
             if self._cycle_completed:
                 self._reset_cycle()
@@ -259,6 +303,22 @@ class RoadSignOcrSession:
                         started_at=now,
                     )
                 )
+
+        shape = getattr(frame, "shape", ())
+        frame_width = int(shape[1]) if len(shape) >= 2 else 0
+        x1, _, x2, _ = candidate.bbox
+        if frame_width <= 0 or x1 <= 0 or x2 >= frame_width - 1:
+            self._reset_area_stability()
+            return self._last_result
+
+        crop = crop_road_sign_candidate(
+            frame,
+            candidate,
+            self.bbox_padding_ratio,
+        )
+        if crop is None:
+            self._reset_area_stability()
+            return self._last_result
 
         if not self._ocr_started:
             area_stable = self._observe_detection_area(crop.detection_area_px)

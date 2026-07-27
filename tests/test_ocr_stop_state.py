@@ -259,3 +259,151 @@ def test_missing_or_unstable_sign_resets_area_confirmation() -> None:
     )
     assert recognizer.call_count == 1
     assert accepted is not None
+
+
+def test_horizontal_edge_sign_triggers_stop_but_waits_for_full_entry() -> None:
+    triggers: list[OcrTrigger] = []
+    recognizer = FakeRecognizer(
+        [OcrResult(frame_id=6, text="left", confidence=0.9)]
+    )
+    session = RoadSignOcrSession(
+        {
+            "enable": True,
+            "class_names": ["road_sign"],
+            "bbox_min_width_px": 1,
+            "bbox_min_height_px": 1,
+            "bbox_area_stability_threshold_ratio": 0.10,
+            "bbox_area_stability_confirm_deltas": 2,
+            "accept_score": 0.6,
+        },
+        recognizer=recognizer,
+        event_logger=FakeLogger(),
+        trigger_callback=triggers.append,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+
+    session.update(frame, 1, [make_detection((0, 20, 100, 100))])
+    session.update(frame, 2, [make_detection((0, 20, 102, 100))])
+    session.update(frame, 3, [make_detection((60, 20, 159, 100))])
+
+    assert len(triggers) == 1
+    assert triggers[0].frame_id == 1
+    assert recognizer.call_count == 0
+
+    session.update(frame, 4, [make_detection((1, 20, 158, 100))])
+    session.update(frame, 5, [make_detection((2, 20, 157, 100))])
+    accepted = session.update(frame, 6, [make_detection((3, 20, 156, 100))])
+
+    assert len(triggers) == 1
+    assert recognizer.call_count == 1
+    assert accepted is not None
+    assert accepted.frame_id == 6
+    assert accepted.trigger_id == triggers[0].trigger_id
+
+
+def test_top_and_bottom_edges_do_not_block_ocr() -> None:
+    recognizer = FakeRecognizer(
+        [OcrResult(frame_id=1, text="right", confidence=0.9)]
+    )
+    session = RoadSignOcrSession(
+        {
+            "enable": True,
+            "class_names": ["road_sign"],
+            "bbox_min_width_px": 1,
+            "bbox_min_height_px": 1,
+            "bbox_area_stability_confirm_deltas": 0,
+            "accept_score": 0.6,
+        },
+        recognizer=recognizer,
+        event_logger=FakeLogger(),
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+
+    accepted = session.update(
+        frame,
+        1,
+        [make_detection((1, 0, 158, 139))],
+    )
+
+    assert recognizer.call_count == 1
+    assert accepted is not None
+
+
+def test_edge_frame_pauses_ocr_retry_until_sign_reenters() -> None:
+    now = [0.0]
+    triggers: list[OcrTrigger] = []
+    recognizer = FakeRecognizer(
+        [
+            OcrResult(frame_id=1, error="retry"),
+            OcrResult(frame_id=3, text="right", confidence=0.9),
+        ]
+    )
+    session = RoadSignOcrSession(
+        {
+            "enable": True,
+            "class_names": ["road_sign"],
+            "bbox_min_width_px": 1,
+            "bbox_min_height_px": 1,
+            "bbox_area_stability_confirm_deltas": 0,
+            "retry_interval_sec": 0.5,
+            "accept_score": 0.6,
+        },
+        recognizer=recognizer,
+        event_logger=FakeLogger(),
+        clock=lambda: now[0],
+        trigger_callback=triggers.append,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+
+    session.update(frame, 1, [make_detection((1, 20, 158, 100))])
+    now[0] = 0.5
+    session.update(frame, 2, [make_detection((0, 20, 100, 100))])
+
+    assert recognizer.call_count == 1
+    assert len(triggers) == 1
+
+    accepted = session.update(
+        frame,
+        3,
+        [make_detection((1, 20, 158, 100))],
+    )
+
+    assert recognizer.call_count == 2
+    assert len(triggers) == 1
+    assert accepted is not None
+    assert accepted.trigger_id == triggers[0].trigger_id
+
+
+def test_edge_highest_priority_candidate_discards_entire_frame() -> None:
+    triggers: list[OcrTrigger] = []
+    recognizer = FakeRecognizer(
+        [OcrResult(frame_id=2, text="left", confidence=0.9)]
+    )
+    session = RoadSignOcrSession(
+        {
+            "enable": True,
+            "class_names": ["road_sign"],
+            "bbox_min_width_px": 1,
+            "bbox_min_height_px": 1,
+            "bbox_area_stability_confirm_deltas": 0,
+            "accept_score": 0.6,
+        },
+        recognizer=recognizer,
+        event_logger=FakeLogger(),
+        trigger_callback=triggers.append,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+    edge_candidate = make_detection((0, 20, 100, 100))
+    inside_candidate = make_detection((20, 20, 120, 100))
+    inside_candidate.confidence = 0.8
+
+    session.update(frame, 1, [edge_candidate, inside_candidate])
+
+    assert recognizer.call_count == 0
+    assert len(triggers) == 1
+
+    accepted = session.update(frame, 2, [inside_candidate])
+
+    assert recognizer.call_count == 1
+    assert len(triggers) == 1
+    assert accepted is not None
