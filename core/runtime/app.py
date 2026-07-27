@@ -758,6 +758,16 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
 
     visualizer_config = runtime_config.setdefault("visualizer", {})
     visualizer_config["save_dir"] = str(resolve_project_path(project_root, str(visualizer_config.get("save_dir", "outputs/visual"))))
+    planner_config = runtime_config.get("planner", {})
+    amplification_config = (
+        planner_config.get("lateral_error_amplification", {})
+        if isinstance(planner_config, dict)
+        else {}
+    )
+    if isinstance(amplification_config, dict):
+        thresholds_px = amplification_config.get("thresholds_px")
+        if isinstance(thresholds_px, (list, tuple)):
+            visualizer_config["lateral_error_thresholds_px"] = list(thresholds_px)
 
     rknn_detector_config = runtime_config.setdefault("rknn_object_detector", {})
     if rknn_detector_config.get("model_path"):

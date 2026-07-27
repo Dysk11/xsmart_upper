@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -141,6 +141,20 @@ class Visualizer:
         )
         self.mask_alpha = float(config.get("mask_alpha", 0.35))
         self.mask_color = tuple(int(value) for value in config.get("mask_color", [0, 180, 255]))
+        raw_thresholds = config.get("lateral_error_thresholds_px", [])
+        parsed_thresholds: set[float] = set()
+        if isinstance(raw_thresholds, (list, tuple)):
+            for value in raw_thresholds:
+                try:
+                    threshold = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(threshold) and threshold > 0.0:
+                    parsed_thresholds.add(threshold)
+        self.lateral_error_thresholds_px = tuple(sorted(parsed_thresholds))
+        self.threshold_line_color = (150, 150, 150)
+        self.threshold_dash_length_px = 5
+        self.threshold_gap_length_px = 5
         self._cached_debug_panel: np.ndarray | None = None
         self._last_debug_refresh_monotonic = float("-inf")
 
@@ -292,6 +306,10 @@ class Visualizer:
 
         original_panel = frame.copy()
         self._overlay_roi_mask(original_panel, detection_result.filtered_mask, (x1, y1, x2, y2))
+        self._draw_lateral_error_thresholds(
+            original_panel,
+            (x1, y1, x2, y2),
+        )
         cv2.rectangle(original_panel, (x1, y1), (x2, y2), (0, 255, 255), 2)
         avoid_x1, avoid_y1, avoid_x2, avoid_y2 = avoidance_roi_rect or roi_rect
         if (avoid_x1, avoid_y1, avoid_x2, avoid_y2) == (x1, y1, x2, y2):
@@ -448,6 +466,58 @@ class Visualizer:
             )
         self._draw_fps(original_panel, fps_value)
         return original_panel
+
+    def _draw_lateral_error_thresholds(
+        self,
+        image: np.ndarray,
+        roi_rect: tuple[int, int, int, int],
+    ) -> None:
+        """Draw symmetric lateral-error bands inside the lane ROI."""
+
+        x1, y1, x2, y2 = roi_rect
+        if x2 <= x1 or y2 <= y1:
+            return
+        center_x = float(x1) + float(x2 - x1) * 0.5
+        for threshold in self.lateral_error_thresholds_px:
+            for direction in (-1.0, 1.0):
+                line_x = int(round(center_x + direction * threshold))
+                if line_x < x1 or line_x >= x2:
+                    continue
+                self._draw_vertical_dashed_line(
+                    image=image,
+                    x=line_x,
+                    top=y1,
+                    bottom=y2 - 1,
+                    color=self.threshold_line_color,
+                    thickness=1,
+                    dash_length=self.threshold_dash_length_px,
+                    gap_length=self.threshold_gap_length_px,
+                )
+
+    @staticmethod
+    def _draw_vertical_dashed_line(
+        image: np.ndarray,
+        x: int,
+        top: int,
+        bottom: int,
+        color: tuple[int, int, int],
+        thickness: int,
+        dash_length: int,
+        gap_length: int,
+    ) -> None:
+        """Draw one clipped vertical dashed line."""
+
+        step = max(1, int(dash_length) + int(gap_length))
+        dash_length = max(1, int(dash_length))
+        for dash_top in range(int(top), int(bottom) + 1, step):
+            dash_bottom = min(int(bottom), dash_top + dash_length - 1)
+            cv2.line(
+                image,
+                (int(x), dash_top),
+                (int(x), dash_bottom),
+                color,
+                max(1, int(thickness)),
+            )
 
     @staticmethod
     def _draw_fps(image: np.ndarray, fps_value: float) -> None:

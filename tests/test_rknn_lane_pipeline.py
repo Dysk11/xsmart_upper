@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
@@ -11,6 +12,30 @@ from core.lane.rknn_segmenter import (
     SegmentationResult,
 )
 from core.runtime.app import UpperMachineApp
+from core.runtime.app import prepare_runtime_config
+
+
+def test_runtime_config_passes_planner_thresholds_to_visualizer() -> None:
+    source = {
+        "planner": {
+            "lateral_error_amplification": {
+                "thresholds_px": [9, 20, 36, 48, 83, 120],
+            }
+        },
+        "visualizer": {"save_dir": "visual"},
+    }
+
+    runtime = prepare_runtime_config(source, Path.cwd())
+
+    assert runtime["visualizer"]["lateral_error_thresholds_px"] == [
+        9,
+        20,
+        36,
+        48,
+        83,
+        120,
+    ]
+    assert "lateral_error_thresholds_px" not in source["visualizer"]
 
 
 def test_lane_inference_can_be_completed_after_next_stage_boundary(monkeypatch) -> None:

@@ -145,6 +145,30 @@ def test_canvas_draws_lane_and_avoidance_rois_independently() -> None:
     assert tuple(canvas[20, 10]) == (255, 255, 0)
 
 
+def test_lateral_error_thresholds_draw_symmetric_dashes_inside_lane_roi() -> None:
+    visualizer = Visualizer(
+        {
+            "show_window": False,
+            "lateral_error_thresholds_px": [10, 25, 80],
+        }
+    )
+    frame = np.zeros((120, 220, 3), dtype=np.uint8)
+    roi_rect = (20, 10, 160, 90)
+
+    visualizer._draw_lateral_error_thresholds(frame, roi_rect)
+
+    line_color = visualizer.threshold_line_color
+    for line_x in (80, 100, 65, 115):
+        assert tuple(frame[10, line_x]) == line_color
+        assert tuple(frame[14, line_x]) == line_color
+        assert tuple(frame[15, line_x]) == (0, 0, 0)
+        assert tuple(frame[89, line_x]) == (0, 0, 0)
+    assert tuple(frame[9, 80]) == (0, 0, 0)
+    assert tuple(frame[90, 80]) == (0, 0, 0)
+    assert tuple(frame[10, 10]) == (0, 0, 0)
+    assert tuple(frame[10, 170]) == (0, 0, 0)
+
+
 def test_pedestrian_regions_and_frozen_target_are_drawn() -> None:
     visualizer = Visualizer({"show_window": False})
     frame = np.zeros((100, 100, 3), dtype=np.uint8)
