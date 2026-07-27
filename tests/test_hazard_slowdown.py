@@ -1,6 +1,9 @@
+import pytest
+
 from core.object.blocking import DetectedObject
 from core.planning.hazard_slowdown import (
     HazardSlowdownController,
+    RoadSignApproachController,
     detect_hazard_presence,
 )
 
@@ -55,20 +58,20 @@ def test_human_requires_center_and_area_while_car_requires_box_overlap() -> None
     assert not presence.any
 
 
-def test_new_ai_result_refreshes_hold_but_duplicate_result_does_not() -> None:
+def test_road_sign_does_not_use_generic_one_gear_slowdown() -> None:
     controller = HazardSlowdownController(hold_sec=1.0)
     road_sign = [detected("road_sign", (5, 5, 25, 25))]
 
     controller.observe_ai_result(road_sign, ROI, 600, 7, 10.0)
-    assert controller.active(10.999)
-    controller.observe_ai_result(road_sign, ROI, 600, 7, 10.8)
-    assert not controller.active(11.0)
+    assert not controller.active(10.1)
 
-    controller.observe_ai_result(road_sign, ROI, 600, 8, 11.1)
-    assert controller.active(12.099)
-    controller.observe_ai_result([], ROI, 600, 9, 11.2)
-    assert controller.active(12.199)
-    assert not controller.active(12.2)
+
+def test_human_still_uses_generic_one_gear_slowdown() -> None:
+    controller = HazardSlowdownController(hold_sec=1.0)
+    human = [detected("human", (120, 120, 150, 150))]
+
+    controller.observe_ai_result(human, ROI, 600, 7, 10.0)
+    assert controller.active(10.999)
 
 
 def test_car_presence_is_reported_without_generic_slowdown_hold() -> None:
@@ -94,3 +97,51 @@ def test_stateful_hazard_holds_for_one_second_after_release() -> None:
 
     assert controller.active(22.999)
     assert not controller.active(23.0)
+
+
+def test_road_sign_approach_uses_independent_hold_and_rearm_cycle() -> None:
+    controller = RoadSignApproachController(speed_state=2, hold_sec=1.0)
+
+    controller.observe(True, detection_result_id=7, now_monotonic=10.0)
+    assert controller.speed_state == 2
+    assert controller.active(10.999)
+    assert controller.merge_speed_state(None, 10.5) == 2
+    assert controller.merge_speed_state(1, 10.5) == 1
+    assert controller.merge_speed_state(3, 10.5) == 2
+
+    controller.observe(True, detection_result_id=7, now_monotonic=10.8)
+    assert not controller.active(11.0)
+
+    controller.observe(True, detection_result_id=8, now_monotonic=11.1)
+    controller.observe(False, detection_result_id=9, now_monotonic=11.2)
+    assert controller.active(12.199)
+    assert not controller.active(12.2)
+
+
+def test_road_sign_approach_stays_blocked_until_absence_after_ocr() -> None:
+    controller = RoadSignApproachController(speed_state=2, hold_sec=1.0)
+
+    controller.observe(True, detection_result_id=1, now_monotonic=1.0)
+    controller.mark_ocr_started()
+    assert not controller.active(1.1)
+
+    controller.observe(True, detection_result_id=2, now_monotonic=1.2)
+    assert not controller.active(1.3)
+    assert controller.merge_speed_state(None, 1.3) is None
+
+    controller.observe(False, detection_result_id=3, now_monotonic=1.4)
+    assert not controller.active(1.5)
+
+    controller.observe(True, detection_result_id=4, now_monotonic=1.6)
+    assert controller.active(2.599)
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    (0, -1, 4, 2.5, True, float("inf"), "bad"),
+)
+def test_road_sign_approach_rejects_invalid_speed_state(
+    invalid_state: object,
+) -> None:
+    with pytest.raises(ValueError, match="ocr.approach_speed_state"):
+        RoadSignApproachController(speed_state=invalid_state, hold_sec=1.0)

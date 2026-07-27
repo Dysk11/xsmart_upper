@@ -123,8 +123,7 @@ ocr:
   bbox_min_width_px: 100
   bbox_min_height_px: 50
   bbox_padding_ratio: 0.10
-  bbox_area_stability_threshold_ratio: 0.10
-  bbox_area_stability_confirm_deltas: 2
+  approach_speed_state: 2
   input_width: 480
   input_height: 480
   min_score: 0.50
@@ -216,7 +215,7 @@ planner:
 # Communication and output
 bridge:
   type: serial
-  drive_speed_state: 2
+  drive_speed_state: 3
   serial:
     port: /dev/ttyUSB0
     baudrate: 115200

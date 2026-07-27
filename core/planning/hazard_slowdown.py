@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
+from core.io.protocol import validate_moving_speed_state
 from core.object.blocking import DetectedObject
 
 
@@ -28,7 +29,7 @@ class HazardPresence:
     def generic_slowdown(self) -> bool:
         """Return hazards that still use the one-gear hold controller."""
 
-        return self.human or self.road_sign
+        return self.human
 
 
 def detect_hazard_presence(
@@ -123,11 +124,10 @@ class HazardSlowdownController:
         now_monotonic: float,
         *,
         pedestrian_active: bool = False,
-        road_sign_waiting: bool = False,
     ) -> None:
         """Keep slowdown held throughout latched safety/planning states."""
 
-        active = pedestrian_active or road_sign_waiting
+        active = pedestrian_active
         if active or self._stateful_hazard_active:
             self._extend(float(now_monotonic))
         self._stateful_hazard_active = active
@@ -137,3 +137,79 @@ class HazardSlowdownController:
 
     def _extend(self, now_monotonic: float) -> None:
         self._hold_until = max(self._hold_until, now_monotonic + self.hold_sec)
+
+
+class RoadSignApproachController:
+    """Apply an independent moving gear until one sign starts its OCR cycle."""
+
+    def __init__(self, speed_state: int, hold_sec: float = 1.0) -> None:
+        self.speed_state = validate_moving_speed_state(
+            speed_state,
+            "ocr.approach_speed_state",
+        )
+        self.hold_sec = float(hold_sec)
+        if not math.isfinite(self.hold_sec) or self.hold_sec < 0.0:
+            raise ValueError(
+                "hazard_slowdown.hold_sec must be finite and non-negative"
+            )
+        self._hold_until = 0.0
+        self._last_detection_result_id: int | None = None
+        self._last_road_sign_present = False
+        self._blocked_until_absent = False
+
+    def observe(
+        self,
+        road_sign_present: bool,
+        detection_result_id: int,
+        now_monotonic: float,
+    ) -> None:
+        """Advance approach/rearm state exactly once per object result."""
+
+        result_id = int(detection_result_id)
+        if result_id == self._last_detection_result_id:
+            return
+        self._last_detection_result_id = result_id
+        present = bool(road_sign_present)
+        now = float(now_monotonic)
+
+        if self._blocked_until_absent:
+            self._hold_until = 0.0
+            if not present:
+                self._blocked_until_absent = False
+            self._last_road_sign_present = present
+            return
+
+        if present or self._last_road_sign_present:
+            self._hold_until = max(self._hold_until, now + self.hold_sec)
+        self._last_road_sign_present = present
+
+    def mark_ocr_started(self) -> None:
+        """Stop approach speed until a fresh result confirms sign absence."""
+
+        self._blocked_until_absent = True
+        self._hold_until = 0.0
+
+    def active(self, now_monotonic: float) -> bool:
+        return (
+            not self._blocked_until_absent
+            and float(now_monotonic) < self._hold_until
+        )
+
+    def merge_speed_state(
+        self,
+        current_override: int | None,
+        now_monotonic: float,
+    ) -> int | None:
+        """Merge approach gear with another moving override using the safer gear."""
+
+        if not self.active(now_monotonic):
+            return current_override
+        if current_override is None:
+            return self.speed_state
+        return min(
+            validate_moving_speed_state(
+                current_override,
+                "speed_state_override",
+            ),
+            self.speed_state,
+        )

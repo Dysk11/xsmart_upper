@@ -39,7 +39,10 @@ from core.object.pedestrian_safety import (
 )
 from core.planning.car_avoidance import CarAvoidancePlanner, CarAvoidanceResult
 from core.planning.gold_target import GoldTargetPlanner, GoldTargetResult
-from core.planning.hazard_slowdown import HazardSlowdownController
+from core.planning.hazard_slowdown import (
+    HazardSlowdownController,
+    RoadSignApproachController,
+)
 from core.planning.path_marker_target import PathMarkerTargetPlanner, PathMarkerTargetResult
 from core.lane.detector import LaneDetectionResult, LaneDetector
 from core.lane.tracker import LaneTracker, TrackedLaneState
@@ -465,7 +468,7 @@ def _ai_inference_worker(
             if item is None:
                 break
 
-            frame_id, captured_at, frame_payload, allow_ocr_inference = item
+            frame_id, captured_at, frame_payload = item
             try:
                 frame_rgb, frame_bgr = _take_shared_ai_frames(
                     frame_payload,
@@ -479,7 +482,6 @@ def _ai_inference_worker(
                         frame_bgr,
                         frame_id,
                         detections,
-                        allow_inference=bool(allow_ocr_inference),
                     )
                     if (
                         ocr_session.last_attempt is not None
@@ -892,6 +894,13 @@ class UpperMachineApp:
                 config.get("hazard_slowdown", {}).get("hold_sec", 1.0)
             )
         )
+        ocr_config = config.get("ocr", {})
+        self.road_sign_approach = RoadSignApproachController(
+            speed_state=ocr_config.get("approach_speed_state", 0x02),
+            hold_sec=float(
+                config.get("hazard_slowdown", {}).get("hold_sec", 1.0)
+            ),
+        )
         self.planner = HighLevelPlanner(config.get("planner", {}))
         bridge_config = config.get("bridge", {})
         self.drive_speed_state = validate_drive_speed_state(
@@ -920,11 +929,9 @@ class UpperMachineApp:
         self.last_gold_result: GoldTargetResult | None = None
         self.last_path_marker_result: PathMarkerTargetResult | None = None
         self.last_car_avoidance_result: CarAvoidanceResult | None = None
-        self.last_confirmed_fork_detected = False
         self.last_ocr_result = OcrResult()
         self.last_ocr_attempt = OcrResult()
         self._last_ocr_event_id = 0
-        ocr_config = config.get("ocr", {})
         self.ocr_stop_latch = OcrStopLatch(
             timeout_sec=float(ocr_config.get("stop_timeout_sec", 20.0))
         )
@@ -1109,7 +1116,6 @@ class UpperMachineApp:
                         self.frame_id,
                         captured_at,
                         ai_frame_payload,
-                        self.last_confirmed_fork_detected,
                     ),
                     release_func=self._release_owned_shared_payload,
                 )
@@ -1125,6 +1131,7 @@ class UpperMachineApp:
                     ocr_trigger.trigger_id,
                     ocr_trigger.started_at,
                 ):
+                    self.road_sign_approach.mark_ocr_started()
                     self.road_sign_analysis_state.cancel_pending(reset_decision=True)
                     self.pending_analysis_trigger_id = 0
                     print(
@@ -1169,12 +1176,17 @@ class UpperMachineApp:
                 ):
                     self.last_ai_frame_id = int(ai_frame_id)
                     self.last_detected_objects = detected_objects
-                    self.hazard_slowdown.observe_ai_result(
+                    hazard_presence = self.hazard_slowdown.observe_ai_result(
                         objects=detected_objects,
                         avoidance_roi_rect=avoidance_roi_rect,
                         pedestrian_min_box_area_px=(
                             self.pedestrian_safety_analyzer.min_box_area_px
                         ),
+                        detection_result_id=self.last_ai_frame_id,
+                        now_monotonic=time.monotonic(),
+                    )
+                    self.road_sign_approach.observe(
+                        road_sign_present=hazard_presence.road_sign,
                         detection_result_id=self.last_ai_frame_id,
                         now_monotonic=time.monotonic(),
                     )
@@ -1266,9 +1278,6 @@ class UpperMachineApp:
                 include_track_boundary_rows=include_track_boundary_rows,
             )
             geometry_ms = (time.perf_counter() - geometry_started) * 1000.0
-            self.last_confirmed_fork_detected = bool(
-                detection_result.fork_result.fork_detected
-            )
             lane_detect_time = time.perf_counter()
 
             # 第 3 步：把当前帧结果和历史结果融合，岔路选中帧优先相信当前分支。
@@ -1290,7 +1299,6 @@ class UpperMachineApp:
                     self.last_pedestrian_safety_result is not None
                     and self.last_pedestrian_safety_result.latched
                 ),
-                road_sign_waiting=self.ocr_stop_latch.active,
             )
             # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
             module_hints = self._collect_future_module_hints(
@@ -1299,8 +1307,13 @@ class UpperMachineApp:
                 detection_result=detection_result,
                 tracked_state=planning_state,
             )
-            module_hints.reduce_one_gear = self.hazard_slowdown.active(
-                time.monotonic()
+            speed_now = time.monotonic()
+            module_hints.reduce_one_gear = self.hazard_slowdown.active(speed_now)
+            module_hints.speed_state_override = (
+                self.road_sign_approach.merge_speed_state(
+                    module_hints.speed_state_override,
+                    speed_now,
+                )
             )
             # 第 5 步：把视觉结果变成“高层目标速度、目标转向”。
             control_command = self.planner.plan(

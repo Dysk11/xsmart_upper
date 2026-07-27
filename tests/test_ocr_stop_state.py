@@ -27,38 +27,58 @@ class FakeLogger:
 
 def make_detection(
     bbox: tuple[int, int, int, int] = (20, 20, 120, 100),
+    *,
+    confidence: float = 0.9,
 ) -> DetectedObject:
     return DetectedObject(
         class_name="road_sign",
-        confidence=0.9,
+        confidence=confidence,
         bbox_frame=bbox,
     )
+
+
+def make_session(
+    results: list[OcrResult],
+    *,
+    now: list[float] | None = None,
+    triggers: list[OcrTrigger] | None = None,
+    **config: object,
+) -> tuple[RoadSignOcrSession, FakeRecognizer]:
+    recognizer = FakeRecognizer(results)
+    session_config: dict[str, object] = {
+        "enable": True,
+        "class_names": ["road_sign"],
+        "bbox_min_confidence": 0.5,
+        "bbox_min_width_px": 1,
+        "bbox_min_height_px": 1,
+        "retry_interval_sec": 0.5,
+        "cooldown_seconds": 0.0,
+        "stop_timeout_sec": 20.0,
+        "accept_score": 0.6,
+    }
+    session_config.update(config)
+    session_kwargs: dict[str, object] = {
+        "recognizer": recognizer,
+        "event_logger": FakeLogger(),
+        "trigger_callback": triggers.append if triggers is not None else None,
+    }
+    if now is not None:
+        session_kwargs["clock"] = lambda: now[0]
+    session = RoadSignOcrSession(session_config, **session_kwargs)
+    return session, recognizer
 
 
 def test_ocr_retries_share_trigger_and_rearm_after_candidate_disappears() -> None:
     now = [0.0]
     triggers: list[OcrTrigger] = []
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "retry_interval_sec": 0.5,
-            "cooldown_seconds": 0.0,
-            "accept_score": 0.6,
-        },
-        recognizer=FakeRecognizer(
-            [
-                OcrResult(frame_id=1, error="retry"),
-                OcrResult(frame_id=2, text="左转", confidence=0.9),
-                OcrResult(frame_id=4, text="右转", confidence=0.9),
-            ]
-        ),
-        event_logger=FakeLogger(),
-        clock=lambda: now[0],
-        trigger_callback=triggers.append,
+    session, recognizer = make_session(
+        [
+            OcrResult(frame_id=1, error="retry"),
+            OcrResult(frame_id=2, text="left", confidence=0.9),
+            OcrResult(frame_id=4, text="right", confidence=0.9),
+        ],
+        now=now,
+        triggers=triggers,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
@@ -66,6 +86,7 @@ def test_ocr_retries_share_trigger_and_rearm_after_candidate_disappears() -> Non
     now[0] = 0.5
     accepted = session.update(frame, 2, [make_detection()])
 
+    assert recognizer.call_count == 2
     assert [item.trigger_id for item in triggers] == [1]
     assert triggers[0].started_at == 0.0
     assert accepted is not None and accepted.trigger_id == 1
@@ -73,6 +94,8 @@ def test_ocr_retries_share_trigger_and_rearm_after_candidate_disappears() -> Non
     session.update(frame, 3, [])
     now[0] = 0.6
     second = session.update(frame, 4, [make_detection()])
+
+    assert recognizer.call_count == 3
     assert [item.trigger_id for item in triggers] == [1, 2]
     assert triggers[1].started_at == 0.6
     assert second is not None and second.trigger_id == 2
@@ -90,232 +113,67 @@ def test_stop_latch_duplicate_trigger_does_not_reset_timeout() -> None:
     assert latch.start(8, 121.0)
 
 
-def test_road_sign_stops_before_fork_but_does_not_start_ocr() -> None:
+def test_missing_or_ineligible_road_sign_does_not_start_ocr() -> None:
     triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer([OcrResult(frame_id=2, text="left", confidence=0.9)])
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "cooldown_seconds": 20.0,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        trigger_callback=triggers.append,
+    session, recognizer = make_session(
+        [OcrResult(frame_id=3, text="left", confidence=0.9)],
+        triggers=triggers,
+        bbox_min_confidence=0.8,
+        bbox_min_width_px=100,
+        bbox_min_height_px=50,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
-    assert session.update(frame, 1, [make_detection()], allow_inference=False) is None
-    assert recognizer.call_count == 0
-    assert len(triggers) == 1
-
-    accepted = session.update(frame, 2, [make_detection()], allow_inference=True)
-    assert recognizer.call_count == 1
-    assert len(triggers) == 1
-    assert accepted is not None and accepted.trigger_id == triggers[0].trigger_id
-
-
-def test_confirmed_fork_without_road_sign_does_not_start_ocr() -> None:
-    triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer([OcrResult(frame_id=1, text="left", confidence=0.9)])
-    session = RoadSignOcrSession(
-        {"enable": True, "class_names": ["road_sign"]},
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        trigger_callback=triggers.append,
-    )
-    frame = np.zeros((140, 160, 3), dtype=np.uint8)
-
-    assert session.update(frame, 1, [], allow_inference=True) is None
-    assert recognizer.call_count == 0
-    assert triggers == []
-
-
-def test_started_ocr_cycle_keeps_retrying_if_fork_detection_flickers() -> None:
-    now = [0.0]
-    triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer(
-        [
-            OcrResult(frame_id=1, error="retry"),
-            OcrResult(frame_id=2, text="right", confidence=0.9),
-        ]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "retry_interval_sec": 0.5,
-            "cooldown_seconds": 0.0,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        clock=lambda: now[0],
-        trigger_callback=triggers.append,
-    )
-    frame = np.zeros((140, 160, 3), dtype=np.uint8)
-
-    session.update(frame, 1, [make_detection()], allow_inference=True)
-    now[0] = 0.5
-    accepted = session.update(frame, 2, [make_detection()], allow_inference=False)
-
-    assert recognizer.call_count == 2
-    assert len(triggers) == 1
-    assert accepted is not None and accepted.trigger_id == triggers[0].trigger_id
-
-
-def test_ocr_waits_for_two_stable_area_deltas_and_confirmed_fork() -> None:
-    triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer(
-        [OcrResult(frame_id=4, text="left", confidence=0.9)]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_threshold_ratio": 0.10,
-            "bbox_area_stability_confirm_deltas": 2,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        trigger_callback=triggers.append,
-    )
-    frame = np.zeros((160, 180, 3), dtype=np.uint8)
-
-    session.update(
-        frame,
-        1,
-        [make_detection((20, 20, 120, 100))],
-        allow_inference=False,
-    )
+    session.update(frame, 1, [])
     session.update(
         frame,
         2,
-        [make_detection((20, 20, 125, 100))],
-        allow_inference=True,
+        [make_detection((20, 20, 80, 60), confidence=0.9)],
     )
     session.update(
         frame,
         3,
-        [make_detection((20, 20, 128, 100))],
-        allow_inference=False,
+        [make_detection((20, 20, 130, 90), confidence=0.7)],
     )
-
-    assert len(triggers) == 1
-    assert recognizer.call_count == 0
-
-    accepted = session.update(
-        frame,
-        4,
-        [make_detection((20, 20, 130, 100))],
-        allow_inference=True,
-    )
-    assert recognizer.call_count == 1
-    assert accepted is not None
-    assert accepted.trigger_id == triggers[0].trigger_id
-
-
-def test_missing_or_unstable_sign_resets_area_confirmation() -> None:
-    recognizer = FakeRecognizer(
-        [OcrResult(frame_id=7, text="right", confidence=0.9)]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_threshold_ratio": 0.10,
-            "bbox_area_stability_confirm_deltas": 2,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-    )
-    frame = np.zeros((180, 200, 3), dtype=np.uint8)
-
-    session.update(frame, 1, [make_detection()])
-    session.update(frame, 2, [make_detection((20, 20, 125, 100))])
-    session.update(frame, 3, [])
-    session.update(frame, 4, [make_detection((20, 20, 160, 120))])
-    session.update(frame, 5, [make_detection((20, 20, 120, 100))])
-    session.update(frame, 6, [make_detection((20, 20, 125, 100))])
 
     assert recognizer.call_count == 0
-    accepted = session.update(
-        frame,
-        7,
-        [make_detection((20, 20, 128, 100))],
-    )
-    assert recognizer.call_count == 1
-    assert accepted is not None
+    assert triggers == []
 
 
-def test_horizontal_edge_sign_triggers_stop_but_waits_for_full_entry() -> None:
+def test_horizontal_edge_waits_then_starts_ocr_immediately_on_full_entry() -> None:
     triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer(
-        [OcrResult(frame_id=6, text="left", confidence=0.9)]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_threshold_ratio": 0.10,
-            "bbox_area_stability_confirm_deltas": 2,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        trigger_callback=triggers.append,
+    session, recognizer = make_session(
+        [OcrResult(frame_id=3, text="left", confidence=0.9)],
+        triggers=triggers,
+        bbox_min_width_px=80,
+        bbox_min_height_px=50,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
     session.update(frame, 1, [make_detection((0, 20, 100, 100))])
-    session.update(frame, 2, [make_detection((0, 20, 102, 100))])
-    session.update(frame, 3, [make_detection((60, 20, 159, 100))])
+    session.update(frame, 2, [make_detection((60, 20, 159, 100))])
 
-    assert len(triggers) == 1
-    assert triggers[0].frame_id == 1
     assert recognizer.call_count == 0
+    assert triggers == []
 
-    session.update(frame, 4, [make_detection((1, 20, 158, 100))])
-    session.update(frame, 5, [make_detection((2, 20, 157, 100))])
-    accepted = session.update(frame, 6, [make_detection((3, 20, 156, 100))])
+    accepted = session.update(
+        frame,
+        3,
+        [make_detection((1, 20, 158, 100))],
+    )
 
-    assert len(triggers) == 1
     assert recognizer.call_count == 1
+    assert len(triggers) == 1
+    assert triggers[0].frame_id == 3
     assert accepted is not None
-    assert accepted.frame_id == 6
     assert accepted.trigger_id == triggers[0].trigger_id
 
 
 def test_top_and_bottom_edges_do_not_block_ocr() -> None:
-    recognizer = FakeRecognizer(
-        [OcrResult(frame_id=1, text="right", confidence=0.9)]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
+    triggers: list[OcrTrigger] = []
+    session, recognizer = make_session(
+        [OcrResult(frame_id=1, text="right", confidence=0.9)],
+        triggers=triggers,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
@@ -326,32 +184,20 @@ def test_top_and_bottom_edges_do_not_block_ocr() -> None:
     )
 
     assert recognizer.call_count == 1
+    assert len(triggers) == 1
     assert accepted is not None
 
 
-def test_edge_frame_pauses_ocr_retry_until_sign_reenters() -> None:
+def test_edge_frame_pauses_retry_without_creating_another_trigger() -> None:
     now = [0.0]
     triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer(
+    session, recognizer = make_session(
         [
             OcrResult(frame_id=1, error="retry"),
             OcrResult(frame_id=3, text="right", confidence=0.9),
-        ]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "retry_interval_sec": 0.5,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        clock=lambda: now[0],
-        trigger_callback=triggers.append,
+        ],
+        now=now,
+        triggers=triggers,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
@@ -376,34 +222,54 @@ def test_edge_frame_pauses_ocr_retry_until_sign_reenters() -> None:
 
 def test_edge_highest_priority_candidate_discards_entire_frame() -> None:
     triggers: list[OcrTrigger] = []
-    recognizer = FakeRecognizer(
-        [OcrResult(frame_id=2, text="left", confidence=0.9)]
-    )
-    session = RoadSignOcrSession(
-        {
-            "enable": True,
-            "class_names": ["road_sign"],
-            "bbox_min_width_px": 1,
-            "bbox_min_height_px": 1,
-            "bbox_area_stability_confirm_deltas": 0,
-            "accept_score": 0.6,
-        },
-        recognizer=recognizer,
-        event_logger=FakeLogger(),
-        trigger_callback=triggers.append,
+    session, recognizer = make_session(
+        [OcrResult(frame_id=2, text="left", confidence=0.9)],
+        triggers=triggers,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
-    edge_candidate = make_detection((0, 20, 100, 100))
-    inside_candidate = make_detection((20, 20, 120, 100))
-    inside_candidate.confidence = 0.8
+    edge_candidate = make_detection(
+        (0, 20, 100, 100),
+        confidence=0.9,
+    )
+    inside_candidate = make_detection(
+        (20, 20, 120, 100),
+        confidence=0.8,
+    )
 
     session.update(frame, 1, [edge_candidate, inside_candidate])
 
     assert recognizer.call_count == 0
-    assert len(triggers) == 1
+    assert triggers == []
 
     accepted = session.update(frame, 2, [inside_candidate])
 
     assert recognizer.call_count == 1
     assert len(triggers) == 1
     assert accepted is not None
+
+
+def test_timeout_suppresses_same_visible_sign_until_it_disappears() -> None:
+    now = [0.0]
+    triggers: list[OcrTrigger] = []
+    session, recognizer = make_session(
+        [
+            OcrResult(frame_id=1, error="retry"),
+            OcrResult(frame_id=4, text="left", confidence=0.9),
+        ],
+        now=now,
+        triggers=triggers,
+        retry_interval_sec=100.0,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+
+    session.update(frame, 1, [make_detection()])
+    now[0] = 20.0
+    session.update(frame, 2, [make_detection()])
+    now[0] = 20.1
+    session.update(frame, 3, [])
+    accepted = session.update(frame, 4, [make_detection()])
+
+    assert recognizer.call_count == 2
+    assert [item.trigger_id for item in triggers] == [1, 2]
+    assert accepted is not None
+    assert accepted.trigger_id == 2

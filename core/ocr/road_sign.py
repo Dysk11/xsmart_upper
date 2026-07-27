@@ -198,26 +198,10 @@ class RoadSignOcrSession:
         self.bbox_min_width_px = max(1, int(config.get("bbox_min_width_px", 96)))
         self.bbox_min_height_px = max(1, int(config.get("bbox_min_height_px", 48)))
         self.bbox_padding_ratio = max(0.0, float(config.get("bbox_padding_ratio", 0.10)))
-        self.bbox_area_stability_threshold_ratio = float(
-            config.get("bbox_area_stability_threshold_ratio", 0.10)
-        )
-        self.bbox_area_stability_confirm_deltas = int(
-            config.get("bbox_area_stability_confirm_deltas", 2)
-        )
         self.accept_score = float(config.get("accept_score", 0.60))
         self.retry_interval_sec = float(config.get("retry_interval_sec", 0.50))
         self.cooldown_seconds = float(config.get("cooldown_seconds", 20.0))
         self.stop_timeout_sec = float(config.get("stop_timeout_sec", 20.0))
-        if (
-            not 0.0 <= self.bbox_area_stability_threshold_ratio <= 1.0
-        ):
-            raise ValueError(
-                "ocr.bbox_area_stability_threshold_ratio must be between 0 and 1"
-            )
-        if self.bbox_area_stability_confirm_deltas < 0:
-            raise ValueError(
-                "ocr.bbox_area_stability_confirm_deltas must be non-negative"
-            )
         if self.retry_interval_sec < 0:
             raise ValueError("ocr.retry_interval_sec must not be negative")
         if self.cooldown_seconds < 0:
@@ -245,16 +229,12 @@ class RoadSignOcrSession:
         self._active_trigger_id = 0
         self._trigger_started_at = 0.0
         self._cycle_completed = False
-        self._ocr_started = False
-        self._previous_detection_area_px: float | None = None
-        self._stable_area_delta_count = 0
 
     def update(
         self,
         frame: np.ndarray,
         frame_id: int,
         detections: Sequence[DetectedObject],
-        allow_inference: bool = True,
     ) -> OcrResult | None:
         """Advance OCR state using detections and pixels from the same frame."""
 
@@ -267,7 +247,7 @@ class RoadSignOcrSession:
             and not self._cycle_completed
             and now - self._trigger_started_at >= self.stop_timeout_sec
         ):
-            self._reset_cycle()
+            self._cycle_completed = True
 
         if self._pending_log_result is not None:
             if now >= self._next_retry_at:
@@ -282,19 +262,30 @@ class RoadSignOcrSession:
             self.bbox_min_height_px,
         )
         if candidate is None:
-            self._reset_area_stability()
             if self._cycle_completed:
                 self._reset_cycle()
             return self._last_result
         if now < self._cooldown_until or self._cycle_completed:
             return self._last_result
 
+        shape = getattr(frame, "shape", ())
+        frame_width = int(shape[1]) if len(shape) >= 2 else 0
+        x1, _, x2, _ = candidate.bbox
+        if frame_width <= 0 or x1 <= 0 or x2 >= frame_width - 1:
+            return self._last_result
+
+        crop = crop_road_sign_candidate(
+            frame,
+            candidate,
+            self.bbox_padding_ratio,
+        )
+        if crop is None:
+            return self._last_result
+
         if self._active_trigger_id == 0:
             self._trigger_counter += 1
             self._active_trigger_id = self._trigger_counter
             self._trigger_started_at = now
-            self._ocr_started = False
-            self._reset_area_stability()
             if self.trigger_callback is not None:
                 self.trigger_callback(
                     OcrTrigger(
@@ -304,29 +295,6 @@ class RoadSignOcrSession:
                     )
                 )
 
-        shape = getattr(frame, "shape", ())
-        frame_width = int(shape[1]) if len(shape) >= 2 else 0
-        x1, _, x2, _ = candidate.bbox
-        if frame_width <= 0 or x1 <= 0 or x2 >= frame_width - 1:
-            self._reset_area_stability()
-            return self._last_result
-
-        crop = crop_road_sign_candidate(
-            frame,
-            candidate,
-            self.bbox_padding_ratio,
-        )
-        if crop is None:
-            self._reset_area_stability()
-            return self._last_result
-
-        if not self._ocr_started:
-            area_stable = self._observe_detection_area(crop.detection_area_px)
-            if not area_stable or not allow_inference:
-                return self._last_result
-            self._ocr_started = True
-
-        # Once OCR starts, retries remain active even if fork detection flickers.
         if now < self._next_retry_at:
             return self._last_result
 
@@ -356,36 +324,11 @@ class RoadSignOcrSession:
         self._publish_pending(now)
         return self._last_result
 
-    def _observe_detection_area(self, area_px: float) -> bool:
-        area = float(area_px)
-        if self.bbox_area_stability_confirm_deltas == 0:
-            self._previous_detection_area_px = area
-            return True
-        previous = self._previous_detection_area_px
-        self._previous_detection_area_px = area
-        if previous is None or previous <= 0.0:
-            self._stable_area_delta_count = 0
-            return False
-        relative_delta = abs(area - previous) / previous
-        if relative_delta <= self.bbox_area_stability_threshold_ratio:
-            self._stable_area_delta_count += 1
-        else:
-            self._stable_area_delta_count = 0
-        return (
-            self._stable_area_delta_count
-            >= self.bbox_area_stability_confirm_deltas
-        )
-
-    def _reset_area_stability(self) -> None:
-        self._previous_detection_area_px = None
-        self._stable_area_delta_count = 0
-
     def _reset_cycle(self) -> None:
         self._active_trigger_id = 0
         self._trigger_started_at = 0.0
         self._cycle_completed = False
-        self._ocr_started = False
-        self._reset_area_stability()
+        self._next_retry_at = 0.0
 
     def _publish_pending(self, now: float) -> None:
         assert self._pending_log_result is not None
