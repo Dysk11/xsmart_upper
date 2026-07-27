@@ -1302,10 +1302,20 @@ class UpperMachineApp:
                 roi_rect=roi_rect,
                 detection_result=detection_result,
                 tracked_state=planning_state,
-                track_mask_visible=bool(np.any(roi_mask)),
+            )
+            module_hints.reduce_one_gear = self.hazard_slowdown.active(
+                time.monotonic()
             )
             # 第 5 步：把视觉结果变成“高层目标速度、目标转向”。
-            control_command = self.planner.plan(planning_state, module_hints=module_hints)
+            control_command = self.planner.plan(
+                planning_state,
+                module_hints=module_hints,
+                line_lost=(
+                    tracked_state.is_lane_lost
+                    or not bool(np.any(roi_mask))
+                ),
+                now_monotonic=time.monotonic(),
+            )
             planning_finished = time.perf_counter()
 
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
@@ -1644,10 +1654,7 @@ class UpperMachineApp:
             "speed_state": resolve_configured_speed_state(
                 control_command.target_speed,
                 self.drive_speed_state,
-                reduce_one_gear=(
-                    control_command.reduce_one_gear
-                    or self.hazard_slowdown.active(time.monotonic())
-                ),
+                reduce_one_gear=control_command.reduce_one_gear,
             ),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
@@ -1662,7 +1669,6 @@ class UpperMachineApp:
         roi_rect: tuple[int, int, int, int],
         detection_result: Any,
         tracked_state: TrackedLaneState,
-        track_mask_visible: bool = True,
     ) -> ModuleHints:
         """为后续目标检测、OCR、红绿灯和金币规划模块预留提示接口。
 
@@ -1682,7 +1688,6 @@ class UpperMachineApp:
         _ = roi_rect
         _ = tracked_state
         safety_stop_hint = build_safety_stop_hint(
-            track_mask_visible=track_mask_visible,
             pedestrian_safety_result=self.last_pedestrian_safety_result,
             road_sign_waiting=self.ocr_stop_latch.active,
         )

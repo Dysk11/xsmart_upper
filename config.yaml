@@ -75,7 +75,7 @@ lane_geometry:
     split_enter_ratio: 0.15
     split_exit_ratio: 0.10
     split_min_rows: 5
-    roughness_threshold_px: 3.0
+    roughness_threshold_px: 2.0
     roughness_tie_margin_px: 0.1
 
 avoidance_roi:
@@ -209,8 +209,7 @@ planner:
   confidence_speed_gain: 0.7
   caution_confidence_threshold: 0.55
   lateral_error_slowdown_threshold_px: 83
-  lost_speed: 0.25
-  lost_steer_decay: 0.6
+  line_loss_hold_sec: 0.5
 
 # Communication and output
 bridge:

@@ -4,7 +4,7 @@ import pytest
 
 from core.io.protocol import resolve_configured_speed_state
 from core.lane.tracker import TrackedLaneState
-from core.planning.high_level import HighLevelPlanner, build_off_track_stop_hint
+from core.planning.high_level import HighLevelPlanner, ModuleHints
 
 
 def make_tracked_state(
@@ -24,33 +24,166 @@ def make_tracked_state(
     )
 
 
-def test_empty_track_mask_stops_immediately_with_highest_priority_mode() -> None:
-    planner = HighLevelPlanner({"lost_speed": 0.25})
-    hint = build_off_track_stop_hint(track_mask_visible=False)
+def test_initial_lane_loss_stops_when_no_valid_command_exists() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.5})
 
-    assert hint is not None and hint.stop
-    command = planner.plan(make_tracked_state(lane_lost=True), hint)
+    command = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=10.0,
+    )
     assert command.mode == "OFF_TRACK_STOP"
     assert command.target_speed == 0.0
     assert command.steer_deg == 0.0
 
 
-def test_nonempty_track_mask_releases_off_track_stop() -> None:
-    planner = HighLevelPlanner({"base_speed": 1.6, "min_speed": 0.45})
+@pytest.mark.parametrize(
+    ("tracked_lane_lost", "raw_line_lost"),
+    [(True, False), (False, True)],
+)
+def test_short_line_loss_holds_last_speed_steer_and_gear(
+    tracked_lane_lost: bool,
+    raw_line_lost: bool,
+) -> None:
+    planner = HighLevelPlanner(
+        {
+            "line_loss_hold_sec": 0.5,
+            "lateral_error_slowdown_threshold_px": 83.0,
+        }
+    )
+    valid = planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+    planner.plan(
+        make_tracked_state(lane_lost=tracked_lane_lost),
+        line_lost=raw_line_lost,
+        now_monotonic=10.1,
+    )
 
-    assert build_off_track_stop_hint(track_mask_visible=True) is None
-    command = planner.plan(make_tracked_state())
-    assert command.mode != "OFF_TRACK_STOP"
-    assert command.target_speed > 0.0
+    held = planner.plan(
+        make_tracked_state(lane_lost=tracked_lane_lost),
+        line_lost=raw_line_lost,
+        now_monotonic=10.59,
+    )
+
+    assert held.mode == "LANE_LOST_HOLD"
+    assert held.target_speed == valid.target_speed
+    assert held.steer_deg == valid.steer_deg
+    assert held.reduce_one_gear is valid.reduce_one_gear
+    assert resolve_configured_speed_state(
+        held.target_speed,
+        3,
+        reduce_one_gear=held.reduce_one_gear,
+    ) == resolve_configured_speed_state(
+        valid.target_speed,
+        3,
+        reduce_one_gear=valid.reduce_one_gear,
+    )
 
 
-def test_geometric_lane_loss_with_visible_mask_keeps_existing_lost_behavior() -> None:
-    planner = HighLevelPlanner({"lost_speed": 0.25})
+def test_line_loss_stops_exactly_at_timeout() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.5})
+    planner.plan(make_tracked_state(), now_monotonic=10.0)
+    planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=11.0,
+    )
 
-    hint = build_off_track_stop_hint(track_mask_visible=True)
-    command = planner.plan(make_tracked_state(lane_lost=True), hint)
-    assert command.mode == "LANE_LOST"
-    assert command.target_speed == 0.25
+    command = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=11.5,
+    )
+
+    assert command.mode == "OFF_TRACK_STOP"
+    assert command.target_speed == 0.0
+    assert command.steer_deg == 0.0
+    assert not command.reduce_one_gear
+
+
+def test_zero_hold_duration_stops_on_first_lost_frame() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.0})
+    planner.plan(make_tracked_state(), now_monotonic=10.0)
+
+    command = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=10.1,
+    )
+
+    assert command.mode == "OFF_TRACK_STOP"
+    assert command.target_speed == 0.0
+
+
+def test_line_recovery_resets_loss_timer_and_refreshes_cached_control() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.5})
+    first = planner.plan(
+        make_tracked_state(lateral_error_px=4.0),
+        now_monotonic=10.0,
+    )
+    held_first = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=10.1,
+    )
+    recovered = planner.plan(
+        make_tracked_state(lateral_error_px=20.0),
+        now_monotonic=10.7,
+    )
+    held_recovered = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=11.1,
+    )
+
+    assert held_first.steer_deg == first.steer_deg
+    assert recovered.steer_deg != first.steer_deg
+    assert held_recovered.mode == "LANE_LOST_HOLD"
+    assert held_recovered.steer_deg == recovered.steer_deg
+
+
+def test_safety_stop_overrides_hold_without_resetting_loss_timer() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.5})
+    planner.plan(make_tracked_state(), now_monotonic=10.0)
+    safety_hint = ModuleHints(stop=True, force_mode="PEDESTRIAN_WAIT")
+
+    stopped = planner.plan(
+        make_tracked_state(lane_lost=True),
+        safety_hint,
+        now_monotonic=11.0,
+    )
+    still_lost = planner.plan(
+        make_tracked_state(lane_lost=True),
+        now_monotonic=11.5,
+    )
+
+    assert stopped.mode == "PEDESTRIAN_WAIT"
+    assert stopped.target_speed == 0.0
+    assert still_lost.mode == "OFF_TRACK_STOP"
+
+
+def test_non_stop_hints_cannot_modify_held_control() -> None:
+    planner = HighLevelPlanner({"line_loss_hold_sec": 0.5})
+    valid = planner.plan(
+        make_tracked_state(),
+        ModuleHints(
+            speed_limit=0.45,
+            steer_offset_deg=3.0,
+            reduce_one_gear=True,
+        ),
+        now_monotonic=10.0,
+    )
+
+    held = planner.plan(
+        make_tracked_state(lane_lost=True),
+        ModuleHints(
+            speed_limit=0.1,
+            steer_offset_deg=-10.0,
+            reduce_one_gear=False,
+        ),
+        now_monotonic=10.1,
+    )
+
+    assert held.mode == "LANE_LOST_HOLD"
+    assert held.target_speed == valid.target_speed
+    assert held.steer_deg == valid.steer_deg
+    assert held.reduce_one_gear is valid.reduce_one_gear
 
 
 def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
@@ -126,7 +259,7 @@ def test_stop_overrides_lateral_error_gear_reduction() -> None:
     planner = HighLevelPlanner(
         {"lateral_error_slowdown_threshold_px": 83.0}
     )
-    hint = build_off_track_stop_hint(track_mask_visible=False)
+    hint = ModuleHints(stop=True, force_mode="OFF_TRACK_STOP")
 
     command = planner.plan(
         make_tracked_state(lateral_error_px=100.0),
@@ -143,6 +276,15 @@ def test_stop_overrides_lateral_error_gear_reduction() -> None:
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "invalid_hold_sec",
+    [-1.0, float("inf"), float("-inf"), float("nan")],
+)
+def test_invalid_line_loss_hold_sec_is_rejected(invalid_hold_sec: float) -> None:
+    with pytest.raises(ValueError, match="line_loss_hold_sec"):
+        HighLevelPlanner({"line_loss_hold_sec": invalid_hold_sec})
 
 
 @pytest.mark.parametrize(

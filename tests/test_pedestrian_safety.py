@@ -1215,7 +1215,6 @@ def test_three_second_cooldown_ignores_results_and_requires_new_result_after_exp
 
 def test_pedestrian_wait_produces_zero_speed_and_stop_protocol_state() -> None:
     hint = build_safety_stop_hint(
-        track_mask_visible=True,
         pedestrian_safety_result=stop_result(),
         road_sign_waiting=True,
     )
@@ -1229,13 +1228,18 @@ def test_pedestrian_wait_produces_zero_speed_and_stop_protocol_state() -> None:
     assert resolve_configured_speed_state(command.target_speed, 2) == 0
 
 
-def test_off_track_stop_has_priority_over_pedestrian_wait() -> None:
+def test_pedestrian_wait_has_priority_over_line_loss_hold() -> None:
     hint = build_safety_stop_hint(
-        track_mask_visible=False,
         pedestrian_safety_result=stop_result(),
         road_sign_waiting=True,
     )
 
     assert hint is not None
     assert hint.stop
-    assert hint.force_mode == "OFF_TRACK_STOP"
+    command = HighLevelPlanner({}).plan(
+        make_tracked_state(),
+        hint,
+        line_lost=True,
+        now_monotonic=1.0,
+    )
+    assert command.mode == "PEDESTRIAN_WAIT"

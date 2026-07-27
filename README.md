@@ -113,7 +113,7 @@ camera:
 
 - `lateral_gain` / `heading_gain`: 高层转向合成权重
 - `base_speed` / `max_speed` / `min_speed`: 速度策略范围
-- `lost_speed`: 丢线时保守速度
+- `line_loss_hold_sec`: 短时丢线保持上一有效控制量的秒数，超时后停车
 - `lateral_error_slowdown_threshold_px`: 原始横向误差达到该绝对值时降一档，默认 `83`
 
 ### 5. `bridge`

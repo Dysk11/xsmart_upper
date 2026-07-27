@@ -34,31 +34,16 @@ class ModuleHints:
     steer_offset_deg: float = 0.0
     force_mode: str | None = None
     stop: bool = False
+    reduce_one_gear: bool = False
     note: str = ""
 
 
-def build_off_track_stop_hint(track_mask_visible: bool) -> ModuleHints | None:
-    """Return the highest-priority stop hint when segmentation sees no track."""
-
-    if track_mask_visible:
-        return None
-    return ModuleHints(
-        stop=True,
-        force_mode="OFF_TRACK_STOP",
-        note="lane segmentation produced an empty ROI mask",
-    )
-
-
 def build_safety_stop_hint(
-    track_mask_visible: bool,
     pedestrian_safety_result: Any | None = None,
     road_sign_waiting: bool = False,
 ) -> ModuleHints | None:
     """Select the active stop request in safety-priority order."""
 
-    off_track_hint = build_off_track_stop_hint(track_mask_visible)
-    if off_track_hint is not None:
-        return off_track_hint
     if (
         pedestrian_safety_result is not None
         and bool(getattr(pedestrian_safety_result, "stop_required", False))
@@ -144,9 +129,16 @@ class HighLevelPlanner:
                 "must be finite and non-negative"
             )
 
-        self.lost_speed = float(config.get("lost_speed", 0.25))
-        self.lost_steer_decay = float(config.get("lost_steer_decay", 0.6))
-        self.last_steer_deg = 0.0
+        self.line_loss_hold_sec = float(config.get("line_loss_hold_sec", 0.5))
+        if (
+            not math.isfinite(self.line_loss_hold_sec)
+            or self.line_loss_hold_sec < 0.0
+        ):
+            raise ValueError(
+                "planner.line_loss_hold_sec must be finite and non-negative"
+            )
+        self.last_valid_command: ControlCommand | None = None
+        self.line_loss_started_at: float | None = None
 
     @staticmethod
     def _parse_lateral_error_amplification(
@@ -221,12 +213,17 @@ class HighLevelPlanner:
         self,
         tracked_state: TrackedLaneState,
         module_hints: ModuleHints | None = None,
+        *,
+        line_lost: bool = False,
+        now_monotonic: float | None = None,
     ) -> ControlCommand:
         """根据平滑后的巡线状态生成一帧高层控制量。
 
         输入:
             tracked_state: 时序平滑后的巡线状态。
             module_hints: 其他高层模块给出的附加提示，例如限速、强制模式或转向补偿。
+            line_lost: 原始感知链路补充的丢线信号，例如 ROI 掩膜为空。
+            now_monotonic: 可选单调时钟值，主要用于确定性测试。
 
         输出:
             返回 ControlCommand，其中只包含目标速度和目标转向等高层量。
@@ -234,17 +231,41 @@ class HighLevelPlanner:
 
         module_hints = module_hints or ModuleHints()
         ts_ms = int(time.time() * 1000)
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        effective_line_lost = bool(line_lost or tracked_state.is_lane_lost)
+
+        if effective_line_lost:
+            if self.line_loss_started_at is None:
+                self.line_loss_started_at = now
+        else:
+            self.line_loss_started_at = None
 
         if module_hints.stop:
             # 预留给红灯、停车标志等场景：上层模块可以直接要求停车。
             steer_deg = 0.0
             target_speed = 0.0
             mode = module_hints.force_mode or "MODULE_STOP"
-        elif tracked_state.is_lane_lost:
-            # 丢线时不要激进，速度降下来，方向逐渐回正。
-            steer_deg = self.last_steer_deg * self.lost_steer_decay
-            target_speed = self.lost_speed
-            mode = "LANE_LOST"
+        elif effective_line_lost:
+            # 短时丢线保持最后一次有效控制；无历史值或超时后安全停车。
+            elapsed = max(0.0, now - float(self.line_loss_started_at))
+            if (
+                self.last_valid_command is not None
+                and elapsed < self.line_loss_hold_sec
+            ):
+                return ControlCommand(
+                    ts_ms=ts_ms,
+                    mode="LANE_LOST_HOLD",
+                    target_speed=self.last_valid_command.target_speed,
+                    steer_deg=self.last_valid_command.steer_deg,
+                    reduce_one_gear=self.last_valid_command.reduce_one_gear,
+                )
+            return ControlCommand(
+                ts_ms=ts_ms,
+                mode="OFF_TRACK_STOP",
+                target_speed=0.0,
+                steer_deg=0.0,
+                reduce_one_gear=False,
+            )
         else:
             # 这里只做高层合成，不做底层 PID。
             amplified_lateral_error_px = self._amplify_lateral_error(
@@ -277,15 +298,17 @@ class HighLevelPlanner:
         if module_hints.force_mode:
             mode = module_hints.force_mode
 
-        self.last_steer_deg = steer_deg
-        reduce_one_gear = (
+        reduce_one_gear = bool(module_hints.reduce_one_gear) or (
             abs(float(tracked_state.lateral_error_px))
             >= self.lateral_error_slowdown_threshold_px
         )
-        return ControlCommand(
+        command = ControlCommand(
             ts_ms=ts_ms,
             mode=mode,
             target_speed=float(target_speed),
             steer_deg=float(steer_deg),
             reduce_one_gear=reduce_one_gear,
         )
+        if not module_hints.stop and not effective_line_lost:
+            self.last_valid_command = command
+        return command
