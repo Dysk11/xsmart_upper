@@ -135,7 +135,7 @@ ocr:
 
 # Planning
 target_selector:
-  fixed_target_y: 40
+  fixed_target_y: 50
   max_extrapolation_y_px: 40
   max_extrapolation_x_px: 60
 
@@ -195,7 +195,7 @@ planner:
   heading_gain: 0.85
   lateral_error_amplification:
     thresholds_px: [9, 20, 36, 48, 83, 120]
-    multipliers: [1, 1, 1, 1, 1, 1, 2]
+    multipliers: [0.9, 0.9, 0.9, 1.1, 1.5, 2.5, 3.5]
   max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2
