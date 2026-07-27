@@ -54,7 +54,7 @@ lane_geometry:
     min_valid_points: 6
     default_lane_width_px: 60
     perspective_width_top_px: 75
-    perspective_width_bottom_px: 260
+    perspective_width_bottom_px: 270
     lookahead_ratio: 0.45
   track_selection:
     switch_threshold_px: 80
@@ -135,7 +135,7 @@ ocr:
 
 # Planning
 target_selector:
-  fixed_target_y: 80
+  fixed_target_y: 40
   max_extrapolation_y_px: 40
   max_extrapolation_x_px: 60
 
@@ -195,7 +195,7 @@ planner:
   heading_gain: 0.85
   lateral_error_amplification:
     thresholds_px: [9, 20, 36, 48, 83, 120]
-    multipliers: [0.199, 0.529, 0.99, 1.39, 1.58, 1.88, 2.5]
+    multipliers: [1, 1, 1, 1, 1, 1, 2]
   max_steer_deg: 35.0
   base_speed: 1.6
   max_speed: 2.2
@@ -208,7 +208,7 @@ planner:
 
 # Communication and output
 bridge:
-  type: mock
+  type: serial
   drive_speed_state: 2
   serial:
     port: /dev/ttyUSB0
@@ -235,7 +235,7 @@ visualizer:
   save_dir: outputs/visual
   video_name: xsmart.mp4
   video_fourcc: mp4v
-  video_fps: 50
+  video_fps: 25
   frame_stride: 1
 
 logger:
