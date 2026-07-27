@@ -1644,7 +1644,10 @@ class UpperMachineApp:
             "speed_state": resolve_configured_speed_state(
                 control_command.target_speed,
                 self.drive_speed_state,
-                reduce_one_gear=self.hazard_slowdown.active(time.monotonic()),
+                reduce_one_gear=(
+                    control_command.reduce_one_gear
+                    or self.hazard_slowdown.active(time.monotonic())
+                ),
             ),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,

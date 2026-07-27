@@ -23,6 +23,7 @@ class ControlCommand:
     mode: str
     target_speed: float
     steer_deg: float
+    reduce_one_gear: bool
 
 
 @dataclass
@@ -131,6 +132,17 @@ class HighLevelPlanner:
         self.heading_speed_gain = float(config.get("heading_speed_gain", 0.03))
         self.confidence_speed_gain = float(config.get("confidence_speed_gain", 0.7))
         self.caution_confidence_threshold = float(config.get("caution_confidence_threshold", 0.55))
+        self.lateral_error_slowdown_threshold_px = float(
+            config.get("lateral_error_slowdown_threshold_px", 83.0)
+        )
+        if (
+            not math.isfinite(self.lateral_error_slowdown_threshold_px)
+            or self.lateral_error_slowdown_threshold_px < 0.0
+        ):
+            raise ValueError(
+                "planner.lateral_error_slowdown_threshold_px "
+                "must be finite and non-negative"
+            )
 
         self.lost_speed = float(config.get("lost_speed", 0.25))
         self.lost_steer_decay = float(config.get("lost_steer_decay", 0.6))
@@ -266,9 +278,14 @@ class HighLevelPlanner:
             mode = module_hints.force_mode
 
         self.last_steer_deg = steer_deg
+        reduce_one_gear = (
+            abs(float(tracked_state.lateral_error_px))
+            >= self.lateral_error_slowdown_threshold_px
+        )
         return ControlCommand(
             ts_ms=ts_ms,
             mode=mode,
             target_speed=float(target_speed),
             steer_deg=float(steer_deg),
+            reduce_one_gear=reduce_one_gear,
         )

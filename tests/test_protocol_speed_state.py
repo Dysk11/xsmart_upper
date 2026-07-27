@@ -100,6 +100,30 @@ def test_hazard_slowdown_reduces_exactly_one_moving_gear(
     )
 
 
+@pytest.mark.parametrize(
+    ("error_reduction", "hazard_reduction", "expected_state"),
+    [
+        (False, False, 0x03),
+        (True, False, 0x02),
+        (False, True, 0x02),
+        (True, True, 0x02),
+    ],
+)
+def test_multiple_reduction_reasons_are_combined_without_stacking(
+    error_reduction: bool,
+    hazard_reduction: bool,
+    expected_state: int,
+) -> None:
+    assert (
+        resolve_configured_speed_state(
+            1.6,
+            0x03,
+            reduce_one_gear=error_reduction or hazard_reduction,
+        )
+        == expected_state
+    )
+
+
 @pytest.mark.parametrize("invalid_state", (-1, 0, 4, 255))
 def test_invalid_configured_drive_state_is_rejected(invalid_state: int) -> None:
     with pytest.raises(ValueError, match="drive_speed_state"):

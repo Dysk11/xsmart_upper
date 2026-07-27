@@ -114,6 +114,7 @@ camera:
 - `lateral_gain` / `heading_gain`: 高层转向合成权重
 - `base_speed` / `max_speed` / `min_speed`: 速度策略范围
 - `lost_speed`: 丢线时保守速度
+- `lateral_error_slowdown_threshold_px`: 原始横向误差达到该绝对值时降一档，默认 `83`
 
 ### 5. `bridge`
 
@@ -389,7 +390,9 @@ TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读�
 字节都会发送 `0x00`。检测到危险目标时按 `hazard_slowdown.hold_sec` 保持降一档：
 `3→2`、`2→1`、`1→1`。其中 `human` 必须满足行人面积门槛且中心进入 avoidance
 ROI，`car` 框接触 avoidance ROI 边界即生效，`road_sign` 在全画面生效；车辆避让、
-行人锁存或路牌等待结束后仍保持低档 1 秒。停车命令始终覆盖降档。
+行人锁存或路牌等待结束后仍保持低档 1 秒。原始横向误差绝对值达到
+`planner.lateral_error_slowdown_threshold_px` 时同样降一档，低于阈值后立即释放该
+降档原因。目标检测和误差降档只做 OR 合并，不会累计降两档；停车命令始终覆盖降档。
 
 ## RKNN 航道分割部署
 

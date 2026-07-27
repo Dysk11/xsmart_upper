@@ -208,6 +208,7 @@ planner:
   heading_speed_gain: 0.03
   confidence_speed_gain: 0.7
   caution_confidence_threshold: 0.55
+  lateral_error_slowdown_threshold_px: 83
   lost_speed: 0.25
   lost_steer_decay: 0.6
 

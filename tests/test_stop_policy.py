@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from core.io.protocol import resolve_configured_speed_state
 from core.lane.tracker import TrackedLaneState
 from core.planning.high_level import HighLevelPlanner, build_off_track_stop_hint
 
@@ -69,6 +70,79 @@ def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
     assert command.mode == "NORMAL"
     assert command.steer_deg == pytest.approx(1.0796)
     assert command.target_speed == pytest.approx(1.47)
+
+
+@pytest.mark.parametrize(
+    ("lateral_error_px", "expected_reduction"),
+    [
+        (-100.0, True),
+        (-83.0, True),
+        (-82.999, False),
+        (82.999, False),
+        (83.0, True),
+        (100.0, True),
+    ],
+)
+def test_raw_lateral_error_requests_one_gear_reduction_at_threshold(
+    lateral_error_px: float,
+    expected_reduction: bool,
+) -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "heading_speed_gain": 0.0,
+            "confidence_speed_gain": 0.0,
+        }
+    )
+
+    command = planner.plan(
+        make_tracked_state(
+            lateral_error_px=lateral_error_px,
+            heading_error_deg=0.0,
+        )
+    )
+
+    assert command.reduce_one_gear is expected_reduction
+    assert command.target_speed == pytest.approx(planner.base_speed)
+
+
+@pytest.mark.parametrize(
+    "invalid_threshold",
+    [-1.0, float("inf"), float("-inf"), float("nan")],
+)
+def test_invalid_lateral_error_slowdown_threshold_is_rejected(
+    invalid_threshold: float,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="lateral_error_slowdown_threshold_px",
+    ):
+        HighLevelPlanner(
+            {"lateral_error_slowdown_threshold_px": invalid_threshold}
+        )
+
+
+def test_stop_overrides_lateral_error_gear_reduction() -> None:
+    planner = HighLevelPlanner(
+        {"lateral_error_slowdown_threshold_px": 83.0}
+    )
+    hint = build_off_track_stop_hint(track_mask_visible=False)
+
+    command = planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        hint,
+    )
+
+    assert command.reduce_one_gear
+    assert command.target_speed == 0.0
+    assert (
+        resolve_configured_speed_state(
+            command.target_speed,
+            3,
+            reduce_one_gear=command.reduce_one_gear,
+        )
+        == 0
+    )
 
 
 @pytest.mark.parametrize(
