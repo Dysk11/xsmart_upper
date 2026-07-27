@@ -70,14 +70,17 @@ def test_short_line_loss_holds_last_speed_steer_and_gear(
     assert held.target_speed == valid.target_speed
     assert held.steer_deg == valid.steer_deg
     assert held.reduce_one_gear is valid.reduce_one_gear
+    assert held.speed_state_override == valid.speed_state_override
     assert resolve_configured_speed_state(
         held.target_speed,
         3,
         reduce_one_gear=held.reduce_one_gear,
+        speed_state_override=held.speed_state_override,
     ) == resolve_configured_speed_state(
         valid.target_speed,
         3,
         reduce_one_gear=valid.reduce_one_gear,
+        speed_state_override=valid.speed_state_override,
     )
 
 
@@ -184,6 +187,36 @@ def test_non_stop_hints_cannot_modify_held_control() -> None:
     assert held.target_speed == valid.target_speed
     assert held.steer_deg == valid.steer_deg
     assert held.reduce_one_gear is valid.reduce_one_gear
+    assert held.speed_state_override == valid.speed_state_override
+
+
+def test_curve_avoidance_and_generic_hazard_use_lowest_speed_state() -> None:
+    planner = HighLevelPlanner(
+        {
+            "curve_speed_state": 2,
+            "lateral_error_slowdown_threshold_px": 83.0,
+        }
+    )
+
+    command = planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        ModuleHints(
+            reduce_one_gear=True,
+            speed_state_override=1,
+        ),
+    )
+
+    assert command.speed_state_override == 1
+    assert command.reduce_one_gear
+    assert (
+        resolve_configured_speed_state(
+            command.target_speed,
+            3,
+            reduce_one_gear=command.reduce_one_gear,
+            speed_state_override=command.speed_state_override,
+        )
+        == 1
+    )
 
 
 def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
@@ -206,23 +239,24 @@ def test_normal_control_uses_only_lateral_and_heading_errors() -> None:
 
 
 @pytest.mark.parametrize(
-    ("lateral_error_px", "expected_reduction"),
+    ("lateral_error_px", "expected_speed_state"),
     [
-        (-100.0, True),
-        (-83.0, True),
-        (-82.999, False),
-        (82.999, False),
-        (83.0, True),
-        (100.0, True),
+        (-100.0, 2),
+        (-83.0, 2),
+        (-82.999, None),
+        (82.999, None),
+        (83.0, 2),
+        (100.0, 2),
     ],
 )
-def test_raw_lateral_error_requests_one_gear_reduction_at_threshold(
+def test_raw_lateral_error_selects_curve_speed_state_at_threshold(
     lateral_error_px: float,
-    expected_reduction: bool,
+    expected_speed_state: int | None,
 ) -> None:
     planner = HighLevelPlanner(
         {
             "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_state": 2,
             "heading_speed_gain": 0.0,
             "confidence_speed_gain": 0.0,
         }
@@ -235,7 +269,8 @@ def test_raw_lateral_error_requests_one_gear_reduction_at_threshold(
         )
     )
 
-    assert command.reduce_one_gear is expected_reduction
+    assert not command.reduce_one_gear
+    assert command.speed_state_override == expected_speed_state
     assert command.target_speed == pytest.approx(planner.base_speed)
 
 
@@ -255,7 +290,7 @@ def test_invalid_lateral_error_slowdown_threshold_is_rejected(
         )
 
 
-def test_stop_overrides_lateral_error_gear_reduction() -> None:
+def test_stop_overrides_curve_speed_state() -> None:
     planner = HighLevelPlanner(
         {"lateral_error_slowdown_threshold_px": 83.0}
     )
@@ -266,16 +301,29 @@ def test_stop_overrides_lateral_error_gear_reduction() -> None:
         hint,
     )
 
-    assert command.reduce_one_gear
+    assert not command.reduce_one_gear
+    assert command.speed_state_override is None
     assert command.target_speed == 0.0
     assert (
         resolve_configured_speed_state(
             command.target_speed,
             3,
             reduce_one_gear=command.reduce_one_gear,
+            speed_state_override=command.speed_state_override,
         )
         == 0
     )
+
+
+@pytest.mark.parametrize(
+    "invalid_curve_state",
+    [0, -1, 4, 2.5, True, float("inf"), "bad"],
+)
+def test_invalid_curve_speed_state_is_rejected(
+    invalid_curve_state: object,
+) -> None:
+    with pytest.raises(ValueError, match="planner.curve_speed_state"):
+        HighLevelPlanner({"curve_speed_state": invalid_curve_state})
 
 
 @pytest.mark.parametrize(

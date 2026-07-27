@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict
 
+from core.io.protocol import validate_moving_speed_state
 from core.lane.tracker import TrackedLaneState
 from utils.math_utils import clamp
 
@@ -24,6 +25,7 @@ class ControlCommand:
     target_speed: float
     steer_deg: float
     reduce_one_gear: bool
+    speed_state_override: int | None
 
 
 @dataclass
@@ -35,6 +37,7 @@ class ModuleHints:
     force_mode: str | None = None
     stop: bool = False
     reduce_one_gear: bool = False
+    speed_state_override: int | None = None
     note: str = ""
 
 
@@ -65,6 +68,9 @@ def build_safety_stop_hint(
 def build_car_avoidance_hint(
     car_avoidance_result: Any | None,
     min_speed: float,
+    *,
+    car_present: bool = False,
+    speed_state: int | None = None,
 ) -> ModuleHints | None:
     """Convert an active car-avoidance result into a control hint."""
 
@@ -81,9 +87,18 @@ def build_car_avoidance_hint(
             note=reason,
         )
     edge_limited = bool(getattr(car_avoidance_result, "edge_limited", False))
+    speed_state_override = (
+        validate_moving_speed_state(
+            speed_state,
+            "car_avoidance.speed_state",
+        )
+        if car_present and speed_state is not None
+        else None
+    )
     return ModuleHints(
         speed_limit=float(min_speed) if edge_limited else None,
         force_mode=str(getattr(car_avoidance_result, "mode", "CAR_AVOID")),
+        speed_state_override=speed_state_override,
         note=reason,
     )
 
@@ -128,6 +143,10 @@ class HighLevelPlanner:
                 "planner.lateral_error_slowdown_threshold_px "
                 "must be finite and non-negative"
             )
+        self.curve_speed_state = validate_moving_speed_state(
+            config.get("curve_speed_state", 0x02),
+            "planner.curve_speed_state",
+        )
 
         self.line_loss_hold_sec = float(config.get("line_loss_hold_sec", 0.5))
         if (
@@ -258,6 +277,9 @@ class HighLevelPlanner:
                     target_speed=self.last_valid_command.target_speed,
                     steer_deg=self.last_valid_command.steer_deg,
                     reduce_one_gear=self.last_valid_command.reduce_one_gear,
+                    speed_state_override=(
+                        self.last_valid_command.speed_state_override
+                    ),
                 )
             return ControlCommand(
                 ts_ms=ts_ms,
@@ -265,6 +287,7 @@ class HighLevelPlanner:
                 target_speed=0.0,
                 steer_deg=0.0,
                 reduce_one_gear=False,
+                speed_state_override=None,
             )
         else:
             # 这里只做高层合成，不做底层 PID。
@@ -298,16 +321,31 @@ class HighLevelPlanner:
         if module_hints.force_mode:
             mode = module_hints.force_mode
 
-        reduce_one_gear = bool(module_hints.reduce_one_gear) or (
-            abs(float(tracked_state.lateral_error_px))
-            >= self.lateral_error_slowdown_threshold_px
-        )
+        reduce_one_gear = bool(module_hints.reduce_one_gear)
+        speed_state_override = None
+        if not module_hints.stop:
+            if (
+                abs(float(tracked_state.lateral_error_px))
+                >= self.lateral_error_slowdown_threshold_px
+            ):
+                speed_state_override = self.curve_speed_state
+            if module_hints.speed_state_override is not None:
+                hint_speed_state = validate_moving_speed_state(
+                    module_hints.speed_state_override,
+                    "module_hints.speed_state_override",
+                )
+                speed_state_override = (
+                    hint_speed_state
+                    if speed_state_override is None
+                    else min(speed_state_override, hint_speed_state)
+                )
         command = ControlCommand(
             ts_ms=ts_ms,
             mode=mode,
             target_speed=float(target_speed),
             steer_deg=float(steer_deg),
             reduce_one_gear=reduce_one_gear,
+            speed_state_override=speed_state_override,
         )
         if not module_hints.stop and not effective_line_lost:
             self.last_valid_command = command

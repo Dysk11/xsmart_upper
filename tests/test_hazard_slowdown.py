@@ -71,11 +71,25 @@ def test_new_ai_result_refreshes_hold_but_duplicate_result_does_not() -> None:
     assert not controller.active(12.2)
 
 
+def test_car_presence_is_reported_without_generic_slowdown_hold() -> None:
+    controller = HazardSlowdownController(hold_sec=1.0)
+    cars = [detected("car", (150, 150, 220, 240))]
+
+    first = controller.observe_ai_result(cars, ROI, 600, 7, 10.0)
+    duplicate = controller.observe_ai_result([], ROI, 600, 7, 10.5)
+    cleared = controller.observe_ai_result([], ROI, 600, 8, 10.6)
+
+    assert first.car
+    assert duplicate.car
+    assert not cleared.car
+    assert not controller.active(10.1)
+
+
 def test_stateful_hazard_holds_for_one_second_after_release() -> None:
     controller = HazardSlowdownController(hold_sec=1.0)
 
-    controller.observe_stateful_hazards(20.0, car_avoidance_active=True)
-    controller.observe_stateful_hazards(21.5, car_avoidance_active=True)
+    controller.observe_stateful_hazards(20.0, pedestrian_active=True)
+    controller.observe_stateful_hazards(21.5, pedestrian_active=True)
     controller.observe_stateful_hazards(22.0)
 
     assert controller.active(22.999)

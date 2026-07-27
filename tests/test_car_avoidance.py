@@ -473,11 +473,18 @@ def test_measured_roi_edge_boundary_is_valid_and_speed_limited() -> None:
     assert result.mode == "CAR_AVOID_EDGE"
     assert_route_clear(result)
 
-    hint = build_car_avoidance_hint(result, min_speed=0.45)
+    hint = build_car_avoidance_hint(
+        result,
+        min_speed=0.45,
+        car_present=True,
+        speed_state=1,
+    )
     command = HighLevelPlanner({}).plan(make_tracked_state(), hint)
     assert hint is not None
     assert hint.speed_limit == pytest.approx(0.45)
+    assert hint.speed_state_override == 1
     assert command.target_speed == pytest.approx(0.45)
+    assert command.speed_state_override == 1
 
 
 def test_boundary_that_still_crosses_original_car_box_stops() -> None:
@@ -533,6 +540,44 @@ def test_cached_detection_cannot_start_recovery_and_new_clear_result_can() -> No
     assert cached.transition_phase == "hold"
     assert started.mode == "CAR_AVOID_RECOVERY"
     assert started.transition_progress == pytest.approx(0.0)
+
+
+def test_avoidance_speed_state_releases_when_new_result_clears_car() -> None:
+    planner = make_planner(speed_state=1)
+    obj = car((80, 60, 120, 100))
+    plan([obj], planner=planner, detection_id=10, now=5.0)
+    active = plan([obj], planner=planner, detection_id=10, now=6.0)
+    recovery = plan([], planner=planner, detection_id=11, now=7.0)
+
+    active_hint = build_car_avoidance_hint(
+        active,
+        min_speed=0.45,
+        car_present=True,
+        speed_state=planner.speed_state,
+    )
+    recovery_hint = build_car_avoidance_hint(
+        recovery,
+        min_speed=0.45,
+        car_present=False,
+        speed_state=planner.speed_state,
+    )
+
+    assert active_hint is not None
+    assert active_hint.speed_state_override == 1
+    assert recovery.transition_phase == "recovery"
+    assert recovery_hint is not None
+    assert recovery_hint.speed_state_override is None
+
+
+@pytest.mark.parametrize(
+    "invalid_speed_state",
+    [0, -1, 4, 2.5, True, float("inf"), "bad"],
+)
+def test_invalid_avoidance_speed_state_is_rejected(
+    invalid_speed_state: object,
+) -> None:
+    with pytest.raises(ValueError, match="car_avoidance.speed_state"):
+        make_planner(speed_state=invalid_speed_state)
 
 
 def test_new_detection_with_car_outside_avoidance_roi_starts_recovery() -> None:

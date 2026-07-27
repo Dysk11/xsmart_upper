@@ -1290,10 +1290,6 @@ class UpperMachineApp:
                     self.last_pedestrian_safety_result is not None
                     and self.last_pedestrian_safety_result.latched
                 ),
-                car_avoidance_active=bool(
-                    self.last_car_avoidance_result is not None
-                    and self.last_car_avoidance_result.active
-                ),
                 road_sign_waiting=self.ocr_stop_latch.active,
             )
             # 第 4 步：为后续 OCR、红绿灯、金币规划等模块预留融合入口。
@@ -1655,6 +1651,7 @@ class UpperMachineApp:
                 control_command.target_speed,
                 self.drive_speed_state,
                 reduce_one_gear=control_command.reduce_one_gear,
+                speed_state_override=control_command.speed_state_override,
             ),
             "steer_deg": control_command.steer_deg,
             "lateral_error_px": tracked_state.lateral_error_px,
@@ -1696,6 +1693,8 @@ class UpperMachineApp:
         car_avoidance_hint = build_car_avoidance_hint(
             self.last_car_avoidance_result,
             min_speed=self.planner.min_speed,
+            car_present=self.hazard_slowdown.last_presence.car,
+            speed_state=self.car_avoidance_planner.speed_state,
         )
         if car_avoidance_hint is not None:
             return car_avoidance_hint

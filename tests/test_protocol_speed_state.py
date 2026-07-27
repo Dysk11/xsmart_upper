@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from core.io.protocol import (
     PACKET_FIELDS,
     build_packet,
@@ -6,6 +8,7 @@ from core.io.protocol import (
     resolve_configured_speed_state,
     target_speed_to_speed_state,
     validate_drive_speed_state,
+    validate_moving_speed_state,
 )
 from core.io.logger import CsvLogger
 import pytest
@@ -101,30 +104,46 @@ def test_hazard_slowdown_reduces_exactly_one_moving_gear(
 
 
 @pytest.mark.parametrize(
-    ("error_reduction", "hazard_reduction", "expected_state"),
+    ("configured_state", "override", "hazard_reduction", "expected_state"),
     [
-        (False, False, 0x03),
-        (True, False, 0x02),
-        (False, True, 0x02),
-        (True, True, 0x02),
+        (0x03, None, False, 0x03),
+        (0x03, 0x02, False, 0x02),
+        (0x03, 0x01, False, 0x01),
+        (0x03, 0x02, True, 0x02),
+        (0x02, 0x02, True, 0x01),
+        (0x02, 0x01, True, 0x01),
     ],
 )
-def test_multiple_reduction_reasons_are_combined_without_stacking(
-    error_reduction: bool,
+def test_override_and_hazard_requests_use_the_lowest_state_without_stacking(
+    configured_state: int,
+    override: int | None,
     hazard_reduction: bool,
     expected_state: int,
 ) -> None:
     assert (
         resolve_configured_speed_state(
             1.6,
-            0x03,
-            reduce_one_gear=error_reduction or hazard_reduction,
+            configured_state,
+            reduce_one_gear=hazard_reduction,
+            speed_state_override=override,
         )
         == expected_state
     )
 
 
-@pytest.mark.parametrize("invalid_state", (-1, 0, 4, 255))
-def test_invalid_configured_drive_state_is_rejected(invalid_state: int) -> None:
+@pytest.mark.parametrize(
+    "invalid_state",
+    (-1, 0, 4, 255, 2.5, True, float("inf"), "bad"),
+)
+def test_invalid_configured_drive_state_is_rejected(invalid_state: object) -> None:
     with pytest.raises(ValueError, match="drive_speed_state"):
         validate_drive_speed_state(invalid_state)
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    (0, -1, 4, 2.5, True, float("inf"), "bad"),
+)
+def test_invalid_explicit_moving_state_is_rejected(invalid_state: object) -> None:
+    with pytest.raises(ValueError, match="test.speed_state"):
+        validate_moving_speed_state(invalid_state, "test.speed_state")

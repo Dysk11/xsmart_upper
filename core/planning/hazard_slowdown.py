@@ -24,6 +24,12 @@ class HazardPresence:
     def any(self) -> bool:
         return self.human or self.car or self.road_sign
 
+    @property
+    def generic_slowdown(self) -> bool:
+        """Return hazards that still use the one-gear hold controller."""
+
+        return self.human or self.road_sign
+
 
 def detect_hazard_presence(
     objects: Sequence[DetectedObject],
@@ -105,7 +111,10 @@ class HazardSlowdownController:
             avoidance_roi_rect=avoidance_roi_rect,
             pedestrian_min_box_area_px=pedestrian_min_box_area_px,
         )
-        if self.last_presence.any or previous_presence.any:
+        if (
+            self.last_presence.generic_slowdown
+            or previous_presence.generic_slowdown
+        ):
             self._extend(float(now_monotonic))
         return self.last_presence
 
@@ -114,12 +123,11 @@ class HazardSlowdownController:
         now_monotonic: float,
         *,
         pedestrian_active: bool = False,
-        car_avoidance_active: bool = False,
         road_sign_waiting: bool = False,
     ) -> None:
         """Keep slowdown held throughout latched safety/planning states."""
 
-        active = pedestrian_active or car_avoidance_active or road_sign_waiting
+        active = pedestrian_active or road_sign_waiting
         if active or self._stateful_hazard_active:
             self._extend(float(now_monotonic))
         self._stateful_hazard_active = active

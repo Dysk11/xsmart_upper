@@ -40,27 +40,52 @@ def target_speed_to_speed_state(target_speed: float) -> int:
     return 0x03
 
 
-def validate_drive_speed_state(value: Any) -> int:
-    """Validate the configured non-stop speed state sent to the vehicle."""
+def validate_moving_speed_state(value: Any, config_name: str = "speed_state") -> int:
+    """Validate one explicit non-stop speed state."""
 
-    state = int(value)
+    if isinstance(value, bool):
+        raise ValueError(f"{config_name} must be 1, 2, or 3")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{config_name} must be 1, 2, or 3") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{config_name} must be 1, 2, or 3")
+    state = int(numeric)
     if state not in (0x01, 0x02, 0x03):
-        raise ValueError("bridge.drive_speed_state must be 1, 2, or 3")
+        raise ValueError(f"{config_name} must be 1, 2, or 3")
     return state
+
+
+def validate_drive_speed_state(value: Any) -> int:
+    """Validate the configured normal moving speed state."""
+
+    return validate_moving_speed_state(value, "bridge.drive_speed_state")
 
 
 def resolve_configured_speed_state(
     target_speed: float,
     drive_speed_state: Any,
     reduce_one_gear: bool = False,
+    speed_state_override: Any | None = None,
 ) -> int:
-    """Resolve stop/configured speed, optionally reducing one moving gear."""
+    """Resolve stop, normal, override, and generic-hazard speed states."""
 
     speed = float(target_speed)
     if not math.isfinite(speed) or speed <= 0.0:
         return 0x00
-    state = validate_drive_speed_state(drive_speed_state)
-    return max(0x01, state - 1) if reduce_one_gear else state
+    drive_state = validate_drive_speed_state(drive_speed_state)
+    state = (
+        drive_state
+        if speed_state_override is None
+        else validate_moving_speed_state(
+            speed_state_override,
+            "speed_state_override",
+        )
+    )
+    if reduce_one_gear:
+        state = min(state, max(0x01, drive_state - 1))
+    return state
 
 
 def normalize_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:

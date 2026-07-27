@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
 
+from core.io.protocol import validate_moving_speed_state
 from core.lane.detector import LaneBoundaryRow
 from core.object.blocking import DetectedObject
 from core.planning.target_selector import TargetPointResult, TargetSelector
@@ -57,6 +58,10 @@ class CarAvoidancePlanner:
         self.entry_duration_s = float(config.get("entry_duration_s", 1.0))
         self.release_duration_s = float(config.get("release_duration_s", 1.0))
         self.edge_slow_margin_px = float(config.get("edge_slow_margin_px", 20.0))
+        self.speed_state = validate_moving_speed_state(
+            config.get("speed_state", 0x01),
+            "car_avoidance.speed_state",
+        )
         self.max_boundary_gap_rows = int(max_boundary_gap_rows)
         if self.entry_duration_s <= 0.0:
             raise ValueError("car_avoidance.entry_duration_s must be > 0")

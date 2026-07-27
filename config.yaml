@@ -146,6 +146,7 @@ car_avoidance:
   entry_duration_s: 0.25
   edge_slow_margin_px: 20
   release_duration_s: 2.0
+  speed_state: 1
 
 gold_target:
   enabled: false
@@ -209,6 +210,7 @@ planner:
   confidence_speed_gain: 0.7
   caution_confidence_threshold: 0.55
   lateral_error_slowdown_threshold_px: 83
+  curve_speed_state: 2
   line_loss_hold_sec: 0.5
 
 # Communication and output

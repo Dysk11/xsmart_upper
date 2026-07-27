@@ -114,7 +114,8 @@ camera:
 - `lateral_gain` / `heading_gain`: 高层转向合成权重
 - `base_speed` / `max_speed` / `min_speed`: 速度策略范围
 - `line_loss_hold_sec`: 短时丢线保持上一有效控制量的秒数，超时后停车
-- `lateral_error_slowdown_threshold_px`: 原始横向误差达到该绝对值时降一档，默认 `83`
+- `lateral_error_slowdown_threshold_px`: 原始横向误差达到该绝对值时进入弯道档位，默认 `83`
+- `curve_speed_state`: 弯道固定档位，`1`=低速、`2`=中速、`3`=高速
 
 ### 5. `bridge`
 
@@ -315,6 +316,7 @@ car_avoidance:
   entry_duration_s: 1.0
   edge_slow_margin_px: 20
   release_duration_s: 1.0
+  speed_state: 1
 ```
 
 规划器在相同 ROI 行上对齐正常中心线与锁定侧 track 边界，进入时用 1 秒时间
@@ -386,13 +388,12 @@ ser.write(data)
 TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读取会导致后续帧错位。
 
 正常行驶档位通过 `bridge.drive_speed_state` 配置，只允许 `1`（低速）、`2`（中速）
-或 `3`（高速），默认值为 `2`。无论正常档位为何值，只要规划结果要求停车，第 7
-字节都会发送 `0x00`。检测到危险目标时按 `hazard_slowdown.hold_sec` 保持降一档：
-`3→2`、`2→1`、`1→1`。其中 `human` 必须满足行人面积门槛且中心进入 avoidance
-ROI，`car` 框接触 avoidance ROI 边界即生效，`road_sign` 在全画面生效；车辆避让、
-行人锁存或路牌等待结束后仍保持低档 1 秒。原始横向误差绝对值达到
-`planner.lateral_error_slowdown_threshold_px` 时同样降一档，低于阈值后立即释放该
-降档原因。目标检测和误差降档只做 OR 合并，不会累计降两档；停车命令始终覆盖降档。
+或 `3`（高速），默认值为 `2`。原始横向误差绝对值达到
+`planner.lateral_error_slowdown_threshold_px` 时使用 `planner.curve_speed_state`；
+最新有效 AI 结果中有 `car` 框接触或进入 avoidance ROI 时使用
+`car_avoidance.speed_state`，新的无车结果到达后立即释放，即使避障路径仍在恢复。
+`human` 和 `road_sign` 继续按 `hazard_slowdown.hold_sec` 从正常档位降低一级。
+多个档位请求同时生效时取最低档且不累计降档；任何停车命令都固定发送 `0x00`。
 
 ## RKNN 航道分割部署
 
