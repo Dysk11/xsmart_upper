@@ -146,6 +146,17 @@ class HighLevelPlanner:
             config.get("curve_speed_state", 0x02),
             "planner.curve_speed_state",
         )
+        self.curve_speed_hold_sec = float(
+            config.get("curve_speed_hold_sec", 1.0)
+        )
+        if (
+            not math.isfinite(self.curve_speed_hold_sec)
+            or self.curve_speed_hold_sec < 0.0
+        ):
+            raise ValueError(
+                "planner.curve_speed_hold_sec must be finite and non-negative"
+            )
+        self.curve_speed_hold_until: float | None = None
 
         self.line_loss_hold_sec = float(config.get("line_loss_hold_sec", 0.5))
         if (
@@ -323,10 +334,17 @@ class HighLevelPlanner:
         reduce_one_gear = bool(module_hints.reduce_one_gear)
         speed_state_override = None
         if not module_hints.stop:
-            if (
+            curve_speed_requested = (
                 abs(float(tracked_state.lateral_error_px))
                 >= self.lateral_error_slowdown_threshold_px
-            ):
+            )
+            if curve_speed_requested:
+                self.curve_speed_hold_until = now + self.curve_speed_hold_sec
+            curve_speed_held = (
+                self.curve_speed_hold_until is not None
+                and now < self.curve_speed_hold_until
+            )
+            if curve_speed_requested or curve_speed_held:
                 speed_state_override = self.curve_speed_state
             if module_hints.speed_state_override is not None:
                 hint_speed_state = validate_moving_speed_state(

@@ -116,6 +116,7 @@ camera:
 - `line_loss_hold_sec`: 短时丢线保持上一有效控制量的秒数，超时后停车
 - `lateral_error_slowdown_threshold_px`: 原始横向误差达到该绝对值时进入弯道档位，默认 `83`
 - `curve_speed_state`: 弯道固定档位，`1`=低速、`2`=中速、`3`=高速
+- `curve_speed_hold_sec`: 退出弯道阈值后继续保持弯道档位的秒数，默认 `1.0`；设为 `0` 时立即恢复
 
 ### 5. `bridge`
 
@@ -396,6 +397,7 @@ TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读�
 正常行驶档位通过 `bridge.drive_speed_state` 配置，只允许 `1`（低速）、`2`（中速）
 或 `3`（高速），默认值为 `2`。原始横向误差绝对值达到
 `planner.lateral_error_slowdown_threshold_px` 时使用 `planner.curve_speed_state`；
+误差退出阈值后继续保持 `planner.curve_speed_hold_sec` 秒，再恢复正常行驶档位；
 最新有效 AI 结果中有 `car` 框接触或进入 avoidance ROI 时使用
 `car_avoidance.speed_state`，新的无车结果到达后立即释放，即使避障路径仍在恢复。
 `human` 和 `road_sign` 继续按 `hazard_slowdown.hold_sec` 从正常档位降低一级。

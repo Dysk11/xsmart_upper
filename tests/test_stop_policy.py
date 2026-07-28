@@ -274,6 +274,107 @@ def test_raw_lateral_error_selects_curve_speed_state_at_threshold(
     assert command.target_speed == pytest.approx(planner.base_speed)
 
 
+def test_curve_speed_is_held_until_configured_timeout() -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_state": 2,
+            "curve_speed_hold_sec": 1.0,
+        }
+    )
+
+    entered = planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+    held = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        now_monotonic=10.999,
+    )
+    released = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        now_monotonic=11.0,
+    )
+
+    assert entered.speed_state_override == 2
+    assert held.speed_state_override == 2
+    assert released.speed_state_override is None
+
+
+def test_curve_speed_hold_is_refreshed_by_new_curve_frame() -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_state": 2,
+            "curve_speed_hold_sec": 1.0,
+        }
+    )
+
+    planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+    planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.8,
+    )
+    held = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        now_monotonic=11.79,
+    )
+    released = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        now_monotonic=11.8,
+    )
+
+    assert held.speed_state_override == 2
+    assert released.speed_state_override is None
+
+
+def test_zero_curve_speed_hold_releases_on_first_straight_frame() -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_state": 2,
+            "curve_speed_hold_sec": 0.0,
+        }
+    )
+
+    entered = planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+    released = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        now_monotonic=10.001,
+    )
+
+    assert entered.speed_state_override == 2
+    assert released.speed_state_override is None
+
+
+def test_held_curve_speed_and_hint_use_lowest_speed_state() -> None:
+    planner = HighLevelPlanner(
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_state": 2,
+            "curve_speed_hold_sec": 1.0,
+        }
+    )
+    planner.plan(
+        make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+
+    command = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
+        ModuleHints(speed_state_override=1),
+        now_monotonic=10.5,
+    )
+
+    assert command.speed_state_override == 1
+
+
 @pytest.mark.parametrize(
     "invalid_threshold",
     [-1.0, float("inf"), float("-inf"), float("nan")],
@@ -292,13 +393,21 @@ def test_invalid_lateral_error_slowdown_threshold_is_rejected(
 
 def test_stop_overrides_curve_speed_state() -> None:
     planner = HighLevelPlanner(
-        {"lateral_error_slowdown_threshold_px": 83.0}
+        {
+            "lateral_error_slowdown_threshold_px": 83.0,
+            "curve_speed_hold_sec": 1.0,
+        }
     )
     hint = ModuleHints(stop=True, force_mode="OFF_TRACK_STOP")
 
-    command = planner.plan(
+    planner.plan(
         make_tracked_state(lateral_error_px=100.0),
+        now_monotonic=10.0,
+    )
+    command = planner.plan(
+        make_tracked_state(lateral_error_px=0.0),
         hint,
+        now_monotonic=10.5,
     )
 
     assert not command.reduce_one_gear
@@ -324,6 +433,17 @@ def test_invalid_curve_speed_state_is_rejected(
 ) -> None:
     with pytest.raises(ValueError, match="planner.curve_speed_state"):
         HighLevelPlanner({"curve_speed_state": invalid_curve_state})
+
+
+@pytest.mark.parametrize(
+    "invalid_hold_sec",
+    [-1.0, float("inf"), float("-inf"), float("nan")],
+)
+def test_invalid_curve_speed_hold_sec_is_rejected(
+    invalid_hold_sec: float,
+) -> None:
+    with pytest.raises(ValueError, match="curve_speed_hold_sec"):
+        HighLevelPlanner({"curve_speed_hold_sec": invalid_hold_sec})
 
 
 @pytest.mark.parametrize(
