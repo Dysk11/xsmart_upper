@@ -102,7 +102,7 @@ rknn_object_detector:
   input_layout: nhwc
   input_color: rgb
   input_dtype: uint8
-  score_threshold: 0.50
+  score_threshold: 0.40
   nms_threshold: 0.45
   max_detections: 30
   runtime_backend: lite2
@@ -129,7 +129,7 @@ ocr:
   min_score: 0.50
   accept_score: 0.60
   retry_interval_sec: 0.50
-  cooldown_seconds: 20.0
+  cooldown_seconds: 10.0
   stop_timeout_sec: 20.0
   bbox_display_seconds: 1.0
   output_dir: outputs/logs/ocr
@@ -212,7 +212,7 @@ planner:
   caution_confidence_threshold: 0.55
   lateral_error_slowdown_threshold_px: 83
   curve_speed_state: 2
-  line_loss_hold_sec: 0.5
+  line_loss_hold_sec: 1.0
 
 # Communication and output
 bridge:
