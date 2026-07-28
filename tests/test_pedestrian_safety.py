@@ -25,6 +25,7 @@ def make_analyzer(**overrides: object) -> PedestrianSafetyAnalyzer:
         "rearm_cooldown_sec": 3.0,
         "target_stability_threshold_px": 20,
         "target_stability_confirm_frames": 2,
+        "crossing_confirm_frames": 3,
         "moving_away_min_delta_px": 3,
         "moving_away_confirm_frames": 2,
         "center_region": {
@@ -177,6 +178,14 @@ def test_center_region_and_cooldown_are_strictly_validated() -> None:
         make_analyzer(target_stability_threshold_px=float("inf"))
     with pytest.raises(ValueError, match="target_stability_confirm_frames"):
         make_analyzer(target_stability_confirm_frames=1.5)
+    with pytest.raises(ValueError, match="crossing_confirm_frames"):
+        make_analyzer(crossing_confirm_frames=0)
+    with pytest.raises(ValueError, match="crossing_confirm_frames"):
+        make_analyzer(crossing_confirm_frames=-1)
+    with pytest.raises(ValueError, match="crossing_confirm_frames"):
+        make_analyzer(crossing_confirm_frames=True)
+    with pytest.raises(ValueError, match="crossing_confirm_frames"):
+        make_analyzer(crossing_confirm_frames=1.5)
     with pytest.raises(ValueError, match="moving_away_min_delta_px"):
         make_analyzer(moving_away_min_delta_px=float("inf"))
     with pytest.raises(ValueError, match="moving_away_min_delta_px"):
@@ -194,6 +203,12 @@ def test_center_region_and_cooldown_are_strictly_validated() -> None:
         )
     with pytest.raises(ValueError, match="approach_speed_state"):
         make_analyzer(approach_speed_state=0)
+
+
+def test_crossing_confirmation_defaults_to_three_frames() -> None:
+    analyzer = PedestrianSafetyAnalyzer({})
+
+    assert analyzer.crossing_confirm_frames == 3
 
 
 @pytest.mark.parametrize(
@@ -454,7 +469,7 @@ def test_exact_threshold_resets_target_stability_count() -> None:
 
 
 def test_movement_before_target_lock_cannot_release_pedestrian_wait() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     analyze(
         analyzer,
         [detected_center(80)],
@@ -594,7 +609,7 @@ def test_exact_locked_target_offset_relocks_on_next_cached_lane_frame() -> None:
 
 
 def test_relock_discards_old_crossing_and_requires_new_baseline() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     analyze(
         analyzer,
         [detected_center(80)],
@@ -729,15 +744,32 @@ def test_center_region_releases_on_strict_crossing(
         now=0.1,
     )
 
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(end_x)],
         result_id=3,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(end_x)],
+        result_id=4,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(end_x)],
+        result_id=5,
+        now=1.2,
+    )
 
     assert baseline.stop_required
+    assert first_crossing.stop_required
+    assert "crossing=1/3" in first_crossing.reason
+    assert second_crossing.stop_required
+    assert "crossing=2/3" in second_crossing.reason
     assert not released.stop_required
+    assert "crossed center target 3/3" in released.reason
     assert released.cooldown_remaining_sec == pytest.approx(3.0)
 
 
@@ -763,15 +795,29 @@ def test_center_region_online_start_requires_a_side_then_opposite_side() -> None
         result_id=3,
         now=0.5,
     )
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(80)],
         result_id=4,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(80)],
+        result_id=5,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(80)],
+        result_id=6,
+        now=1.2,
+    )
 
     assert first_side.stop_required
     assert "moving_away=disabled(center crossing-only)" in first_side.reason
+    assert "crossing=1/3" in first_crossing.reason
+    assert "crossing=2/3" in second_crossing.reason
     assert not released.stop_required
 
 
@@ -805,17 +851,33 @@ def test_left_region_requires_right_to_left_crossing() -> None:
         result_id=3,
         now=0.5,
     )
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(40)],
         target_x_roi=40.0,
         result_id=4,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(40)],
+        target_x_roi=40.0,
+        result_id=5,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(40)],
+        target_x_roi=40.0,
+        result_id=6,
+        now=1.2,
+    )
 
     assert wrong_direction.stop_required
     assert wrong_direction.frozen_target_x_frame == 50.0
     assert wrong_direction.target_region == "left"
+    assert "crossing=1/3" in first_crossing.reason
+    assert "crossing=2/3" in second_crossing.reason
     assert not released.stop_required
 
 
@@ -843,14 +905,30 @@ def test_left_region_releases_when_starting_on_target_line() -> None:
         now=0.1,
     )
 
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(40)],
         target_x_roi=40.0,
         result_id=3,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(40)],
+        target_x_roi=40.0,
+        result_id=4,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(40)],
+        target_x_roi=40.0,
+        result_id=5,
+        now=1.2,
+    )
 
+    assert first_crossing.stop_required
+    assert second_crossing.stop_required
     assert not released.stop_required
 
 
@@ -884,17 +962,33 @@ def test_right_region_requires_left_to_right_crossing() -> None:
         result_id=3,
         now=0.5,
     )
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(190)],
         target_x_roi=170.0,
         result_id=4,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=5,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=6,
+        now=1.2,
+    )
 
     assert wrong_direction.stop_required
     assert wrong_direction.frozen_target_x_frame == 180.0
     assert wrong_direction.target_region == "right"
+    assert "crossing=1/3" in first_crossing.reason
+    assert "crossing=2/3" in second_crossing.reason
     assert not released.stop_required
 
 
@@ -922,15 +1016,205 @@ def test_right_region_releases_when_starting_on_target_line() -> None:
         now=0.1,
     )
 
-    released = analyze(
+    first_crossing = analyze(
         analyzer,
         [detected_center(190)],
         target_x_roi=170.0,
         result_id=3,
         now=1.0,
     )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=4,
+        now=1.1,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(190)],
+        target_x_roi=170.0,
+        result_id=5,
+        now=1.2,
+    )
 
+    assert first_crossing.stop_required
+    assert second_crossing.stop_required
     assert not released.stop_required
+
+
+def test_cached_ai_result_does_not_advance_crossing_confirmation() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 80)
+
+    first_crossing = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=3,
+        now=0.5,
+    )
+    cached = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=3,
+        now=0.6,
+    )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=4,
+        now=0.7,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=5,
+        now=0.8,
+    )
+
+    assert "crossing=1/3" in first_crossing.reason
+    assert cached.stop_required
+    assert "crossing=1/3" in cached.reason
+    assert "crossing=2/3" in second_crossing.reason
+    assert not released.stop_required
+
+
+@pytest.mark.parametrize(
+    "reset_objects",
+    [
+        [detected_center(100, width=10, height=10)],
+        [detected_center(80, width=10, height=10)],
+    ],
+    ids=["on-target-line", "returned-to-source-side"],
+)
+def test_line_or_source_side_resets_crossing_confirmation(
+    reset_objects: list[DetectedObject],
+) -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 80)
+    first_crossing = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=3,
+        now=0.5,
+    )
+    reset = analyze(
+        analyzer,
+        reset_objects,
+        result_id=4,
+        now=0.6,
+    )
+
+    assert "crossing=1/3" in first_crossing.reason
+    assert reset.stop_required
+    assert "crossing=" not in reset.reason
+    assert analyzer.crossing_count == 0
+    assert analyzer.crossing_destination_side is None
+
+
+@pytest.mark.parametrize(
+    "missing_objects",
+    [
+        [],
+        [detected_center(220, width=10, height=10)],
+    ],
+    ids=["missing", "outside-avoidance-roi"],
+)
+def test_missing_or_roi_exit_resets_crossing_confirmation(
+    missing_objects: list[DetectedObject],
+) -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 80)
+    first_crossing = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=3,
+        now=0.5,
+    )
+    missing = analyze(
+        analyzer,
+        missing_objects,
+        result_id=4,
+        now=0.6,
+    )
+    reappeared = analyze(
+        analyzer,
+        [detected_center(120, width=10, height=10)],
+        result_id=5,
+        now=0.7,
+    )
+
+    assert "crossing=1/3" in first_crossing.reason
+    assert missing.stop_required
+    assert "triggering pedestrian missing" in missing.reason
+    assert analyzer.crossing_count == 0
+    assert reappeared.stop_required
+    assert "crossing baseline established" in reappeared.reason
+
+
+def test_target_relock_resets_crossing_confirmation() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 80)
+    first_crossing = analyze(
+        analyzer,
+        [detected_center(120)],
+        result_id=3,
+        now=0.5,
+    )
+    invalidated = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=110.0,
+        result_id=3,
+        now=0.6,
+    )
+    relocked = analyze(
+        analyzer,
+        [detected_center(120)],
+        target_x_roi=150.0,
+        result_id=3,
+        now=0.7,
+    )
+
+    assert "crossing=1/3" in first_crossing.reason
+    assert invalidated.stop_required
+    assert "target relock pending" in invalidated.reason
+    assert analyzer.crossing_count == 0
+    assert relocked.stop_required
+    assert relocked.frozen_target_x_frame == pytest.approx(160.0)
+
+
+def test_crossing_confirmation_suppresses_moving_away_confirmation() -> None:
+    analyzer = make_analyzer()
+    trigger_lock_and_establish_baseline(analyzer, 70, target_x_roi=40.0)
+
+    first_crossing = analyze(
+        analyzer,
+        [detected_center(40)],
+        target_x_roi=40.0,
+        result_id=3,
+        now=0.5,
+    )
+    second_crossing = analyze(
+        analyzer,
+        [detected_center(34)],
+        target_x_roi=40.0,
+        result_id=4,
+        now=0.6,
+    )
+    released = analyze(
+        analyzer,
+        [detected_center(28)],
+        target_x_roi=40.0,
+        result_id=5,
+        now=0.7,
+    )
+
+    assert "crossing=1/3" in first_crossing.reason
+    assert "crossing=2/3" in second_crossing.reason
+    assert "moving_away=" not in second_crossing.reason
+    assert not released.stop_required
+    assert "crossed left target 3/3" in released.reason
 
 
 @pytest.mark.parametrize(
@@ -1217,7 +1501,7 @@ def test_nearest_human_is_associated_without_distance_limit() -> None:
 
 
 def test_missing_triggering_pedestrian_holds_stop_until_reappearance() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
     lock_target(
         analyzer,
@@ -1254,7 +1538,7 @@ def test_missing_triggering_pedestrian_holds_stop_until_reappearance() -> None:
 
 
 def test_roi_exit_resets_release_baseline_and_cannot_cross_outside_roi() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     trigger_lock_and_establish_baseline(analyzer, 80)
 
     outside = analyze(
@@ -1291,7 +1575,7 @@ def test_roi_exit_resets_release_baseline_and_cannot_cross_outside_roi() -> None
 
 
 def test_cached_ai_result_cannot_update_or_release_track() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
     lock_target(
         analyzer,
@@ -1325,7 +1609,7 @@ def test_cached_ai_result_cannot_update_or_release_track() -> None:
 
 
 def test_three_second_cooldown_ignores_results_and_requires_new_result_after_expiry() -> None:
-    analyzer = make_analyzer()
+    analyzer = make_analyzer(crossing_confirm_frames=1)
     analyze(analyzer, [detected_center(80)], result_id=1, now=0.0)
     lock_target(
         analyzer,

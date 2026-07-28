@@ -273,6 +273,7 @@ pedestrian_safety:
   rearm_cooldown_sec: 3.0
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2
+  crossing_confirm_frames: 3
   moving_away_min_delta_px: 3
   moving_away_confirm_frames: 2
   center_region:
@@ -297,8 +298,10 @@ pedestrian_safety:
 后续结果只在中心位于 avoidance ROI 内的 human 框中选择距触发行人上一中心最近者，
 不设置关联距离上限；漏检或关联行人中心移出 avoidance ROI 时无限保持停车，并清除
 穿越基线和远离计数。重新进入 ROI 的第一份新 AI 结果只重建基线，ROI 外的运动不能
-用于放行。原有跨线放行规则保持不变：center 目标允许任意方向跨越，left 目标只接受
-右到左，right 目标只接受左到右。
+用于放行。center 目标允许任意方向跨越，left 目标只接受右到左，right 目标只接受
+左到右。首次严格跨线计为一次，行人需要连续 `crossing_confirm_frames` 份新 AI 结果
+保持在首次到达的同一侧才会放行；压线、回到原侧、漏检、移出 avoidance ROI 或目标线
+重锁都会清零跨线确认，缓存 AI 结果不会推进计数。
 
 锁线并建立行人基线后，还会用连续的新 AI 结果判断行人是否正在远离冻结线。相邻
 结果中，行人中心到冻结线的距离至少增加 `moving_away_min_delta_px`，才累计一次
@@ -306,7 +309,8 @@ pedestrian_safety:
 放行，无论行人向哪一侧远离都继续停车，仅在严格穿越冻结线时恢复。left 目标只允许
 行人在线左侧继续向左，right 目标只允许行人在线右侧继续向右。停滞、靠近、增量不足、
 侧别不符、漏检、移出 avoidance ROI 或目标线重锁都会清零累计；缓存 AI 结果不推进
-累计。完成跨线或确认远离后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发停车。
+累计。跨线确认期间不累计远离次数。完成跨线确认或确认远离后立即恢复并进入 3 秒冷却，
+冷却期间 human 不再触发停车。
 行人逻辑只处理 `human`，不会把 `car` 当作行人停车目标。
 
 ## 7. car 原始检测框避让

@@ -57,6 +57,10 @@ class PedestrianSafetyAnalyzer:
             "target_stability_confirm_frames",
             2,
         )
+        crossing_confirm_frames = config.get(
+            "crossing_confirm_frames",
+            3,
+        )
         self.moving_away_min_delta_px = float(
             config.get("moving_away_min_delta_px", 3.0)
         )
@@ -70,6 +74,14 @@ class PedestrianSafetyAnalyzer:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError(
                 "pedestrian_safety.target_stability_confirm_frames "
+                "must be a positive integer"
+            ) from exc
+        try:
+            self.crossing_confirm_frames = int(crossing_confirm_frames)
+            crossing_confirm_frames_value = float(crossing_confirm_frames)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "pedestrian_safety.crossing_confirm_frames "
                 "must be a positive integer"
             ) from exc
         try:
@@ -125,6 +137,17 @@ class PedestrianSafetyAnalyzer:
                 "must be a positive integer"
             )
         if (
+            isinstance(crossing_confirm_frames, bool)
+            or not math.isfinite(crossing_confirm_frames_value)
+            or crossing_confirm_frames_value
+            != float(self.crossing_confirm_frames)
+            or self.crossing_confirm_frames <= 0
+        ):
+            raise ValueError(
+                "pedestrian_safety.crossing_confirm_frames "
+                "must be a positive integer"
+            )
+        if (
             not math.isfinite(self.moving_away_min_delta_px)
             or self.moving_away_min_delta_px < 0.0
         ):
@@ -162,6 +185,8 @@ class PedestrianSafetyAnalyzer:
         self.target_relock_pending = False
         self.last_locked_target_offset_px: float | None = None
         self.last_lock_was_relock = False
+        self.crossing_count = 0
+        self.crossing_destination_side: str | None = None
         self.moving_away_count = 0
         self.last_moving_away_delta_px: float | None = None
 
@@ -275,6 +300,7 @@ class PedestrianSafetyAnalyzer:
     ) -> PedestrianSafetyResult:
         if not humans or self.tracked_center_frame is None:
             self.crossing_baseline_ready = False
+            self._reset_crossing_confirmation()
             self._reset_moving_away_state()
             return self._result(
                 center_region,
@@ -293,6 +319,7 @@ class PedestrianSafetyAnalyzer:
         )
         current_center = self._bbox_center(tracked.bbox_frame)
         if self.frozen_target_x_frame is None:
+            self._reset_crossing_confirmation()
             self._reset_moving_away_state()
             self.tracked_center_frame = current_center
             return self._result(
@@ -305,6 +332,7 @@ class PedestrianSafetyAnalyzer:
             )
 
         if not self.crossing_baseline_ready:
+            self._reset_crossing_confirmation()
             self._reset_moving_away_state()
             self.tracked_center_frame = current_center
             self.crossing_baseline_ready = True
@@ -318,12 +346,14 @@ class PedestrianSafetyAnalyzer:
                 ),
             )
 
-        crossed = self._has_crossed_target(
+        crossed = self._update_crossing_confirmation(
             previous_x=previous_center[0],
             current_x=current_center[0],
         )
         moving_away = False
-        if not crossed:
+        if self.crossing_count > 0:
+            self._reset_moving_away_state()
+        elif not crossed:
             moving_away = self._update_moving_away_state(
                 previous_x=previous_center[0],
                 current_x=current_center[0],
@@ -337,13 +367,16 @@ class PedestrianSafetyAnalyzer:
                 (
                     f"latched; tracking region={self.target_region} "
                     f"x={current_center[0]:.1f} "
-                    f"{self._moving_away_debug_text()}"
+                    f"{self._release_debug_text()}"
                 ),
             )
 
         released_region = self.target_region
         release_reason = (
-            f"pedestrian crossed {released_region} target"
+            (
+                f"pedestrian crossed {released_region} target "
+                f"{self.crossing_count}/{self.crossing_confirm_frames}"
+            )
             if crossed
             else (
                 f"pedestrian moved away from {released_region} target "
@@ -382,6 +415,7 @@ class PedestrianSafetyAnalyzer:
             self.last_locked_target_offset_px = None
             self.last_lock_was_relock = True
             self.crossing_baseline_ready = False
+            self._reset_crossing_confirmation()
             self._reset_moving_away_state()
             return
 
@@ -402,6 +436,7 @@ class PedestrianSafetyAnalyzer:
             self.crossing_baseline_ready = False
             self.target_relock_pending = True
             self.last_lock_was_relock = False
+            self._reset_crossing_confirmation()
             self._reset_moving_away_state()
             return
 
@@ -436,6 +471,7 @@ class PedestrianSafetyAnalyzer:
         self.last_locked_target_offset_px = 0.0
         self.last_lock_was_relock = False
         self.crossing_baseline_ready = False
+        self._reset_crossing_confirmation()
         self._reset_moving_away_state()
 
     def _latched_wait_reason(self, detail: str) -> str:
@@ -453,7 +489,7 @@ class PedestrianSafetyAnalyzer:
             return (
                 f"latched; {lock_label} region={self.target_region} "
                 f"offset={offset_text} "
-                f"{self._moving_away_debug_text()}; {detail}"
+                f"{self._release_debug_text()}; {detail}"
             )
         if self.target_relock_pending:
             offset_text = (
@@ -494,6 +530,56 @@ class PedestrianSafetyAnalyzer:
                 or previous_x > target_x > current_x
             )
         return False
+
+    def _update_crossing_confirmation(
+        self,
+        previous_x: float,
+        current_x: float,
+    ) -> bool:
+        target_x = self.frozen_target_x_frame
+        if target_x is None:
+            self._reset_crossing_confirmation()
+            return False
+
+        current_side = self._target_side(float(current_x), target_x)
+        if self.crossing_count > 0:
+            if current_side == self.crossing_destination_side:
+                self.crossing_count += 1
+            else:
+                self._reset_crossing_confirmation()
+            return self.crossing_count >= self.crossing_confirm_frames
+
+        if not self._has_crossed_target(previous_x, current_x):
+            return False
+
+        self.crossing_destination_side = current_side
+        self.crossing_count = 1
+        return self.crossing_count >= self.crossing_confirm_frames
+
+    @staticmethod
+    def _target_side(value_x: float, target_x: float) -> str | None:
+        if value_x < target_x:
+            return "left"
+        if value_x > target_x:
+            return "right"
+        return None
+
+    def _reset_crossing_confirmation(self) -> None:
+        self.crossing_count = 0
+        self.crossing_destination_side = None
+
+    def _crossing_debug_text(self) -> str:
+        side = self.crossing_destination_side or "none"
+        return (
+            f"crossing={self.crossing_count}/"
+            f"{self.crossing_confirm_frames} "
+            f"side={side}"
+        )
+
+    def _release_debug_text(self) -> str:
+        if self.crossing_count > 0:
+            return self._crossing_debug_text()
+        return self._moving_away_debug_text()
 
     def _update_moving_away_state(
         self,
@@ -628,6 +714,7 @@ class PedestrianSafetyAnalyzer:
         self.target_relock_pending = False
         self.last_locked_target_offset_px = None
         self.last_lock_was_relock = False
+        self._reset_crossing_confirmation()
         self._reset_moving_away_state()
         self.cooldown_until = 0.0
 
