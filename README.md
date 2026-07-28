@@ -259,13 +259,16 @@ avoidance_roi:
 
 调试画面用青色 `AVOID ROI` 矩形标出该范围，黄色矩形仍表示巡线 ROI。
 `center_region` 由 avoidance ROI 相对横坐标配置并贯穿 avoidance ROI 全高；其左侧是 `left`
-区域，右侧是 `right` 区域。完整 `human` 框面积达到 `min_box_area_px: 600`
-且框中心位于 avoidance ROI 时，车辆选择面积最大的合格行人并立即停车。
+区域，右侧是 `right` 区域。只处理检测框中心位于 avoidance ROI 内的 `human`：
+框面积达到减速入口后使用独立的行人接近档位，严格大于停车面积阈值时选择面积最大的
+合格行人并立即停车。
 
 ```yaml
 pedestrian_safety:
   enabled: true
-  min_box_area_px: 600
+  slowdown_min_box_area_px: 0
+  stop_min_box_area_px: 1600
+  approach_speed_state: 2
   rearm_cooldown_sec: 3.0
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2
@@ -276,7 +279,8 @@ pedestrian_safety:
     right_ratio: 0.70
 ```
 
-检测到行人后立即停车，但先不冻结目标线。每个巡线帧比较普通目标点 x 与上一帧
+检测到 ROI 内行人后先切换到 `approach_speed_state`；框面积严格大于
+`stop_min_box_area_px` 后立即停车，但先不冻结目标线。每个巡线帧比较普通目标点 x 与上一帧
 的跳变；连续 `target_stability_confirm_frames` 次严格小于
 `target_stability_threshold_px` 后，才冻结当前目标点 x 和它所属的
 `left/center/right` 区域。稳定期间继续关联行人但不判断穿越，锁线后的第一份
@@ -289,17 +293,19 @@ pedestrian_safety:
 连续稳定计数；若目标点不是有限值则继续等待。新线锁定后的第一份新行人检测重新
 建立穿越基线，旧线失效前后的行人移动不会触发释放。
 
-后续结果始终选择距触发行人上一中心最近的 human 框，不设置关联距离上限；漏检时
-无限保持停车。原有跨线放行规则保持不变：center 目标允许任意方向跨越，left 目标
-只接受右到左，right 目标只接受左到右。
+后续结果只在中心位于 avoidance ROI 内的 human 框中选择距触发行人上一中心最近者，
+不设置关联距离上限；漏检或关联行人中心移出 avoidance ROI 时无限保持停车，并清除
+穿越基线和远离计数。重新进入 ROI 的第一份新 AI 结果只重建基线，ROI 外的运动不能
+用于放行。原有跨线放行规则保持不变：center 目标允许任意方向跨越，left 目标只接受
+右到左，right 目标只接受左到右。
 
 锁线并建立行人基线后，还会用连续的新 AI 结果判断行人是否正在远离冻结线。相邻
 结果中，行人中心到冻结线的距离至少增加 `moving_away_min_delta_px`，才累计一次
-有效远离；连续达到 `moving_away_confirm_frames` 次后放行。center 目标允许行人在
-任一侧远离，left 目标只允许行人在线左侧继续向左，right 目标只允许行人在线右侧
-继续向右。停滞、靠近、增量不足、侧别不符、漏检或目标线重锁都会清零累计；缓存
-AI 结果不推进累计。完成跨线或确认远离后立即恢复并进入 3 秒冷却，冷却期间 human
-不再触发。
+有效远离；连续达到 `moving_away_confirm_frames` 次后放行。center 目标不启用远离
+放行，无论行人向哪一侧远离都继续停车，仅在严格穿越冻结线时恢复。left 目标只允许
+行人在线左侧继续向左，right 目标只允许行人在线右侧继续向右。停滞、靠近、增量不足、
+侧别不符、漏检、移出 avoidance ROI 或目标线重锁都会清零累计；缓存 AI 结果不推进
+累计。完成跨线或确认远离后立即恢复并进入 3 秒冷却，冷却期间 human 不再触发停车。
 行人逻辑只处理 `human`，不会把 `car` 当作行人停车目标。
 
 ## 7. car 原始检测框避让

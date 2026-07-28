@@ -27,7 +27,7 @@ class HazardPresence:
 
     @property
     def generic_slowdown(self) -> bool:
-        """Return hazards that still use the one-gear hold controller."""
+        """Return hazards that use the configured approach-speed hold."""
 
         return self.human
 
@@ -35,14 +35,14 @@ class HazardPresence:
 def detect_hazard_presence(
     objects: Sequence[DetectedObject],
     avoidance_roi_rect: tuple[int, int, int, int],
-    pedestrian_min_box_area_px: float,
+    pedestrian_slowdown_min_box_area_px: float,
 ) -> HazardPresence:
     """Classify hazards using the same ROI contracts as the safety planners."""
 
     avoid_x1, avoid_y1, avoid_x2, avoid_y2 = (
         float(value) for value in avoidance_roi_rect
     )
-    min_human_area = max(0.0, float(pedestrian_min_box_area_px))
+    min_human_area = max(0.0, float(pedestrian_slowdown_min_box_area_px))
     human = False
     car = False
     road_sign = False
@@ -79,9 +79,13 @@ def detect_hazard_presence(
 
 
 class HazardSlowdownController:
-    """Hold a one-gear slowdown after fresh detections and stateful hazards."""
+    """Hold a configured pedestrian approach gear after fresh detections."""
 
-    def __init__(self, hold_sec: float = 1.0) -> None:
+    def __init__(self, hold_sec: float = 1.0, speed_state: int = 0x02) -> None:
+        self.speed_state = validate_moving_speed_state(
+            speed_state,
+            "pedestrian_safety.approach_speed_state",
+        )
         self.hold_sec = float(hold_sec)
         if not math.isfinite(self.hold_sec) or self.hold_sec < 0.0:
             raise ValueError(
@@ -96,7 +100,7 @@ class HazardSlowdownController:
         self,
         objects: Sequence[DetectedObject],
         avoidance_roi_rect: tuple[int, int, int, int],
-        pedestrian_min_box_area_px: float,
+        pedestrian_slowdown_min_box_area_px: float,
         detection_result_id: int,
         now_monotonic: float,
     ) -> HazardPresence:
@@ -110,7 +114,9 @@ class HazardSlowdownController:
         self.last_presence = detect_hazard_presence(
             objects=objects,
             avoidance_roi_rect=avoidance_roi_rect,
-            pedestrian_min_box_area_px=pedestrian_min_box_area_px,
+            pedestrian_slowdown_min_box_area_px=(
+                pedestrian_slowdown_min_box_area_px
+            ),
         )
         if (
             self.last_presence.generic_slowdown
@@ -134,6 +140,25 @@ class HazardSlowdownController:
 
     def active(self, now_monotonic: float) -> bool:
         return float(now_monotonic) < self._hold_until
+
+    def merge_speed_state(
+        self,
+        current_override: int | None,
+        now_monotonic: float,
+    ) -> int | None:
+        """Merge the pedestrian gear with another moving override."""
+
+        if not self.active(now_monotonic):
+            return current_override
+        if current_override is None:
+            return self.speed_state
+        return min(
+            validate_moving_speed_state(
+                current_override,
+                "speed_state_override",
+            ),
+            self.speed_state,
+        )
 
     def _extend(self, now_monotonic: float) -> None:
         self._hold_until = max(self._hold_until, now_monotonic + self.hold_sec)

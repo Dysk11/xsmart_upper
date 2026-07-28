@@ -892,7 +892,8 @@ class UpperMachineApp:
         self.hazard_slowdown = HazardSlowdownController(
             hold_sec=float(
                 config.get("hazard_slowdown", {}).get("hold_sec", 1.0)
-            )
+            ),
+            speed_state=self.pedestrian_safety_analyzer.approach_speed_state,
         )
         ocr_config = config.get("ocr", {})
         self.road_sign_approach = RoadSignApproachController(
@@ -1179,8 +1180,8 @@ class UpperMachineApp:
                     hazard_presence = self.hazard_slowdown.observe_ai_result(
                         objects=detected_objects,
                         avoidance_roi_rect=avoidance_roi_rect,
-                        pedestrian_min_box_area_px=(
-                            self.pedestrian_safety_analyzer.min_box_area_px
+                        pedestrian_slowdown_min_box_area_px=(
+                            self.pedestrian_safety_analyzer.slowdown_min_box_area_px
                         ),
                         detection_result_id=self.last_ai_frame_id,
                         now_monotonic=time.monotonic(),
@@ -1308,7 +1309,12 @@ class UpperMachineApp:
                 tracked_state=planning_state,
             )
             speed_now = time.monotonic()
-            module_hints.reduce_one_gear = self.hazard_slowdown.active(speed_now)
+            module_hints.speed_state_override = (
+                self.hazard_slowdown.merge_speed_state(
+                    module_hints.speed_state_override,
+                    speed_now,
+                )
+            )
             module_hints.speed_state_override = (
                 self.road_sign_approach.merge_speed_state(
                     module_hints.speed_state_override,

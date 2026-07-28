@@ -32,7 +32,7 @@ def test_hazard_presence_uses_class_specific_roi_rules() -> None:
             detected("Stop", (20, 20, 50, 50)),
         ],
         avoidance_roi_rect=ROI,
-        pedestrian_min_box_area_px=600,
+        pedestrian_slowdown_min_box_area_px=600,
     )
 
     assert presence.human
@@ -49,7 +49,7 @@ def test_human_requires_center_and_area_while_car_requires_box_overlap() -> None
             detected("car", (40, 150, 99, 220)),
         ],
         avoidance_roi_rect=ROI,
-        pedestrian_min_box_area_px=600,
+        pedestrian_slowdown_min_box_area_px=600,
     )
 
     assert not presence.human
@@ -67,11 +67,25 @@ def test_road_sign_does_not_use_generic_one_gear_slowdown() -> None:
 
 
 def test_human_still_uses_generic_one_gear_slowdown() -> None:
-    controller = HazardSlowdownController(hold_sec=1.0)
+    controller = HazardSlowdownController(hold_sec=1.0, speed_state=2)
     human = [detected("human", (120, 120, 150, 150))]
 
-    controller.observe_ai_result(human, ROI, 600, 7, 10.0)
+    controller.observe_ai_result(human, ROI, 0, 7, 10.0)
     assert controller.active(10.999)
+    assert controller.merge_speed_state(None, 10.5) == 2
+    assert controller.merge_speed_state(1, 10.5) == 1
+    assert controller.merge_speed_state(3, 10.5) == 2
+
+
+def test_human_center_outside_roi_does_not_activate_approach_speed() -> None:
+    controller = HazardSlowdownController(hold_sec=1.0, speed_state=2)
+    overlapping = [detected("human", (90, 120, 109, 180))]
+
+    presence = controller.observe_ai_result(overlapping, ROI, 0, 7, 10.0)
+
+    assert not presence.human
+    assert not controller.active(10.1)
+    assert controller.merge_speed_state(None, 10.1) is None
 
 
 def test_car_presence_is_reported_without_generic_slowdown_hold() -> None:
@@ -97,6 +111,17 @@ def test_stateful_hazard_holds_for_one_second_after_release() -> None:
 
     assert controller.active(22.999)
     assert not controller.active(23.0)
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    (0, -1, 4, 2.5, True, float("inf"), "bad"),
+)
+def test_pedestrian_approach_rejects_invalid_speed_state(
+    invalid_state: object,
+) -> None:
+    with pytest.raises(ValueError, match="pedestrian_safety.approach_speed_state"):
+        HazardSlowdownController(hold_sec=1.0, speed_state=invalid_state)
 
 
 def test_road_sign_approach_uses_independent_hold_and_rearm_cycle() -> None:

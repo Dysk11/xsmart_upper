@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from core.io.protocol import validate_moving_speed_state
 from core.object.blocking import DetectedObject
 
 
@@ -35,7 +36,19 @@ class PedestrianSafetyAnalyzer:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.enabled = bool(config.get("enabled", True))
-        self.min_box_area_px = float(config.get("min_box_area_px", 600.0))
+        legacy_min_box_area_px = config.get("min_box_area_px", 600.0)
+        self.slowdown_min_box_area_px = float(
+            config.get("slowdown_min_box_area_px", 0.0)
+        )
+        self.stop_min_box_area_px = float(
+            config.get("stop_min_box_area_px", legacy_min_box_area_px)
+        )
+        # Keep the legacy attribute available for callers that still inspect it.
+        self.min_box_area_px = self.stop_min_box_area_px
+        self.approach_speed_state = validate_moving_speed_state(
+            config.get("approach_speed_state", 0x02),
+            "pedestrian_safety.approach_speed_state",
+        )
         self.rearm_cooldown_sec = float(config.get("rearm_cooldown_sec", 3.0))
         self.target_stability_threshold_px = float(
             config.get("target_stability_threshold_px", 20.0)
@@ -67,8 +80,27 @@ class PedestrianSafetyAnalyzer:
                 "pedestrian_safety.moving_away_confirm_frames "
                 "must be a positive integer"
             ) from exc
-        if self.min_box_area_px < 0.0:
-            raise ValueError("pedestrian_safety.min_box_area_px must be non-negative")
+        if (
+            not math.isfinite(self.slowdown_min_box_area_px)
+            or self.slowdown_min_box_area_px < 0.0
+        ):
+            raise ValueError(
+                "pedestrian_safety.slowdown_min_box_area_px "
+                "must be finite and non-negative"
+            )
+        if (
+            not math.isfinite(self.stop_min_box_area_px)
+            or self.stop_min_box_area_px < 0.0
+        ):
+            raise ValueError(
+                "pedestrian_safety.stop_min_box_area_px "
+                "must be finite and non-negative"
+            )
+        if self.slowdown_min_box_area_px > self.stop_min_box_area_px:
+            raise ValueError(
+                "pedestrian_safety.slowdown_min_box_area_px "
+                "must not exceed stop_min_box_area_px"
+            )
         if self.rearm_cooldown_sec < 0.0:
             raise ValueError(
                 "pedestrian_safety.rearm_cooldown_sec must be non-negative"
@@ -148,6 +180,10 @@ class PedestrianSafetyAnalyzer:
         humans = [
             obj for obj in objects
             if obj.class_name.casefold() == "human"
+            and self._center_is_in_roi(
+                self._bbox_center(obj.bbox_frame),
+                avoidance_roi_rect,
+            )
         ]
 
         if not self.enabled:
@@ -197,11 +233,7 @@ class PedestrianSafetyAnalyzer:
         self._clear_crossing_state()
         triggering = [
             obj for obj in humans
-            if self._bbox_area(obj.bbox_frame) >= self.min_box_area_px
-            and self._center_is_in_roi(
-                self._bbox_center(obj.bbox_frame),
-                avoidance_roi_rect,
-            )
+            if self._bbox_area(obj.bbox_frame) > self.stop_min_box_area_px
         ]
         if not triggering:
             return self._result(
@@ -242,6 +274,7 @@ class PedestrianSafetyAnalyzer:
         now: float,
     ) -> PedestrianSafetyResult:
         if not humans or self.tracked_center_frame is None:
+            self.crossing_baseline_ready = False
             self._reset_moving_away_state()
             return self._result(
                 center_region,
@@ -468,7 +501,7 @@ class PedestrianSafetyAnalyzer:
         current_x: float,
     ) -> bool:
         target_x = self.frozen_target_x_frame
-        if target_x is None:
+        if target_x is None or self.target_region == "center":
             self._reset_moving_away_state()
             return False
 
@@ -478,15 +511,11 @@ class PedestrianSafetyAnalyzer:
         )
         self.last_moving_away_delta_px = distance_delta_px
         side_allowed = (
-            self.target_region == "center"
-            or (
-                self.target_region == "left"
-                and float(current_x) < target_x
-            )
-            or (
-                self.target_region == "right"
-                and float(current_x) > target_x
-            )
+            self.target_region == "left"
+            and float(current_x) < target_x
+        ) or (
+            self.target_region == "right"
+            and float(current_x) > target_x
         )
         if (
             side_allowed
@@ -502,6 +531,8 @@ class PedestrianSafetyAnalyzer:
         self.last_moving_away_delta_px = None
 
     def _moving_away_debug_text(self) -> str:
+        if self.target_region == "center":
+            return "moving_away=disabled(center crossing-only)"
         delta_text = (
             "n/a"
             if self.last_moving_away_delta_px is None
