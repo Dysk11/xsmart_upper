@@ -1706,7 +1706,6 @@ class UpperMachineApp:
         car_avoidance_hint = build_car_avoidance_hint(
             self.last_car_avoidance_result,
             min_speed=self.planner.min_speed,
-            car_present=self.hazard_slowdown.last_presence.car,
             speed_state=self.car_avoidance_planner.speed_state,
         )
         if car_avoidance_hint is not None:

@@ -162,14 +162,14 @@ path_marker_target:
   enabled: false
   class_names: [Go, Stop]
   min_confidence: 0.20
-  hold_frames: 4
+  hold_frames: 2
   connection_margin_px: 12
   interpolation_step_px: 4
   release_y_ratio: 0.92
 
 pedestrian_safety:
   enabled: true
-  min_box_area_px: 10
+  min_box_area_px: 400
   rearm_cooldown_sec: 3.0
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2

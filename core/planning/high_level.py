@@ -69,7 +69,6 @@ def build_car_avoidance_hint(
     car_avoidance_result: Any | None,
     min_speed: float,
     *,
-    car_present: bool = False,
     speed_state: int | None = None,
 ) -> ModuleHints | None:
     """Convert an active car-avoidance result into a control hint."""
@@ -92,7 +91,7 @@ def build_car_avoidance_hint(
             speed_state,
             "car_avoidance.speed_state",
         )
-        if car_present and speed_state is not None
+        if speed_state is not None
         else None
     )
     return ModuleHints(

@@ -476,7 +476,6 @@ def test_measured_roi_edge_boundary_is_valid_and_speed_limited() -> None:
     hint = build_car_avoidance_hint(
         result,
         min_speed=0.45,
-        car_present=True,
         speed_state=1,
     )
     command = HighLevelPlanner({}).plan(make_tracked_state(), hint)
@@ -542,31 +541,47 @@ def test_cached_detection_cannot_start_recovery_and_new_clear_result_can() -> No
     assert started.transition_progress == pytest.approx(0.0)
 
 
-def test_avoidance_speed_state_releases_when_new_result_clears_car() -> None:
-    planner = make_planner(speed_state=1)
+def test_avoidance_speed_state_is_held_through_two_second_recovery() -> None:
+    planner = make_planner(speed_state=1, release_duration_s=2.0)
     obj = car((80, 60, 120, 100))
     plan([obj], planner=planner, detection_id=10, now=5.0)
     active = plan([obj], planner=planner, detection_id=10, now=6.0)
-    recovery = plan([], planner=planner, detection_id=11, now=7.0)
+    recovery_started = plan([], planner=planner, detection_id=11, now=7.0)
+    recovery_halfway = plan([], planner=planner, detection_id=11, now=8.0)
+    recovery_complete = plan([], planner=planner, detection_id=11, now=9.0)
 
     active_hint = build_car_avoidance_hint(
         active,
         min_speed=0.45,
-        car_present=True,
         speed_state=planner.speed_state,
     )
-    recovery_hint = build_car_avoidance_hint(
-        recovery,
+    recovery_started_hint = build_car_avoidance_hint(
+        recovery_started,
         min_speed=0.45,
-        car_present=False,
+        speed_state=planner.speed_state,
+    )
+    recovery_halfway_hint = build_car_avoidance_hint(
+        recovery_halfway,
+        min_speed=0.45,
+        speed_state=planner.speed_state,
+    )
+    recovery_complete_hint = build_car_avoidance_hint(
+        recovery_complete,
+        min_speed=0.45,
         speed_state=planner.speed_state,
     )
 
     assert active_hint is not None
     assert active_hint.speed_state_override == 1
-    assert recovery.transition_phase == "recovery"
-    assert recovery_hint is not None
-    assert recovery_hint.speed_state_override is None
+    assert recovery_started.transition_phase == "recovery"
+    assert recovery_started_hint is not None
+    assert recovery_started_hint.speed_state_override == 1
+    assert recovery_halfway.transition_phase == "recovery"
+    assert recovery_halfway.transition_progress == pytest.approx(0.5)
+    assert recovery_halfway_hint is not None
+    assert recovery_halfway_hint.speed_state_override == 1
+    assert not recovery_complete.active
+    assert recovery_complete_hint is None
 
 
 @pytest.mark.parametrize(
@@ -632,7 +647,7 @@ def test_recovery_smoothstep_returns_to_current_centerline_in_one_second() -> No
 
 
 def test_car_reappearing_during_recovery_has_no_route_jump() -> None:
-    planner = make_planner()
+    planner = make_planner(speed_state=1)
     obj = car((80, 60, 120, 100))
     plan([obj], planner=planner, detection_id=1, now=1.0)
     plan([obj], planner=planner, detection_id=1, now=2.0)
@@ -640,11 +655,18 @@ def test_car_reappearing_during_recovery_has_no_route_jump() -> None:
     halfway = plan([], planner=planner, detection_id=2, now=3.5)
     reappeared = plan([obj], planner=planner, detection_id=3, now=3.5)
     resumed = plan([obj], planner=planner, detection_id=3, now=4.0)
+    reappeared_hint = build_car_avoidance_hint(
+        reappeared,
+        min_speed=0.45,
+        speed_state=planner.speed_state,
+    )
 
     assert route_x(reappeared) == pytest.approx(route_x(halfway))
     assert reappeared.transition_phase == "entry"
     assert reappeared.transition_progress == pytest.approx(0.0)
     assert reappeared.locked_side == "left"
+    assert reappeared_hint is not None
+    assert reappeared_hint.speed_state_override == 1
     assert route_x(resumed) == pytest.approx(52.5)
 
 
