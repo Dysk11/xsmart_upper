@@ -310,7 +310,10 @@ class RknnLaneSegmenter:
         return result
 
     def _nms(self, boxes: np.ndarray, scores: np.ndarray) -> list[int]:
-        order = scores.argsort()[::-1]
+        # Quantized RKNN outputs can contain exactly equal scores. Make the
+        # historical reverse-index preference explicit so C++ and NumPy select
+        # the same box instead of depending on an unstable sort implementation.
+        order = np.lexsort((np.arange(scores.size, dtype=np.intp), scores))[::-1]
         selected: list[int] = []
         while order.size:
             current = int(order[0])

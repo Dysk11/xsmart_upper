@@ -41,6 +41,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Command bridge under test.",
     )
     parser.add_argument("--video", help="Video path for --mode video.")
+    parser.add_argument(
+        "--lane-backend",
+        choices=("c_api", "lite2"),
+        help="Override the lane inference backend for an A/B run.",
+    )
+    parser.add_argument(
+        "--preprocess",
+        choices=("auto", "direct", "rga"),
+        help="Override native preprocessing for a C API run.",
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=("float", "native"),
+        help="Select preallocated float outputs or native zero-copy outputs.",
+    )
     parser.add_argument("--warmup-sec", type=float, default=None)
     parser.add_argument("--duration-sec", type=float, default=None)
     parser.add_argument("--system-sample-interval-sec", type=float, default=None)
@@ -62,6 +77,9 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
         camera_config["video_path"] = args.video
     if args.mode == "video" and not camera_config.get("video_path"):
         raise ValueError("--mode video requires --video or camera.video_path")
+    if args.mode == "video":
+        # Keep an unthrottled finite file running for the full sampling window.
+        camera_config["loop_video"] = True
 
     if args.bridge == "serial" and not args.serial_safety_confirmed:
         raise RuntimeError(
@@ -69,6 +87,13 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
             "--serial-safety-confirmed."
         )
     config.setdefault("bridge", {})["type"] = args.bridge
+    lane_config = config.setdefault("rknn_lane_segmenter", {})
+    if getattr(args, "lane_backend", None):
+        lane_config["runtime_backend"] = args.lane_backend
+    if getattr(args, "preprocess", None):
+        lane_config["preprocess_backend"] = args.preprocess
+    if getattr(args, "output_mode", None):
+        lane_config["output_mode"] = args.output_mode
 
     visualizer = config.setdefault("visualizer", {})
     visualizer["show_window"] = False

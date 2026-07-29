@@ -34,13 +34,21 @@ rknn_lane_segmenter:
   nms_threshold: 0.45
   mask_threshold: 0.5
   max_instances: 3
-  runtime_backend: lite2
+  runtime_backend: c_api
+  fallback_backend: lite2
+  c_api_binary: native/lane_rknn_backend/build/lane_rknn_backend
+  preprocess_backend: direct
+  output_mode: native
+  startup_timeout_sec: 8.0
   core_mask: NPU_CORE_0
   parallel: true
   worker_count: 2
-  worker_core_masks: [NPU_CORE_0, NPU_CORE_2]
-  pipeline_depth: 3
-  max_result_age_frames: 4
+  worker_core_masks: [NPU_CORE_0, NPU_CORE_1]
+  worker_cpu_cores: [6, 7]
+  pipeline_depth: 1
+  max_result_age_frames: 2
+  max_result_age_ms: 50.0
+  fresh_result_wait_ms: 0.0
   drop_stale_results: true
 
 lane_geometry:
@@ -117,14 +125,14 @@ rknn_object_detector:
   max_result_age_frames: 12
   drop_stale_results: true
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
-  core_mask: NPU_CORE_1
+  core_mask: NPU_CORE_2
 
 ocr:
   enable: true
   det_model_path: models/ocr/ppocrv4_det.rknn
   rec_model_path: models/ocr/ppocrv4_rec.rknn
   target: rk3588
-  core_mask: NPU_CORE_1
+  core_mask: NPU_CORE_2
   class_names: [road_sign]
   bbox_min_confidence: 0.50
   bbox_min_width_px: 100
@@ -179,15 +187,15 @@ pedestrian_safety:
   slowdown_min_box_area_px: 0
   stop_min_box_area_px: 1000
   approach_speed_state: 2
-  rearm_cooldown_sec: 3.0
+  rearm_cooldown_sec: 1.5
   target_stability_threshold_px: 20
   target_stability_confirm_frames: 2
   crossing_confirm_frames: 3
   moving_away_min_delta_px: 3
   moving_away_confirm_frames: 2
   center_region:
-    left_ratio: 0.35
-    right_ratio: 0.65
+    left_ratio: 0.40
+    right_ratio: 0.60
 
 hazard_slowdown:
   hold_sec: 1.0

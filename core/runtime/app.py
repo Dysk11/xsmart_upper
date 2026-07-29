@@ -64,6 +64,7 @@ from core.planning.road_sign_analyzer import (
 )
 from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
+from core.lane.capi_backend import CapiLaneBackend, NativeLaneResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
 from core.runtime.latency_benchmark import LatencyBenchmark
@@ -784,6 +785,13 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
         rknn_segmenter_config["model_path"] = str(
             resolve_project_path(project_root, str(rknn_segmenter_config["model_path"]))
         )
+    if rknn_segmenter_config.get("c_api_binary"):
+        rknn_segmenter_config["c_api_binary"] = str(
+            resolve_project_path(
+                project_root,
+                str(rknn_segmenter_config["c_api_binary"]),
+            )
+        )
 
     ocr_config = runtime_config.setdefault("ocr", {})
     for path_key in ("det_model_path", "rec_model_path", "output_dir"):
@@ -864,16 +872,46 @@ class UpperMachineApp:
         )
         self.detector = LaneDetector(self.lane_geometry_config)
         lane_config = config.get("rknn_lane_segmenter", {})
+        self.lane_backend_requested = str(
+            lane_config.get("runtime_backend", "lite2")
+        ).lower()
+        self.lane_capi_requested = self.lane_backend_requested == "c_api"
+        self.lane_capi_active = False
+        self.lane_fallback_backend = str(
+            lane_config.get("fallback_backend", "lite2")
+        ).lower()
         worker_core_masks = list(lane_config.get("worker_core_masks", []))
         configured_worker_count = int(lane_config.get("worker_count", len(worker_core_masks)))
         worker_core_masks = worker_core_masks[: max(0, configured_worker_count)]
-        self.lane_parallel_enabled = bool(lane_config.get("parallel", False) and worker_core_masks)
-        self.lane_pipeline_depth = min(
-            3,
-            max(1, int(lane_config.get("pipeline_depth", 3))),
+        self.lane_parallel_enabled = bool(
+            not self.lane_capi_requested
+            and lane_config.get("parallel", False)
+            and worker_core_masks
         )
-        self.lane_segmenter = None if self.lane_parallel_enabled else RknnLaneSegmenter(lane_config)
+        self.lane_pipeline_depth = (
+            1
+            if self.lane_capi_requested
+            else min(3, max(1, int(lane_config.get("pipeline_depth", 3))))
+        )
+        self.lane_segmenter = (
+            None
+            if self.lane_parallel_enabled or self.lane_capi_requested
+            else RknnLaneSegmenter(lane_config)
+        )
+        self.lane_capi_backend = (
+            CapiLaneBackend(lane_config, project_root)
+            if self.lane_capi_requested
+            else None
+        )
         self.lane_max_result_age_frames = max(0, int(lane_config.get("max_result_age_frames", 2)))
+        self.lane_max_result_age_ms = max(
+            0.0,
+            float(lane_config.get("max_result_age_ms", 50.0)),
+        )
+        self.lane_fresh_result_wait_ms = max(
+            0.0,
+            float(lane_config.get("fresh_result_wait_ms", 6.0)),
+        )
         self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
         ai_config = config.get("rknn_object_detector", {})
         self.ai_inference_stride = max(1, int(ai_config.get("inference_stride", 1)))
@@ -929,6 +967,8 @@ class UpperMachineApp:
                 "video_path": config.get("camera", {}).get("video_path", ""),
                 "bridge_type": bridge_config.get("type", "mock"),
                 "lane_parallel": self.lane_parallel_enabled,
+                "lane_backend_requested": self.lane_backend_requested,
+                "lane_backend_actual": "pending" if self.lane_capi_requested else self.lane_backend_requested,
                 "lane_worker_core_masks": worker_core_masks,
                 "object_core_mask": ai_config.get("core_mask", ""),
             },
@@ -1003,6 +1043,7 @@ class UpperMachineApp:
         self.last_segmentation_ipc_finished_at = 0.0
         self.last_segmentation_timing: dict[str, float] = {}
         self.last_segmentation_worker_index = -1
+        self.last_native_lane_counters: dict[str, int] = {}
         self.last_ai_frame_id = -1
         self.last_ai_captured_at = 0.0
         self.last_ai_completed_at = 0.0
@@ -1022,7 +1063,17 @@ class UpperMachineApp:
             self.ui_frame_pool.pool_id: self.ui_frame_pool,
             self.ui_mask_pool.pool_id: self.ui_mask_pool,
         }
-        if self.lane_parallel_enabled:
+        create_fallback_lane_workers = bool(
+            worker_core_masks
+            and (
+                self.lane_parallel_enabled
+                or (
+                    self.lane_capi_requested
+                    and self.lane_fallback_backend == "lite2"
+                )
+            )
+        )
+        if create_fallback_lane_workers:
             for worker_index, core_mask in enumerate(worker_core_masks):
                 input_queue = self.mp_context.Queue(maxsize=1)
                 ack_queue = self.mp_context.Queue()
@@ -1103,11 +1154,37 @@ class UpperMachineApp:
         self.camera.open()
         self.bridge.connect()
         self.csv_logger.open()
+        if self.lane_capi_backend is not None:
+            try:
+                self.lane_capi_backend.start()
+                self.lane_capi_active = True
+                self.latency_benchmark.metadata["lane_backend_actual"] = "c_api"
+                print(
+                    "[LANE_C_API] native dual-context backend ready",
+                    flush=True,
+                )
+            except Exception as error:
+                benchmark_enabled = self.latency_benchmark.enabled
+                self.latency_benchmark.add_error(
+                    f"C API backend startup failed: {type(error).__name__}: {error}"
+                )
+                if benchmark_enabled or self.lane_fallback_backend != "lite2":
+                    raise
+                print(
+                    "[LANE_C_API] startup failed; falling back to Lite2: "
+                    f"{type(error).__name__}: {error}",
+                    flush=True,
+                )
+                self.lane_capi_backend.close()
+                self.lane_capi_backend = None
+                self.lane_parallel_enabled = True
+                self.latency_benchmark.metadata["lane_backend_actual"] = "lite2_fallback"
         self.ai_process.start()
         if self.road_sign_analyzer_config.enable:
             self.road_sign_analyzer_process.start()
-        for process in self.lane_processes:
-            process.start()
+        if not self.lane_capi_active:
+            for process in self.lane_processes:
+                process.start()
         if self.ui_active:
             self.ui_process.start()
 
@@ -1131,6 +1208,7 @@ class UpperMachineApp:
             avoidance_roi_rect = self._compute_avoidance_roi_rect(frame_bgr)
             lane_roi_time = time.perf_counter()
             self.frame_id += 1
+            self._current_source_frame_id = int(captured_frame.source_frame_id)
             ai_frame_payload = None
             if self.frame_id % self.ai_inference_stride == 0:
                 ai_frame_payload = _share_ai_frames(
@@ -1515,6 +1593,64 @@ class UpperMachineApp:
     def _segment_lane(self, frame: np.ndarray, captured_at: float | None = None) -> SegmentationResult:
         """Segment synchronously or through the configured low-latency worker pool."""
 
+        if self.lane_capi_active:
+            assert self.lane_capi_backend is not None
+            captured_time = float(
+                captured_at if captured_at is not None else time.perf_counter()
+            )
+            self.lane_capi_backend.publish(
+                frame,
+                frame_id=self.frame_id,
+                source_frame_id=getattr(
+                    self,
+                    "_current_source_frame_id",
+                    self.frame_id,
+                ),
+                captured_at=captured_time,
+            )
+            while self._receive_capi_lane_result():
+                pass
+            fresh_deadline = (
+                time.monotonic() + self.lane_fresh_result_wait_ms / 1000.0
+            )
+            target_frame_id = self.frame_id - 1
+            while (
+                self.last_segmentation_result is not None
+                and self.last_segmentation_frame_id < target_frame_id
+                and time.monotonic() < fresh_deadline
+            ):
+                if not self._receive_capi_lane_result():
+                    time.sleep(0.0002)
+            if self.last_segmentation_result is None:
+                deadline = time.monotonic() + 2.0
+                while self.last_segmentation_result is None and time.monotonic() < deadline:
+                    if not self._receive_capi_lane_result():
+                        time.sleep(0.0005)
+            if self.last_segmentation_result is None:
+                return SegmentationResult(
+                    np.zeros(frame.shape[:2], dtype=np.uint8),
+                    [],
+                    0.0,
+                    "backend_timeout",
+                )
+            result_age_frames = self.frame_id - self.last_segmentation_frame_id
+            result_age_ms = max(
+                0.0,
+                (time.perf_counter() - self.last_segmentation_captured_at)
+                * 1000.0,
+            )
+            if self.drop_stale_lane_results and (
+                result_age_frames > self.lane_max_result_age_frames
+                or result_age_ms > self.lane_max_result_age_ms
+            ):
+                return SegmentationResult(
+                    np.zeros(frame.shape[:2], dtype=np.uint8),
+                    [],
+                    0.0,
+                    "stale_result",
+                )
+            return self.last_segmentation_result
+
         if not self.lane_parallel_enabled:
             assert self.lane_segmenter is not None
             result = self.lane_segmenter.segment(frame)
@@ -1549,6 +1685,33 @@ class UpperMachineApp:
                 break
         assert self.last_segmentation_result is not None
         return self.last_segmentation_result
+
+    def _receive_capi_lane_result(self) -> bool:
+        """Consume one newest native result and discard frame-number regressions."""
+
+        if self.lane_capi_backend is None:
+            return False
+        native_result: NativeLaneResult | None = self.lane_capi_backend.read_latest()
+        if native_result is None:
+            return False
+        self.last_native_lane_counters = dict(native_result.counters)
+        worker_index = int(native_result.worker_index)
+        if 0 <= worker_index < len(self.lane_worker_completed):
+            self.lane_worker_completed[worker_index] += 1
+            self._accumulate_timing(
+                self.lane_worker_timing_totals[worker_index],
+                native_result.timing,
+            )
+        if native_result.frame_id <= self.last_segmentation_frame_id:
+            return True
+        self.last_segmentation_frame_id = int(native_result.frame_id)
+        self.last_segmentation_captured_at = float(native_result.captured_at)
+        self.last_segmentation_completed_at = float(native_result.completed_at)
+        self.last_segmentation_ipc_finished_at = time.perf_counter()
+        self.last_segmentation_timing = dict(native_result.timing)
+        self.last_segmentation_worker_index = worker_index
+        self.last_segmentation_result = native_result.result
+        return True
 
     def _receive_lane_result(self, block: bool) -> bool:
         try:
@@ -1617,6 +1780,7 @@ class UpperMachineApp:
 
         lane_timing = self.last_segmentation_timing
         ai_timing = self.last_ai_timing
+        native_lane_counters = getattr(self, "last_native_lane_counters", {})
         lane_captured_at = self.last_segmentation_captured_at
         ai_captured_at = self.last_ai_captured_at
         return {
@@ -1681,6 +1845,24 @@ class UpperMachineApp:
             "lane_postprocess_queue_ms": lane_timing.get("postprocess_queue_ms"),
             "lane_postprocess_ms": lane_timing.get("postprocess_ms"),
             "lane_worker_total_ms": lane_timing.get("total_ms"),
+            "lane_input_sync_ms": lane_timing.get("input_sync_ms"),
+            "lane_output_sync_ms": lane_timing.get("output_sync_ms"),
+            "lane_publish_ms": lane_timing.get("publish_ms"),
+            "lane_native_claimed_count": native_lane_counters.get(
+                "claimed_count"
+            ),
+            "lane_native_completed_count": native_lane_counters.get(
+                "completed_count"
+            ),
+            "lane_native_overwritten_count": native_lane_counters.get(
+                "overwritten_count"
+            ),
+            "lane_native_out_of_order_count": native_lane_counters.get(
+                "out_of_order_count"
+            ),
+            "lane_native_error_count": native_lane_counters.get(
+                "error_count"
+            ),
             "geometry_ms": float(geometry_ms),
             "track_ms": float(track_ms),
             "planning_ms": float(planning_ms),
@@ -1825,6 +2007,8 @@ class UpperMachineApp:
         self.camera.release()
         if self.lane_segmenter is not None:
             self.lane_segmenter.close()
+        if self.lane_capi_backend is not None:
+            self.lane_capi_backend.close()
         self.bridge.close()
         _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
         if self.road_sign_analyzer_config.enable:
@@ -1833,7 +2017,10 @@ class UpperMachineApp:
             _put_latest(self.ui_queue, None, release_func=self._release_owned_shared_payload)
         for lane_queue in self.lane_input_queues:
             _put_latest(lane_queue, None, release_func=self._release_owned_shared_payload)
-        processes = [self.ai_process, *self.lane_processes]
+        processes = [
+            self.ai_process,
+            *([] if self.lane_capi_active else self.lane_processes),
+        ]
         if self.road_sign_analyzer_config.enable:
             processes.append(self.road_sign_analyzer_process)
         if self.ui_active:
