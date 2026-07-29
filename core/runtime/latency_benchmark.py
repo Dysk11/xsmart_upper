@@ -303,6 +303,19 @@ class LatencyBenchmark:
         unique_ai_frames = len(
             {int(row["ai_frame_id"]) for row in self.rows if int(row.get("ai_frame_id", -1)) >= 0}
         )
+        native_completed_values = [
+            int(row["lane_native_completed_count"])
+            for row in self.rows
+            if row.get("lane_native_completed_count") is not None
+        ]
+        native_completed_fps = (
+            (
+                native_completed_values[-1] - native_completed_values[0]
+            )
+            / sample_elapsed
+            if sample_elapsed > 0 and len(native_completed_values) >= 2
+            else None
+        )
         return {
             "metadata": self.metadata,
             "warmup_sec": self.warmup_sec,
@@ -311,6 +324,7 @@ class LatencyBenchmark:
             "command_samples": len(self.rows),
             "command_fps": len(self.rows) / sample_elapsed if sample_elapsed > 0 else None,
             "lane_result_fps": unique_lane_frames / sample_elapsed if sample_elapsed > 0 else None,
+            "lane_native_completed_fps": native_completed_fps,
             "ai_result_fps": unique_ai_frames / sample_elapsed if sample_elapsed > 0 else None,
             "errors": list(self.errors),
             "metrics": metrics,
@@ -375,6 +389,7 @@ class LatencyBenchmark:
             f"- Observed duration: `{summary.get('observed_duration_sec', 0):.3f} s`",
             f"- Command FPS: `{_format_number(summary.get('command_fps'))}`",
             f"- Lane-result FPS: `{_format_number(summary.get('lane_result_fps'))}`",
+            f"- Native-completed FPS: `{_format_number(summary.get('lane_native_completed_fps'))}`",
             f"- AI-result FPS: `{_format_number(summary.get('ai_result_fps'))}`",
             "",
             "## Latency metrics (ms)",

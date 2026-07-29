@@ -48,6 +48,8 @@ rknn_lane_segmenter:
   pipeline_depth: 1
   max_result_age_frames: 2
   max_result_age_ms: 50.0
+  result_notification: eventfd
+  target_result_lag_frames: 1
   fresh_result_wait_ms: 0.0
   drop_stale_results: true
 

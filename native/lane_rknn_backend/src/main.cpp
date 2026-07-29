@@ -133,6 +133,7 @@ struct Options {
   std::string model_path;
   std::string input_shm;
   std::string result_shm;
+  int result_event_fd = -1;
   std::array<std::uint32_t, 2> core_masks = {1U, 2U};
   std::array<int, 2> cpu_cores = {6, 7};
   std::string preprocess = "auto";
@@ -157,6 +158,8 @@ Options parse_options(const int argc, char** argv) {
       options.input_shm = value;
     } else if (key == "--result-shm") {
       options.result_shm = value;
+    } else if (key == "--result-event-fd") {
+      options.result_event_fd = std::stoi(value);
     } else if (key == "--core-masks") {
       const auto comma = value.find(',');
       if (comma == std::string::npos) {
@@ -191,8 +194,9 @@ Options parse_options(const int argc, char** argv) {
     }
   }
   if (options.model_path.empty() || options.input_shm.empty() ||
-      options.result_shm.empty()) {
-    throw std::invalid_argument("--model, --input-shm and --result-shm are required");
+      options.result_shm.empty() || options.result_event_fd < 0) {
+    throw std::invalid_argument(
+        "--model, --input-shm, --result-shm and --result-event-fd are required");
   }
   if (options.preprocess != "auto" && options.preprocess != "direct" &&
       options.preprocess != "rga") {
@@ -982,13 +986,17 @@ struct Counters {
   std::atomic<std::uint64_t> overwritten{0};
   std::atomic<std::uint64_t> out_of_order{0};
   std::atomic<std::uint64_t> errors{0};
+  std::atomic<std::uint64_t> notifications{0};
+  std::atomic<std::uint64_t> notification_errors{0};
 };
 
 class ResultPublisher {
  public:
-  ResultPublisher(SharedMapping& mapping, Counters& counters)
+  ResultPublisher(SharedMapping& mapping, Counters& counters,
+                  const int result_event_fd)
       : mapping_(mapping), counters_(counters),
-        header_(reinterpret_cast<GlobalHeader*>(mapping.bytes())) {
+        header_(reinterpret_cast<GlobalHeader*>(mapping.bytes())),
+        result_event_fd_(result_event_fd) {
     validate_global_header(*header_, xsmart::kResultMagic, mapping.size(),
                            xsmart::kResultSlotHeaderSize);
   }
@@ -1047,6 +1055,10 @@ class ResultPublisher {
     snapshot.out_of_order_count =
         counters_.out_of_order.load(std::memory_order_relaxed);
     snapshot.error_count = counters_.errors.load(std::memory_order_relaxed);
+    snapshot.notification_count =
+        counters_.notifications.load(std::memory_order_relaxed);
+    snapshot.notification_error_count =
+        counters_.notification_errors.load(std::memory_order_relaxed);
     for (std::size_t index = 0; index < snapshot.instance_count; ++index) {
       snapshot.instances[index] = output.instances[index];
     }
@@ -1062,6 +1074,16 @@ class ResultPublisher {
     atomic_store(&header_->published_slot, slot);
     atomic_store(&header_->publish_sequence, publish_sequence);
     latest_frame_id_ = job.frame_id;
+    const std::uint64_t notification = 1;
+    const ssize_t written =
+        ::write(result_event_fd_, &notification, sizeof(notification));
+    if (written == static_cast<ssize_t>(sizeof(notification))) {
+      counters_.notifications.fetch_add(1, std::memory_order_relaxed);
+    } else if (written < 0 && errno == EAGAIN) {
+      counters_.notifications.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      counters_.notification_errors.fetch_add(1, std::memory_order_relaxed);
+    }
     return true;
   }
 
@@ -1071,6 +1093,7 @@ class ResultPublisher {
   GlobalHeader* header_;
   std::mutex mutex_;
   std::uint64_t latest_frame_id_ = 0;
+  int result_event_fd_ = -1;
 };
 
 class Worker {
@@ -1185,7 +1208,7 @@ int run_backend(const Options& options) {
   SharedMapping result_mapping(options.result_shm, true);
   InputReader input_reader(input_mapping);
   Counters counters;
-  ResultPublisher publisher(result_mapping, counters);
+  ResultPublisher publisher(result_mapping, counters, options.result_event_fd);
 
   rknn_context contexts[2] = {0, 0};
   std::unique_ptr<Worker> workers[2];

@@ -912,6 +912,14 @@ class UpperMachineApp:
             0.0,
             float(lane_config.get("fresh_result_wait_ms", 6.0)),
         )
+        self.lane_target_result_lag_frames = max(
+            0,
+            int(lane_config.get("target_result_lag_frames", 1)),
+        )
+        self.lane_event_wait_enabled = (
+            config.get("camera", {}).get("mode", "camera")
+            in {"camera", "shared_memory"}
+        )
         self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
         ai_config = config.get("rknn_object_detector", {})
         self.ai_inference_stride = max(1, int(ai_config.get("inference_stride", 1)))
@@ -970,6 +978,9 @@ class UpperMachineApp:
                 "lane_backend_requested": self.lane_backend_requested,
                 "lane_backend_actual": "pending" if self.lane_capi_requested else self.lane_backend_requested,
                 "lane_worker_core_masks": worker_core_masks,
+                "lane_fresh_result_wait_ms": self.lane_fresh_result_wait_ms,
+                "lane_target_result_lag_frames": self.lane_target_result_lag_frames,
+                "lane_event_wait_enabled": self.lane_event_wait_enabled,
                 "object_core_mask": ai_config.get("core_mask", ""),
             },
         )
@@ -1044,6 +1055,11 @@ class UpperMachineApp:
         self.last_segmentation_timing: dict[str, float] = {}
         self.last_segmentation_worker_index = -1
         self.last_native_lane_counters: dict[str, int] = {}
+        self.last_lane_capture_to_publish_ms = 0.0
+        self.last_lane_publish_to_wait_ms = 0.0
+        self.last_lane_event_wait_ms = 0.0
+        self.last_lane_wait_target_met = False
+        self.last_lane_published_at = 0.0
         self.last_ai_frame_id = -1
         self.last_ai_captured_at = 0.0
         self.last_ai_completed_at = 0.0
@@ -1209,6 +1225,7 @@ class UpperMachineApp:
             lane_roi_time = time.perf_counter()
             self.frame_id += 1
             self._current_source_frame_id = int(captured_frame.source_frame_id)
+            self._publish_capi_lane_frame(frame_rgb, captured_at)
             ai_frame_payload = None
             if self.frame_id % self.ai_inference_stride == 0:
                 ai_frame_payload = _share_ai_frames(
@@ -1595,37 +1612,50 @@ class UpperMachineApp:
 
         if self.lane_capi_active:
             assert self.lane_capi_backend is not None
-            captured_time = float(
-                captured_at if captured_at is not None else time.perf_counter()
-            )
-            self.lane_capi_backend.publish(
-                frame,
-                frame_id=self.frame_id,
-                source_frame_id=getattr(
-                    self,
-                    "_current_source_frame_id",
-                    self.frame_id,
-                ),
-                captured_at=captured_time,
-            )
             while self._receive_capi_lane_result():
                 pass
-            fresh_deadline = (
-                time.monotonic() + self.lane_fresh_result_wait_ms / 1000.0
+            self.last_lane_event_wait_ms = 0.0
+            _notified, _count, waited_ms = (
+                self.lane_capi_backend.wait_for_result(0.0)
             )
-            target_frame_id = self.frame_id - 1
+            self.last_lane_event_wait_ms += waited_ms
+            while self._receive_capi_lane_result():
+                pass
+            wait_started = time.perf_counter()
+            self.last_lane_publish_to_wait_ms = (
+                max(0.0, (wait_started - self.last_lane_published_at) * 1000.0)
+                if self.last_lane_published_at > 0.0
+                else 0.0
+            )
+            target_frame_id = self.frame_id - self.lane_target_result_lag_frames
+            wait_budget_ms = (
+                self.lane_fresh_result_wait_ms
+                if self.lane_event_wait_enabled
+                else 0.0
+            )
+            fresh_deadline = time.monotonic() + wait_budget_ms / 1000.0
             while (
                 self.last_segmentation_result is not None
                 and self.last_segmentation_frame_id < target_frame_id
                 and time.monotonic() < fresh_deadline
             ):
-                if not self._receive_capi_lane_result():
-                    time.sleep(0.0002)
+                remaining = max(0.0, fresh_deadline - time.monotonic())
+                _notified, _count, waited_ms = (
+                    self.lane_capi_backend.wait_for_result(remaining)
+                )
+                self.last_lane_event_wait_ms += waited_ms
+                while self._receive_capi_lane_result():
+                    pass
             if self.last_segmentation_result is None:
                 deadline = time.monotonic() + 2.0
                 while self.last_segmentation_result is None and time.monotonic() < deadline:
-                    if not self._receive_capi_lane_result():
-                        time.sleep(0.0005)
+                    remaining = max(0.0, deadline - time.monotonic())
+                    _notified, _count, waited_ms = (
+                        self.lane_capi_backend.wait_for_result(remaining)
+                    )
+                    self.last_lane_event_wait_ms += waited_ms
+                    while self._receive_capi_lane_result():
+                        pass
             if self.last_segmentation_result is None:
                 return SegmentationResult(
                     np.zeros(frame.shape[:2], dtype=np.uint8),
@@ -1633,6 +1663,9 @@ class UpperMachineApp:
                     0.0,
                     "backend_timeout",
                 )
+            self.last_lane_wait_target_met = (
+                self.last_segmentation_frame_id >= target_frame_id
+            )
             result_age_frames = self.frame_id - self.last_segmentation_frame_id
             result_age_ms = max(
                 0.0,
@@ -1685,6 +1718,33 @@ class UpperMachineApp:
                 break
         assert self.last_segmentation_result is not None
         return self.last_segmentation_result
+
+    def _publish_capi_lane_frame(
+        self,
+        frame: np.ndarray,
+        captured_at: float,
+    ) -> None:
+        """Publish the current frame before unrelated main-loop work begins."""
+
+        self.last_lane_capture_to_publish_ms = 0.0
+        self.last_lane_published_at = 0.0
+        if not self.lane_capi_active or self.lane_capi_backend is None:
+            return
+        self.lane_capi_backend.publish(
+            frame,
+            frame_id=self.frame_id,
+            source_frame_id=getattr(
+                self,
+                "_current_source_frame_id",
+                self.frame_id,
+            ),
+            captured_at=float(captured_at),
+        )
+        self.last_lane_published_at = time.perf_counter()
+        self.last_lane_capture_to_publish_ms = max(
+            0.0,
+            (self.last_lane_published_at - float(captured_at)) * 1000.0,
+        )
 
     def _receive_capi_lane_result(self) -> bool:
         """Consume one newest native result and discard frame-number regressions."""
@@ -1781,6 +1841,12 @@ class UpperMachineApp:
         lane_timing = self.last_segmentation_timing
         ai_timing = self.last_ai_timing
         native_lane_counters = getattr(self, "last_native_lane_counters", {})
+        lane_capi_backend = getattr(self, "lane_capi_backend", None)
+        native_notification_metrics = (
+            lane_capi_backend.notification_metrics
+            if lane_capi_backend is not None
+            else {}
+        )
         lane_captured_at = self.last_segmentation_captured_at
         ai_captured_at = self.last_ai_captured_at
         return {
@@ -1840,6 +1906,30 @@ class UpperMachineApp:
                 else None
             ),
             "segmentation_wait_ms": float(segmentation_wait_ms),
+            "lane_capture_to_publish_ms": float(
+                getattr(self, "last_lane_capture_to_publish_ms", 0.0)
+            ),
+            "lane_publish_to_wait_ms": float(
+                getattr(self, "last_lane_publish_to_wait_ms", 0.0)
+            ),
+            "lane_event_wait_ms": float(
+                getattr(self, "last_lane_event_wait_ms", 0.0)
+            ),
+            "lane_wait_target_met": int(
+                getattr(self, "last_lane_wait_target_met", False)
+            ),
+            "lane_result_complete_to_consume_ms": (
+                max(
+                    0.0,
+                    (
+                        self.last_segmentation_ipc_finished_at
+                        - self.last_segmentation_completed_at
+                    )
+                    * 1000.0,
+                )
+                if self.last_segmentation_completed_at > 0.0
+                else None
+            ),
             "lane_preprocess_ms": lane_timing.get("preprocess_ms"),
             "lane_npu_inference_ms": lane_timing.get("inference_ms"),
             "lane_postprocess_queue_ms": lane_timing.get("postprocess_queue_ms"),
@@ -1862,6 +1952,27 @@ class UpperMachineApp:
             ),
             "lane_native_error_count": native_lane_counters.get(
                 "error_count"
+            ),
+            "lane_native_notification_count": native_lane_counters.get(
+                "notification_count"
+            ),
+            "lane_native_notification_error_count": native_lane_counters.get(
+                "notification_error_count"
+            ),
+            "lane_event_wait_count": native_notification_metrics.get(
+                "wait_count"
+            ),
+            "lane_event_wait_timeout_count": native_notification_metrics.get(
+                "wait_timeout_count"
+            ),
+            "lane_event_wakeup_count": native_notification_metrics.get(
+                "wakeup_count"
+            ),
+            "lane_event_coalesced_count": native_notification_metrics.get(
+                "coalesced_notification_count"
+            ),
+            "lane_event_read_error_count": native_notification_metrics.get(
+                "notification_read_error_count"
             ),
             "geometry_ms": float(geometry_ms),
             "track_ms": float(track_ms),

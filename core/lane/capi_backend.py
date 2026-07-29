@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from multiprocessing import shared_memory
 from pathlib import Path
 import os
+import select
 import struct
 import subprocess
 import time
@@ -17,7 +18,7 @@ import numpy as np
 from core.lane.rknn_segmenter import SegmentationInstance, SegmentationResult
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SLOT_COUNT = 2
 GLOBAL_HEADER_SIZE = 64
 INPUT_SLOT_HEADER_SIZE = 64
@@ -27,7 +28,7 @@ RESULT_MAGIC = b"XSLNOT1\0"
 
 GLOBAL_HEADER = struct.Struct("<8sIIIIQIIII16x")
 INPUT_SLOT_HEADER = struct.Struct("<QQQQIIIII12x")
-RESULT_BASE_HEADER = struct.Struct("<QQQQQQIIIIIIIdddddddQQQQQ")
+RESULT_BASE_HEADER = struct.Struct("<QQQQQQIIIIIIIdddddddQQQQQQQ")
 RESULT_INSTANCE = struct.Struct("<iiiif")
 
 BACKEND_STATE_INITIALIZING = 0
@@ -242,6 +243,8 @@ class LatestResultSharedMemory:
             overwritten_count,
             out_of_order_count,
             error_count,
+            notification_count,
+            notification_error_count,
         ) = values
         if (
             width <= 0
@@ -311,6 +314,8 @@ class LatestResultSharedMemory:
                 "overwritten_count": int(overwritten_count),
                 "out_of_order_count": int(out_of_order_count),
                 "error_count": int(error_count),
+                "notification_count": int(notification_count),
+                "notification_error_count": int(notification_error_count),
             },
         )
 
@@ -364,9 +369,20 @@ class CapiLaneBackend:
         self.nms_threshold = float(config.get("nms_threshold", 0.45))
         self.mask_threshold = float(config.get("mask_threshold", 0.5))
         self.max_instances = min(3, max(1, int(config.get("max_instances", 3))))
+        self.result_notification = str(
+            config.get("result_notification", "eventfd")
+        ).lower()
+        if self.result_notification != "eventfd":
+            raise ValueError("C API result_notification must be eventfd")
         self.input_transport: LatestFrameSharedMemory | None = None
         self.result_transport: LatestResultSharedMemory | None = None
         self.process: subprocess.Popen[str] | None = None
+        self.result_event_fd: int | None = None
+        self.wait_count = 0
+        self.wait_timeout_count = 0
+        self.wakeup_count = 0
+        self.coalesced_notification_count = 0
+        self.notification_read_error_count = 0
         self.actual_backend = "unstarted"
 
     def start(self) -> None:
@@ -376,8 +392,18 @@ class CapiLaneBackend:
             raise RuntimeError(f"native lane backend binary not found: {self.binary_path}")
         if not self.model_path.is_file():
             raise RuntimeError(f"native lane model not found: {self.model_path}")
+        if not hasattr(os, "eventfd"):
+            raise RuntimeError("eventfd result notification requires Linux/Python 3.10+")
         self.input_transport = LatestFrameSharedMemory(self.width, self.height)
         self.result_transport = LatestResultSharedMemory(self.width, self.height)
+        try:
+            self.result_event_fd = os.eventfd(
+                0,
+                os.EFD_NONBLOCK | os.EFD_CLOEXEC,
+            )
+        except Exception:
+            self.close()
+            raise
         command = [
             str(self.binary_path),
             "--model",
@@ -386,6 +412,8 @@ class CapiLaneBackend:
             self.input_transport.name,
             "--result-shm",
             self.result_transport.name,
+            "--result-event-fd",
+            str(self.result_event_fd),
             "--core-masks",
             f"{self.core_masks[0]},{self.core_masks[1]}",
             "--cpu-cores",
@@ -410,6 +438,7 @@ class CapiLaneBackend:
                 stdout=None,
                 stderr=None,
                 text=True,
+                pass_fds=(self.result_event_fd,),
             )
             deadline = time.monotonic() + self.startup_timeout_sec
             while time.monotonic() < deadline:
@@ -457,6 +486,53 @@ class CapiLaneBackend:
             return None
         return self.result_transport.read_latest()
 
+    def wait_for_result(self, timeout_sec: float) -> tuple[bool, int, float]:
+        """Wait for a committed result notification without polling shared memory."""
+
+        if self.result_event_fd is None:
+            raise RuntimeError("native lane result eventfd is not available")
+        timeout = max(0.0, float(timeout_sec))
+        started = time.perf_counter()
+        self.wait_count += 1
+        try:
+            readable, _, _ = select.select(
+                [self.result_event_fd],
+                [],
+                [],
+                timeout,
+            )
+        except (OSError, ValueError):
+            self.notification_read_error_count += 1
+            return False, 0, (time.perf_counter() - started) * 1000.0
+        if not readable:
+            self.wait_timeout_count += 1
+            return False, 0, (time.perf_counter() - started) * 1000.0
+        try:
+            notification_count = int(os.eventfd_read(self.result_event_fd))
+        except BlockingIOError:
+            notification_count = 0
+        except OSError:
+            self.notification_read_error_count += 1
+            return False, 0, (time.perf_counter() - started) * 1000.0
+        if notification_count > 0:
+            self.wakeup_count += 1
+            self.coalesced_notification_count += max(0, notification_count - 1)
+        return (
+            notification_count > 0,
+            notification_count,
+            (time.perf_counter() - started) * 1000.0,
+        )
+
+    @property
+    def notification_metrics(self) -> dict[str, int]:
+        return {
+            "wait_count": self.wait_count,
+            "wait_timeout_count": self.wait_timeout_count,
+            "wakeup_count": self.wakeup_count,
+            "coalesced_notification_count": self.coalesced_notification_count,
+            "notification_read_error_count": self.notification_read_error_count,
+        }
+
     def close(self) -> None:
         process = self.process
         self.process = None
@@ -473,6 +549,12 @@ class CapiLaneBackend:
         if self.result_transport is not None:
             self.result_transport.close()
             self.result_transport = None
+        if self.result_event_fd is not None:
+            try:
+                os.close(self.result_event_fd)
+            except OSError:
+                pass
+            self.result_event_fd = None
         self.actual_backend = "closed"
 
 

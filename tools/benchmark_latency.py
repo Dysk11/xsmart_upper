@@ -56,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("float", "native"),
         help="Select preallocated float outputs or native zero-copy outputs.",
     )
+    parser.add_argument(
+        "--fresh-result-wait-ms",
+        type=float,
+        help="Override the realtime C API eventfd wait budget.",
+    )
     parser.add_argument("--warmup-sec", type=float, default=None)
     parser.add_argument("--duration-sec", type=float, default=None)
     parser.add_argument("--system-sample-interval-sec", type=float, default=None)
@@ -94,6 +99,11 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
         lane_config["preprocess_backend"] = args.preprocess
     if getattr(args, "output_mode", None):
         lane_config["output_mode"] = args.output_mode
+    if getattr(args, "fresh_result_wait_ms", None) is not None:
+        lane_config["fresh_result_wait_ms"] = max(
+            0.0,
+            float(args.fresh_result_wait_ms),
+        )
 
     visualizer = config.setdefault("visualizer", {})
     visualizer["show_window"] = False

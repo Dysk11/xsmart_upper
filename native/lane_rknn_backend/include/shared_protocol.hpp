@@ -5,7 +5,7 @@
 
 namespace xsmart {
 
-constexpr std::uint32_t kProtocolVersion = 1;
+constexpr std::uint32_t kProtocolVersion = 2;
 constexpr std::size_t kGlobalHeaderSize = 64;
 constexpr std::size_t kInputSlotHeaderSize = 64;
 constexpr std::size_t kResultSlotHeaderSize = 256;
@@ -92,8 +92,10 @@ struct ResultSlotHeader {
   std::uint64_t overwritten_count;
   std::uint64_t out_of_order_count;
   std::uint64_t error_count;
+  std::uint64_t notification_count;
+  std::uint64_t notification_error_count;
   ResultInstance instances[3];
-  std::uint8_t reserved[24];
+  std::uint8_t reserved[8];
 };
 
 #pragma pack(pop)
