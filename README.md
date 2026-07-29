@@ -161,6 +161,32 @@ python main.py
 python main.py --mode video --video /path/to/demo.mp4 --bridge mock
 ```
 
+## Camera-to-command latency benchmark
+
+The reusable benchmark records command-aligned source, RKNN, lane geometry,
+planning, protocol, and bridge timings. It writes raw CSV samples plus JSON and
+Markdown summaries under `outputs/benchmarks`.
+
+```bash
+python tools/benchmark_latency.py \
+  --mode shared_memory \
+  --bridge mock \
+  --warmup-sec 10 \
+  --duration-sec 60
+
+python tools/benchmark_latency.py \
+  --mode video \
+  --video outputs/video/record_20260708_135111.mp4 \
+  --bridge mock \
+  --warmup-sec 10 \
+  --duration-sec 60
+```
+
+Serial benchmarking is intentionally blocked unless vehicle motion has been
+physically disabled and `--serial-safety-confirmed` is supplied. The serial
+endpoint is the return of host-side `write()` plus `flush()`; it does not
+include TC264 parsing or mechanical response.
+
 ---
 
 # RKNN 目标识别、行人停车、吃 coin 功能

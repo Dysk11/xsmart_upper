@@ -3,6 +3,13 @@
 # Application
 app:
   fps_smoothing_alpha: 0.1
+  latency_benchmark:
+    enable: false
+    warmup_sec: 10.0
+    duration_sec: 60.0
+    system_sample_interval_sec: 1.0
+    output_dir: outputs/benchmarks
+    auto_stop: true
 
 # Input
 camera:

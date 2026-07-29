@@ -66,6 +66,7 @@ from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
 from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
 from core.planning.target_selector import TargetPointResult, TargetSelector
+from core.runtime.latency_benchmark import LatencyBenchmark
 from core.visualization.visualizer import (
     CarAvoidanceUiSnapshot,
     LaneUiSnapshot,
@@ -795,6 +796,14 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
             resolve_project_path(project_root, str(road_sign_analyzer_config["output_dir"]))
         )
 
+    benchmark_config = runtime_config.setdefault("app", {}).setdefault(
+        "latency_benchmark", {}
+    )
+    if benchmark_config.get("output_dir"):
+        benchmark_config["output_dir"] = str(
+            resolve_project_path(project_root, str(benchmark_config["output_dir"]))
+        )
+
     return runtime_config
 
 
@@ -910,6 +919,20 @@ class UpperMachineApp:
         self.bridge: BaseVehicleBridge = build_vehicle_bridge(bridge_config)
         self.csv_logger = CsvLogger(config.get("logger", {}))
         self.fps_counter = FPSCounter(config.get("app", {}).get("fps_smoothing_alpha", 0.2))
+        self.latency_benchmark = LatencyBenchmark(
+            config.get("app", {}).get("latency_benchmark", {}),
+            metadata={
+                "source_mode": config.get("camera", {}).get("mode", "unknown"),
+                "shared_memory_name": config.get("camera", {}).get(
+                    "shared_memory_name", ""
+                ),
+                "video_path": config.get("camera", {}).get("video_path", ""),
+                "bridge_type": bridge_config.get("type", "mock"),
+                "lane_parallel": self.lane_parallel_enabled,
+                "lane_worker_core_masks": worker_core_masks,
+                "object_core_mask": ai_config.get("core_mask", ""),
+            },
+        )
         timing_config = config.get("app", {}).get("lane_timing", {})
         self.lane_timing_enabled = bool(timing_config.get("enable", True))
         self.lane_timing_interval = max(1, int(timing_config.get("print_interval_frames", 30)))
@@ -976,7 +999,15 @@ class UpperMachineApp:
         self.last_segmentation_result: SegmentationResult | None = None
         self.last_segmentation_frame_id = -1
         self.last_segmentation_captured_at = 0.0
+        self.last_segmentation_completed_at = 0.0
+        self.last_segmentation_ipc_finished_at = 0.0
+        self.last_segmentation_timing: dict[str, float] = {}
+        self.last_segmentation_worker_index = -1
         self.last_ai_frame_id = -1
+        self.last_ai_captured_at = 0.0
+        self.last_ai_completed_at = 0.0
+        self.last_ai_ipc_finished_at = 0.0
+        self.last_ai_timing: dict[str, float] = {}
         self.ai_completed_count = 0
         self.ai_timing_totals: dict[str, float] = {}
         self.ui_frame_ack_queue = self.mp_context.Queue()
@@ -1171,6 +1202,18 @@ class UpperMachineApp:
                 ) = latest_ai_result
                 self.ai_completed_count += 1
                 self._accumulate_timing(self.ai_timing_totals, _timing)
+                self.last_ai_captured_at = float(_captured_at)
+                self.last_ai_completed_at = float(_completed_at)
+                self.last_ai_ipc_finished_at = float(_ipc_finished)
+                self.last_ai_timing = (
+                    {
+                        str(key): float(value)
+                        for key, value in _timing.items()
+                        if isinstance(value, (int, float))
+                    }
+                    if isinstance(_timing, dict)
+                    else {}
+                )
                 result_age = self.frame_id - int(ai_frame_id)
                 if int(ai_frame_id) > self.last_ai_frame_id and (
                     not self.drop_stale_ai_results or result_age <= self.ai_max_result_age_frames
@@ -1334,10 +1377,14 @@ class UpperMachineApp:
             planning_finished = time.perf_counter()
 
             # 第 6 步：通过桥接层发给下位机，至于串口协议细节由 bridge/protocol 负责。
+            protocol_started = time.perf_counter()
             payload = self._build_payload(control_command, planning_state)
             bridge_started = time.perf_counter()
             self.bridge.send(payload)
-            bridge_ms = (time.perf_counter() - bridge_started) * 1000.0
+            bridge_finished = time.perf_counter()
+            protocol_ms = (bridge_started - protocol_started) * 1000.0
+            bridge_ms = (bridge_finished - bridge_started) * 1000.0
+            track_ms = (lane_track_time - lane_detect_time) * 1000.0
             self._record_lane_timing(
                 total_ms=(planning_finished - lane_start_time) * 1000.0,
                 roi_ms=(lane_roi_time - lane_start_time) * 1000.0,
@@ -1349,6 +1396,25 @@ class UpperMachineApp:
                 geometry_ms=geometry_ms,
                 bridge_ms=bridge_ms,
             )
+            benchmark_complete = self.latency_benchmark.observe(
+                self._build_latency_sample(
+                    current_frame_id=self.frame_id,
+                    source_frame_id=captured_frame.source_frame_id,
+                    captured_at=captured_at,
+                    bridge_finished=bridge_finished,
+                    camera_wait_ms=camera_wait_ms,
+                    color_conversion_ms=captured_frame.color_conversion_ms,
+                    segmentation_wait_ms=segmentation_wait_ms,
+                    geometry_ms=geometry_ms,
+                    track_ms=track_ms,
+                    planning_ms=(planning_finished - planning_started) * 1000.0,
+                    protocol_ms=protocol_ms,
+                    bridge_ms=bridge_ms,
+                ),
+                observed_at=bridge_finished,
+            )
+            if benchmark_complete and self.latency_benchmark.auto_stop:
+                self.stop_event.set()
             fps_value = self.fps_counter.update()
 
             # 第 7 步：把关键数据落盘，方便赛后分析和调参。
@@ -1451,7 +1517,17 @@ class UpperMachineApp:
 
         if not self.lane_parallel_enabled:
             assert self.lane_segmenter is not None
-            return self.lane_segmenter.segment(frame)
+            result = self.lane_segmenter.segment(frame)
+            completed_at = time.perf_counter()
+            self.last_segmentation_frame_id = self.frame_id
+            self.last_segmentation_captured_at = float(
+                captured_at if captured_at is not None else completed_at
+            )
+            self.last_segmentation_completed_at = completed_at
+            self.last_segmentation_ipc_finished_at = self.last_segmentation_captured_at
+            self.last_segmentation_timing = dict(self.lane_segmenter.last_timing)
+            self.last_segmentation_worker_index = -1
+            return result
 
         while self._receive_lane_result(block=False):
             pass
@@ -1482,8 +1558,8 @@ class UpperMachineApp:
         (
             frame_id,
             captured_at,
-            _completed_at,
-            _ipc_finished,
+            completed_at,
+            ipc_finished,
             _timing,
             worker_index,
             mask_shape,
@@ -1506,8 +1582,127 @@ class UpperMachineApp:
             result = SegmentationResult(mask, instances, confidence, status)
             self.last_segmentation_frame_id = int(frame_id)
             self.last_segmentation_captured_at = float(captured_at)
+            self.last_segmentation_completed_at = float(completed_at)
+            self.last_segmentation_ipc_finished_at = float(ipc_finished)
+            self.last_segmentation_timing = (
+                {
+                    str(key): float(value)
+                    for key, value in _timing.items()
+                    if isinstance(value, (int, float))
+                }
+                if isinstance(_timing, dict)
+                else {}
+            )
+            self.last_segmentation_worker_index = worker_index
             self.last_segmentation_result = result
         return True
+
+    def _build_latency_sample(
+        self,
+        *,
+        current_frame_id: int,
+        source_frame_id: int,
+        captured_at: float,
+        bridge_finished: float,
+        camera_wait_ms: float,
+        color_conversion_ms: float,
+        segmentation_wait_ms: float,
+        geometry_ms: float,
+        track_ms: float,
+        planning_ms: float,
+        protocol_ms: float,
+        bridge_ms: float,
+    ) -> dict[str, Any]:
+        """Build one command-aligned latency row without performing I/O."""
+
+        lane_timing = self.last_segmentation_timing
+        ai_timing = self.last_ai_timing
+        lane_captured_at = self.last_segmentation_captured_at
+        ai_captured_at = self.last_ai_captured_at
+        return {
+            "current_frame_id": int(current_frame_id),
+            "source_frame_id": int(source_frame_id),
+            "lane_frame_id": int(self.last_segmentation_frame_id),
+            "lane_worker_index": int(self.last_segmentation_worker_index),
+            "lane_result_age_frames": max(
+                0,
+                int(current_frame_id) - int(self.last_segmentation_frame_id),
+            ),
+            "ai_frame_id": int(self.last_ai_frame_id),
+            "ai_result_age_frames": (
+                max(0, int(current_frame_id) - int(self.last_ai_frame_id))
+                if self.last_ai_frame_id >= 0
+                else None
+            ),
+            "camera_wait_ms": float(camera_wait_ms),
+            "color_conversion_ms": float(color_conversion_ms),
+            "current_frame_to_send_ms": max(
+                0.0,
+                (bridge_finished - captured_at) * 1000.0,
+            ),
+            "lane_source_to_send_ms": (
+                max(0.0, (bridge_finished - lane_captured_at) * 1000.0)
+                if lane_captured_at > 0.0
+                else None
+            ),
+            "lane_source_to_worker_ipc_ms": (
+                max(
+                    0.0,
+                    (
+                        self.last_segmentation_ipc_finished_at
+                        - lane_captured_at
+                    )
+                    * 1000.0,
+                )
+                if lane_captured_at > 0.0
+                else None
+            ),
+            "lane_worker_complete_ms": (
+                max(
+                    0.0,
+                    (self.last_segmentation_completed_at - lane_captured_at)
+                    * 1000.0,
+                )
+                if lane_captured_at > 0.0
+                else None
+            ),
+            "lane_result_to_send_ms": (
+                max(
+                    0.0,
+                    (bridge_finished - self.last_segmentation_completed_at)
+                    * 1000.0,
+                )
+                if self.last_segmentation_completed_at > 0.0
+                else None
+            ),
+            "segmentation_wait_ms": float(segmentation_wait_ms),
+            "lane_preprocess_ms": lane_timing.get("preprocess_ms"),
+            "lane_npu_inference_ms": lane_timing.get("inference_ms"),
+            "lane_postprocess_queue_ms": lane_timing.get("postprocess_queue_ms"),
+            "lane_postprocess_ms": lane_timing.get("postprocess_ms"),
+            "lane_worker_total_ms": lane_timing.get("total_ms"),
+            "geometry_ms": float(geometry_ms),
+            "track_ms": float(track_ms),
+            "planning_ms": float(planning_ms),
+            "protocol_ms": float(protocol_ms),
+            "bridge_ms": float(bridge_ms),
+            "ai_source_to_complete_ms": (
+                max(0.0, (self.last_ai_completed_at - ai_captured_at) * 1000.0)
+                if ai_captured_at > 0.0
+                else None
+            ),
+            "ai_source_to_worker_ipc_ms": (
+                max(
+                    0.0,
+                    (self.last_ai_ipc_finished_at - ai_captured_at) * 1000.0,
+                )
+                if ai_captured_at > 0.0
+                else None
+            ),
+            "ai_preprocess_ms": ai_timing.get("preprocess_ms"),
+            "ai_npu_inference_ms": ai_timing.get("inference_ms"),
+            "ai_postprocess_ms": ai_timing.get("postprocess_ms"),
+        }
 
     @staticmethod
     def _accumulate_timing(totals: dict[str, float], timing: Any) -> None:
@@ -1619,11 +1814,18 @@ class UpperMachineApp:
             无返回值。
         """
 
+        self.stop_event.set()
+        benchmark_summary = self.latency_benchmark.finalize()
+        if benchmark_summary is not None:
+            for output_type, output_path in self.latency_benchmark.output_paths.items():
+                print(
+                    f"[LATENCY_BENCHMARK] {output_type}={output_path}",
+                    flush=True,
+                )
         self.camera.release()
         if self.lane_segmenter is not None:
             self.lane_segmenter.close()
         self.bridge.close()
-        self.stop_event.set()
         _put_latest(self.ai_input_queue, None, release_func=self._release_owned_shared_payload)
         if self.road_sign_analyzer_config.enable:
             _put_latest(self.road_sign_analysis_input_queue, None)
