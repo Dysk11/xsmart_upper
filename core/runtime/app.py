@@ -445,15 +445,37 @@ def _ai_inference_worker(
     ocr_trigger_queue: Any,
     rgb_ack_queue: Any,
     bgr_ack_queue: Any,
+    startup_queue: Any,
     stop_event: Any,
 ) -> None:
     """Run object detection and exact-frame road-sign OCR in one AI process."""
 
     detector = RknnObjectDetector(detector_config)
-    ocr_session = RoadSignOcrSession(
-        ocr_config,
-        project_root=Path(project_root),
-        trigger_callback=ocr_trigger_queue.put,
+    try:
+        detector.open()
+        ocr_session = RoadSignOcrSession(
+            ocr_config,
+            project_root=Path(project_root),
+            trigger_callback=ocr_trigger_queue.put,
+        )
+    except Exception as error:
+        startup_queue.put(
+            (
+                "error",
+                f"{type(error).__name__}: {error}",
+            )
+        )
+        detector.close()
+        return
+    startup_queue.put(
+        (
+            "ready",
+            {
+                "runtime_backend": detector.runtime_backend,
+                "core_mask": detector.core_mask_name,
+                "pipeline_depth": detector.pipeline_depth,
+            },
+        )
     )
     ack_queues = {
         "ai_rgb_frame": rgb_ack_queue,
@@ -461,14 +483,129 @@ def _ai_inference_worker(
     }
     last_ocr_result: OcrResult | None = None
     last_ocr_attempt: OcrResult | None = None
+    pipeline_depth = 2 if detector.runtime_backend == "c_api" else 1
+    pending: list[
+        tuple[
+            Future[tuple[list[DetectedObject], dict[str, float], float]],
+            int,
+            float,
+            float,
+            np.ndarray,
+        ]
+    ] = []
+    input_closed = False
+
+    def run_detection(
+        frame_rgb: np.ndarray,
+        frame_id: int,
+    ) -> tuple[list[DetectedObject], dict[str, float], float]:
+        detections, timing = detector.detect_with_timing(
+            frame_rgb,
+            frame_id=frame_id,
+        )
+        return detections, timing, time.perf_counter()
+
+    executor = ThreadPoolExecutor(
+        max_workers=pipeline_depth,
+        thread_name_prefix="xsmart-object-capi",
+    )
     try:
         while not stop_event.is_set():
+            if pending and (
+                pending[0][0].done()
+                or len(pending) >= pipeline_depth
+                or input_closed
+            ):
+                (
+                    future,
+                    frame_id,
+                    captured_at,
+                    ipc_finished,
+                    frame_bgr,
+                ) = pending.pop(0)
+                try:
+                    detections, timing, detected_at = future.result()
+                    # OCR also uses NPU2. Only drain the detector pipeline when
+                    # this exact frame will actually enter the OCR recognizer;
+                    # ordinary detection results must be published immediately.
+                    if ocr_session.would_run_recognizer(
+                        frame_bgr,
+                        detections,
+                    ):
+                        for pending_future, *_metadata in pending:
+                            pending_future.result()
+                    try:
+                        ocr_result = ocr_session.update(
+                            frame_bgr,
+                            frame_id,
+                            detections,
+                        )
+                        if (
+                            ocr_session.last_attempt is not None
+                            and (
+                                last_ocr_attempt is None
+                                or ocr_session.last_attempt.frame_id
+                                > last_ocr_attempt.frame_id
+                            )
+                        ):
+                            last_ocr_attempt = ocr_session.last_attempt
+                            if last_ocr_attempt.frame_id == frame_id:
+                                timing = dict(timing)
+                                timing["ocr_inference_ms"] = float(
+                                    last_ocr_attempt.inference_ms
+                                )
+                                timing["ocr_trigger_id"] = float(
+                                    last_ocr_attempt.trigger_id
+                                )
+                                timing["ocr_same_frame"] = 1.0
+                        if ocr_result is not None and ocr_result.event_id > 0:
+                            last_ocr_result = ocr_result
+                    except Exception:
+                        traceback.print_exc()
+                    _put_latest(
+                        output_queue,
+                        (
+                            frame_id,
+                            captured_at,
+                            time.perf_counter(),
+                            detected_at,
+                            ipc_finished,
+                            timing,
+                            detections,
+                            last_ocr_result,
+                            last_ocr_attempt,
+                        ),
+                    )
+                except Exception:
+                    traceback.print_exc()
+                    if detector.runtime_backend == "c_api":
+                        raise
+                    _put_latest(
+                        output_queue,
+                        (
+                            frame_id,
+                            captured_at,
+                            time.perf_counter(),
+                            time.perf_counter(),
+                            ipc_finished,
+                            {},
+                            [],
+                            last_ocr_result,
+                            last_ocr_attempt,
+                        ),
+                    )
+                continue
+            if input_closed:
+                if not pending:
+                    break
+                continue
             try:
-                item = input_queue.get(timeout=0.1)
+                item = input_queue.get(timeout=0.001 if pending else 0.1)
             except queue.Empty:
                 continue
             if item is None:
-                break
+                input_closed = True
+                continue
 
             frame_id, captured_at, frame_payload = item
             try:
@@ -478,45 +615,29 @@ def _ai_inference_worker(
                     expected_frame_id=int(frame_id),
                 )
                 ipc_finished = time.perf_counter()
-                detections = detector.detect(frame_rgb)
-                try:
-                    ocr_result = ocr_session.update(
+                pending.append(
+                    (
+                        executor.submit(
+                            run_detection,
+                            frame_rgb,
+                            int(frame_id),
+                        ),
+                        int(frame_id),
+                        float(captured_at),
+                        ipc_finished,
                         frame_bgr,
-                        frame_id,
-                        detections,
                     )
-                    if (
-                        ocr_session.last_attempt is not None
-                        and (
-                            last_ocr_attempt is None
-                            or ocr_session.last_attempt.frame_id > last_ocr_attempt.frame_id
-                        )
-                    ):
-                        last_ocr_attempt = ocr_session.last_attempt
-                    if ocr_result is not None and ocr_result.event_id > 0:
-                        last_ocr_result = ocr_result
-                except Exception:
-                    traceback.print_exc()
+                )
+            except Exception:
+                traceback.print_exc()
+                if detector.runtime_backend == "c_api":
+                    raise
                 _put_latest(
                     output_queue,
                     (
                         frame_id,
                         captured_at,
                         time.perf_counter(),
-                        ipc_finished,
-                        detector.last_timing,
-                        detections,
-                        last_ocr_result,
-                        last_ocr_attempt,
-                    ),
-                )
-            except Exception:
-                traceback.print_exc()
-                _put_latest(
-                    output_queue,
-                    (
-                        frame_id,
-                        captured_at,
                         time.perf_counter(),
                         time.perf_counter(),
                         {},
@@ -526,6 +647,7 @@ def _ai_inference_worker(
                     ),
                 )
     finally:
+        executor.shutdown(wait=True, cancel_futures=True)
         detector.close()
         ocr_session.close()
 
@@ -779,6 +901,13 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
         rknn_detector_config["model_path"] = str(
             resolve_project_path(project_root, str(rknn_detector_config["model_path"]))
         )
+    if rknn_detector_config.get("c_api_library"):
+        rknn_detector_config["c_api_library"] = str(
+            resolve_project_path(
+                project_root,
+                str(rknn_detector_config["c_api_library"]),
+            )
+        )
 
     rknn_segmenter_config = runtime_config.setdefault("rknn_lane_segmenter", {})
     if rknn_segmenter_config.get("model_path"):
@@ -1028,6 +1157,7 @@ class UpperMachineApp:
         self.stop_event = self.mp_context.Event()
         self.ai_input_queue = self.mp_context.Queue(maxsize=1)
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
+        self.ai_startup_queue = self.mp_context.Queue(maxsize=1)
         self.ocr_trigger_queue = self.mp_context.Queue()
         self.road_sign_analysis_input_queue = self.mp_context.Queue(maxsize=1)
         self.road_sign_analysis_output_queue = self.mp_context.Queue(maxsize=1)
@@ -1063,6 +1193,7 @@ class UpperMachineApp:
         self.last_ai_frame_id = -1
         self.last_ai_captured_at = 0.0
         self.last_ai_completed_at = 0.0
+        self.last_ai_detected_at = 0.0
         self.last_ai_ipc_finished_at = 0.0
         self.last_ai_timing: dict[str, float] = {}
         self.ai_completed_count = 0
@@ -1123,6 +1254,7 @@ class UpperMachineApp:
                 self.ocr_trigger_queue,
                 self.ai_rgb_ack_queue,
                 self.ai_bgr_ack_queue,
+                self.ai_startup_queue,
                 self.stop_event,
             ),
             name="xsmart-ai-inference",
@@ -1196,6 +1328,30 @@ class UpperMachineApp:
                 self.lane_parallel_enabled = True
                 self.latency_benchmark.metadata["lane_backend_actual"] = "lite2_fallback"
         self.ai_process.start()
+        try:
+            ai_startup_status, ai_startup_details = self.ai_startup_queue.get(
+                timeout=10.0
+            )
+        except queue.Empty as error:
+            raise RuntimeError(
+                "object detector worker startup timed out"
+            ) from error
+        if ai_startup_status != "ready":
+            raise RuntimeError(
+                "object detector worker startup failed: "
+                f"{ai_startup_details}"
+            )
+        self.latency_benchmark.metadata.update(
+            {
+                "object_backend_actual": ai_startup_details.get(
+                    "runtime_backend"
+                ),
+                "object_core_mask_actual": ai_startup_details.get("core_mask"),
+                "object_pipeline_depth": ai_startup_details.get(
+                    "pipeline_depth"
+                ),
+            }
+        )
         if self.road_sign_analyzer_config.enable:
             self.road_sign_analyzer_process.start()
         if not self.lane_capi_active:
@@ -1205,6 +1361,8 @@ class UpperMachineApp:
             self.ui_process.start()
 
         while not self.stop_event.is_set():
+            if not self.ai_process.is_alive():
+                raise RuntimeError("object detector worker exited unexpectedly")
             camera_wait_started = time.perf_counter()
             success, captured_frame = self.camera.read()
             camera_wait_ms = (time.perf_counter() - camera_wait_started) * 1000.0
@@ -1289,6 +1447,7 @@ class UpperMachineApp:
                     ai_frame_id,
                     _captured_at,
                     _completed_at,
+                    _detected_at,
                     _ipc_finished,
                     _timing,
                     detected_objects,
@@ -1299,6 +1458,7 @@ class UpperMachineApp:
                 self._accumulate_timing(self.ai_timing_totals, _timing)
                 self.last_ai_captured_at = float(_captured_at)
                 self.last_ai_completed_at = float(_completed_at)
+                self.last_ai_detected_at = float(_detected_at)
                 self.last_ai_ipc_finished_at = float(_ipc_finished)
                 self.last_ai_timing = (
                     {
@@ -1984,6 +2144,22 @@ class UpperMachineApp:
                 if ai_captured_at > 0.0
                 else None
             ),
+            "ai_capture_to_result_ms": (
+                max(
+                    0.0,
+                    (
+                        getattr(
+                            self,
+                            "last_ai_detected_at",
+                            self.last_ai_completed_at,
+                        )
+                        - ai_captured_at
+                    )
+                    * 1000.0,
+                )
+                if ai_captured_at > 0.0
+                else None
+            ),
             "ai_source_to_worker_ipc_ms": (
                 max(
                     0.0,
@@ -1993,8 +2169,17 @@ class UpperMachineApp:
                 else None
             ),
             "ai_preprocess_ms": ai_timing.get("preprocess_ms"),
+            "ai_input_sync_ms": ai_timing.get("input_sync_ms"),
             "ai_npu_inference_ms": ai_timing.get("inference_ms"),
+            "ai_npu_run_ms": ai_timing.get("npu_run_ms"),
+            "ai_output_sync_ms": ai_timing.get("output_sync_ms"),
             "ai_postprocess_ms": ai_timing.get("postprocess_ms"),
+            "ai_total_ms": ai_timing.get("total_ms"),
+            "ai_context_index": ai_timing.get("context_index"),
+            "ai_core_mask": ai_timing.get("core_mask"),
+            "ai_ocr_inference_ms": ai_timing.get("ocr_inference_ms"),
+            "ai_ocr_trigger_id": ai_timing.get("ocr_trigger_id"),
+            "ai_ocr_same_frame": ai_timing.get("ocr_same_frame"),
         }
 
     @staticmethod

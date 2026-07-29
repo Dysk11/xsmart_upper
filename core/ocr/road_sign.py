@@ -324,6 +324,45 @@ class RoadSignOcrSession:
         self._publish_pending(now)
         return self._last_result
 
+    def would_run_recognizer(
+        self,
+        frame: np.ndarray,
+        detections: Sequence[DetectedObject],
+    ) -> bool:
+        """Return whether update() would enter the NPU OCR recognizer now."""
+
+        if (
+            not self.enabled
+            or self._pending_log_result is not None
+            or self._cycle_completed
+        ):
+            return False
+        now = self.clock()
+        if now < self._cooldown_until or now < self._next_retry_at:
+            return False
+        candidate = select_road_sign_candidate(
+            detections,
+            self.class_names,
+            self.bbox_min_confidence,
+            self.bbox_min_width_px,
+            self.bbox_min_height_px,
+        )
+        if candidate is None:
+            return False
+        shape = getattr(frame, "shape", ())
+        frame_width = int(shape[1]) if len(shape) >= 2 else 0
+        x1, _, x2, _ = candidate.bbox
+        if frame_width <= 0 or x1 <= 0 or x2 >= frame_width - 1:
+            return False
+        return (
+            crop_road_sign_candidate(
+                frame,
+                candidate,
+                self.bbox_padding_ratio,
+            )
+            is not None
+        )
+
     def _reset_cycle(self) -> None:
         self._active_trigger_id = 0
         self._trigger_started_at = 0.0

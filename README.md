@@ -218,13 +218,49 @@ camera:
 ```yaml
 rknn_object_detector:
   enable: true
-  model_path: models/object/rknn_7classes.rknn
+  model_path: models/object/rknn_7classes_0727.rknn
   # 按 [width, height] 配置，与 RKNN 固定输入 640x480 一致
   input_size: [640, 480]
   class_names: [car, coin, Go, human, road_sign, speed_limit, Stop]
-  # 单核运行入口，可选 NPU_CORE_0、NPU_CORE_1、NPU_CORE_2
-  core_mask: NPU_CORE_0
+  runtime_backend: c_api
+  c_api_library: native/object_rknn_backend/build/libxsmart_object_rknn.so
+  pipeline_depth: 2
+  # 目标检测强制使用 NPU2；其他值会导致启动失败
+  core_mask: NPU_CORE_2
 ```
+
+目标检测原生库在 RK3588 板端构建：
+
+```bash
+cmake -S native/object_rknn_backend -B native/object_rknn_backend/build \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build native/object_rknn_backend/build -j
+```
+
+If the board image does not include CMake, build the same library directly:
+
+```bash
+mkdir -p native/object_rknn_backend/build
+g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -fPIC -shared \
+  -Inative/object_rknn_backend/include -I"${RKNN_INCLUDE_DIR}" \
+  native/object_rknn_backend/src/object_backend.cpp \
+  -L"${RKNN_LIBRARY_DIR:-/lib}" -lrknnrt -pthread \
+  -o native/object_rknn_backend/build/libxsmart_object_rknn.so
+```
+
+构建时使用与板端 `librknnrt.so` 匹配的 RKNN 2.3.2 头文件。固定帧一致性检查：
+
+```bash
+python tools/validate_capi_object.py \
+  --video outputs/video/record_20260708_135111.mp4
+```
+
+生产配置不回退到 Lite2；`--object-backend lite2` 仅供
+`tools/benchmark_latency.py` 做同条件 A/B 基准。
+
+For a paced 60 FPS shared-memory A/B run, use
+`tools/replay_video_to_shm.py`; `tools/run_object_ab_benchmark.sh` performs the
+required three 10-second-warmup/60-second-sample runs for both backends.
 
 ## 2. 类别顺序
 

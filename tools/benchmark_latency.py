@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the lane inference backend for an A/B run.",
     )
     parser.add_argument(
+        "--object-backend",
+        choices=("c_api", "lite2"),
+        help="Override object inference only for a controlled A/B benchmark.",
+    )
+    parser.add_argument(
         "--preprocess",
         choices=("auto", "direct", "rga"),
         help="Override native preprocessing for a C API run.",
@@ -104,6 +109,9 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
             0.0,
             float(args.fresh_result_wait_ms),
         )
+    object_config = config.setdefault("rknn_object_detector", {})
+    if getattr(args, "object_backend", None):
+        object_config["runtime_backend"] = args.object_backend
 
     visualizer = config.setdefault("visualizer", {})
     visualizer["show_window"] = False

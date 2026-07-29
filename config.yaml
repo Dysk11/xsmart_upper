@@ -122,7 +122,9 @@ rknn_object_detector:
   score_threshold: 0.40
   nms_threshold: 0.45
   max_detections: 30
-  runtime_backend: lite2
+  runtime_backend: c_api
+  c_api_library: native/object_rknn_backend/build/libxsmart_object_rknn.so
+  pipeline_depth: 2
   inference_stride: 2
   max_result_age_frames: 12
   drop_stale_results: true

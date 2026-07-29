@@ -140,6 +140,28 @@ def test_missing_or_ineligible_road_sign_does_not_start_ocr() -> None:
     assert triggers == []
 
 
+def test_would_run_recognizer_matches_same_frame_eligibility_and_retry_gate() -> None:
+    now = [0.0]
+    session, _recognizer = make_session(
+        [OcrResult(frame_id=1, error="retry")],
+        now=now,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+    eligible = [make_detection((1, 20, 158, 100))]
+
+    assert not session.would_run_recognizer(frame, [])
+    assert not session.would_run_recognizer(
+        frame,
+        [make_detection((0, 20, 100, 100))],
+    )
+    assert session.would_run_recognizer(frame, eligible)
+
+    session.update(frame, 1, eligible)
+    assert not session.would_run_recognizer(frame, eligible)
+    now[0] = 0.5
+    assert session.would_run_recognizer(frame, eligible)
+
+
 def test_horizontal_edge_waits_then_starts_ocr_immediately_on_full_entry() -> None:
     triggers: list[OcrTrigger] = []
     session, recognizer = make_session(

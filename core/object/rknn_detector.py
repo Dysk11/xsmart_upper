@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from core.object.blocking import DetectedObject
+from core.object.capi_backend import CapiObjectBackend, validate_capi_object_config
 
 
 @dataclass(frozen=True)
@@ -52,8 +53,18 @@ class RknnObjectDetector:
         self.class_agnostic_nms = bool(config.get("class_agnostic_nms", False))
         self.runtime_backend = str(config.get("runtime_backend", "lite2")).lower()
         self.core_mask_name = str(config.get("core_mask", "NPU_CORE_0_1_2"))
+        self.pipeline_depth = int(config.get("pipeline_depth", 2))
+        self.c_api_library = str(
+            config.get(
+                "c_api_library",
+                "native/object_rknn_backend/build/libxsmart_object_rknn.so",
+            )
+        )
+        if self.runtime_backend == "c_api":
+            validate_capi_object_config(config)
 
         self._rknn: Any = None
+        self._capi_backend: CapiObjectBackend | None = None
         self._rknn_cls: Any = None
         self._runtime_ready = False
         self._warned_unavailable = False
@@ -62,13 +73,27 @@ class RknnObjectDetector:
         self.last_timing: dict[str, float] = {}
         self._canvas = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
 
-    def detect(self, frame_rgb: np.ndarray) -> list[DetectedObject]:
+    def detect(
+        self,
+        frame_rgb: np.ndarray,
+        *,
+        frame_id: int = 0,
+    ) -> list[DetectedObject]:
         if not self.enabled:
             return []
         if frame_rgb.size == 0:
             return []
         if not self._ensure_runtime():
             return []
+
+        if self.runtime_backend == "c_api":
+            assert self._capi_backend is not None
+            detections = self._capi_backend.detect(
+                frame_rgb,
+                frame_id=frame_id,
+            )
+            self.last_timing = dict(self._capi_backend.last_timing)
+            return detections
 
         started = time.perf_counter()
         input_tensor, letterbox = self._preprocess(frame_rgb)
@@ -90,7 +115,30 @@ class RknnObjectDetector:
             detections = detections[: self.max_detections]
         return detections
 
+    def detect_with_timing(
+        self,
+        frame_rgb: np.ndarray,
+        *,
+        frame_id: int,
+    ) -> tuple[list[DetectedObject], dict[str, float]]:
+        """Return one result with timing isolated for concurrent C API calls."""
+
+        detections = self.detect(frame_rgb, frame_id=frame_id)
+        if self.runtime_backend == "c_api" and self._capi_backend is not None:
+            timing = self._capi_backend.take_timing(frame_id)
+        else:
+            timing = dict(self.last_timing)
+        return detections, timing
+
+    def open(self) -> None:
+        """Initialize the configured runtime before the worker reports ready."""
+
+        if self.enabled and not self._ensure_runtime():
+            raise RuntimeError("RKNN object detector runtime is unavailable")
     def close(self) -> None:
+        if self._capi_backend is not None:
+            self._capi_backend.close()
+            self._capi_backend = None
         if self._rknn is not None:
             try:
                 self._rknn.release()
@@ -101,6 +149,32 @@ class RknnObjectDetector:
 
     def _ensure_runtime(self) -> bool:
         if self._runtime_ready:
+            return True
+
+        if self.runtime_backend == "c_api":
+            self._capi_backend = CapiObjectBackend(
+                {
+                    "runtime_backend": self.runtime_backend,
+                    "model_path": str(self.model_path),
+                    "c_api_library": self.c_api_library,
+                    "input_size": [self.input_width, self.input_height],
+                    "input_layout": self.input_layout,
+                    "input_color": self.input_color,
+                    "input_dtype": self.input_dtype,
+                    "score_threshold": self.score_threshold,
+                    "nms_threshold": self.nms_threshold,
+                    "max_detections": self.max_detections,
+                    "class_agnostic_nms": self.class_agnostic_nms,
+                    "core_mask": self.core_mask_name,
+                    "pipeline_depth": self.pipeline_depth,
+                },
+                self.class_names,
+            )
+            self._runtime_ready = True
+            print(
+                "RKNN C API detector loaded on NPU2: "
+                f"{self.model_path} contexts={self.pipeline_depth}"
+            )
             return True
 
         if self.runtime_backend != "lite2":
