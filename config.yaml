@@ -125,6 +125,7 @@ rknn_object_detector:
   runtime_backend: c_api
   c_api_library: native/object_rknn_backend/build/libxsmart_object_rknn.so
   pipeline_depth: 2
+  ai_frame_transport: rgb_lease
   inference_stride: 2
   max_result_age_frames: 12
   drop_stale_results: true
@@ -258,7 +259,7 @@ visualizer:
   debug_refresh_hz: 10
   mask_alpha: 0.35
   mask_color: [0, 180, 255]
-  save_video: true
+  save_video: false
   record_without_ui: false
   save_screenshot: false
   save_dir: outputs/visual

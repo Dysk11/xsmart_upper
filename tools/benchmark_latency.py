@@ -42,6 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--video", help="Video path for --mode video.")
     parser.add_argument(
+        "--shared-memory-name",
+        help="Override camera.shared_memory_name for an isolated replay run.",
+    )
+    parser.add_argument(
         "--lane-backend",
         choices=("c_api", "lite2"),
         help="Override the lane inference backend for an A/B run.",
@@ -50,6 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--object-backend",
         choices=("c_api", "lite2"),
         help="Override object inference only for a controlled A/B benchmark.",
+    )
+    parser.add_argument(
+        "--ai-frame-transport",
+        choices=("rgb_bgr_copy", "rgb_lease"),
+        help="Override the main-to-AI shared-frame transport for an A/B run.",
     )
     parser.add_argument(
         "--preprocess",
@@ -83,6 +92,8 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
     config = copy.deepcopy(load_config(config_path))
     camera_config = config.setdefault("camera", {})
     camera_config["mode"] = args.mode
+    if getattr(args, "shared_memory_name", None):
+        camera_config["shared_memory_name"] = args.shared_memory_name
     if args.video:
         camera_config["video_path"] = args.video
     if args.mode == "video" and not camera_config.get("video_path"):
@@ -112,6 +123,8 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
     object_config = config.setdefault("rknn_object_detector", {})
     if getattr(args, "object_backend", None):
         object_config["runtime_backend"] = args.object_backend
+    if getattr(args, "ai_frame_transport", None):
+        object_config["ai_frame_transport"] = args.ai_frame_transport
 
     visualizer = config.setdefault("visualizer", {})
     visualizer["show_window"] = False

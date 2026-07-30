@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import struct
+import threading
 from multiprocessing import shared_memory
 
 import cv2
@@ -11,8 +12,14 @@ import pytest
 from core.io.camera import CameraReader
 from core.lane.rknn_segmenter import RknnLaneSegmenter
 from core.object.rknn_detector import RknnObjectDetector
+import core.runtime.app as runtime_app
 from core.runtime.app import (
+    AI_FRAME_TRANSPORT_COPY,
+    AI_FRAME_TRANSPORT_LEASE,
     SharedArrayPool,
+    _ai_inference_worker,
+    _put_latest,
+    _release_shared_payload,
     _share_ai_frames,
     _take_shared_ai_frames,
 )
@@ -133,7 +140,7 @@ def test_ai_shared_packet_keeps_rgb_bgr_pair_on_same_frame() -> None:
     try:
         packet = _share_ai_frames(rgb, bgr, 23, 99, rgb_pool, bgr_pool)
         assert packet is not None
-        restored_rgb, restored_bgr = _take_shared_ai_frames(
+        restored = _take_shared_ai_frames(
             packet,
             {
                 "ai_rgb_frame": rgb_ack,
@@ -141,8 +148,12 @@ def test_ai_shared_packet_keeps_rgb_bgr_pair_on_same_frame() -> None:
             },
             expected_frame_id=23,
         )
-        assert np.array_equal(restored_rgb, rgb)
-        assert np.array_equal(restored_bgr, bgr)
+        assert np.array_equal(restored.rgb, rgb)
+        assert restored.bgr is not None
+        assert np.array_equal(restored.bgr, bgr)
+        assert restored.leases == []
+        assert restored.timing["worker_copy_ms"] >= 0.0
+        restored.close()
     finally:
         rgb_pool.close()
         bgr_pool.close()
@@ -166,6 +177,316 @@ def test_ai_shared_packet_rejects_cross_frame_use() -> None:
                 },
                 expected_frame_id=8,
             )
+    finally:
+        rgb_pool.close()
+        bgr_pool.close()
+
+
+def test_ai_rgb_lease_holds_slot_until_explicit_close() -> None:
+    rgb_ack: queue.Queue[int] = queue.Queue()
+    bgr_ack: queue.Queue[int] = queue.Queue()
+    rgb_pool = SharedArrayPool("ai_rgb_frame", rgb_ack, slot_count=2)
+    bgr_pool = SharedArrayPool("ai_bgr_frame", bgr_ack, slot_count=2)
+    first = np.full((2, 3, 3), 11, dtype=np.uint8)
+    second = np.full((2, 3, 3), 22, dtype=np.uint8)
+    third = np.full((2, 3, 3), 33, dtype=np.uint8)
+    leases = []
+    try:
+        for frame_id, frame in ((1, first), (2, second)):
+            packet = _share_ai_frames(
+                frame,
+                frame[..., ::-1],
+                frame_id,
+                frame_id,
+                rgb_pool,
+                bgr_pool,
+                AI_FRAME_TRANSPORT_LEASE,
+            )
+            assert packet is not None
+            payload = _take_shared_ai_frames(
+                packet,
+                {
+                    "ai_rgb_frame": rgb_ack,
+                    "ai_bgr_frame": bgr_ack,
+                },
+                expected_frame_id=frame_id,
+            )
+            assert payload.bgr is None
+            assert len(payload.leases) == 1
+            assert np.shares_memory(payload.rgb, payload.leases[0].array)
+            leases.append(payload)
+
+        assert (
+            _share_ai_frames(
+                third,
+                third,
+                3,
+                3,
+                rgb_pool,
+                bgr_pool,
+                AI_FRAME_TRANSPORT_LEASE,
+            )
+            is None
+        )
+        leases[0].close()
+        replacement = _share_ai_frames(
+            third,
+            third,
+            3,
+            3,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert replacement is not None
+        restored = _take_shared_ai_frames(
+            replacement,
+            {
+                "ai_rgb_frame": rgb_ack,
+                "ai_bgr_frame": bgr_ack,
+            },
+            expected_frame_id=3,
+        )
+        assert np.array_equal(restored.rgb, third)
+        restored.close()
+    finally:
+        for payload in leases:
+            payload.close()
+        rgb_pool.close()
+        bgr_pool.close()
+
+
+def test_ai_copy_transport_remains_explicit_fallback() -> None:
+    rgb_ack: queue.Queue[int] = queue.Queue()
+    bgr_ack: queue.Queue[int] = queue.Queue()
+    rgb_pool = SharedArrayPool("ai_rgb_frame", rgb_ack, slot_count=2)
+    bgr_pool = SharedArrayPool("ai_bgr_frame", bgr_ack, slot_count=2)
+    rgb = np.full((2, 2, 3), (4, 5, 6), dtype=np.uint8)
+    try:
+        packet = _share_ai_frames(
+            rgb,
+            rgb[..., ::-1],
+            9,
+            90,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_COPY,
+        )
+        assert packet is not None
+        payload = _take_shared_ai_frames(
+            packet,
+            {
+                "ai_rgb_frame": rgb_ack,
+                "ai_bgr_frame": bgr_ack,
+            },
+            expected_frame_id=9,
+        )
+        assert payload.bgr is not None
+        assert payload.leases == []
+        assert np.array_equal(payload.bgr, rgb[..., ::-1])
+    finally:
+        rgb_pool.close()
+        bgr_pool.close()
+
+
+def test_ai_rgb_lease_reconstructs_exact_old_path_bgr_pixels() -> None:
+    rgb_ack: queue.Queue[int] = queue.Queue()
+    bgr_ack: queue.Queue[int] = queue.Queue()
+    rgb_pool = SharedArrayPool("ai_rgb_frame", rgb_ack, slot_count=2)
+    bgr_pool = SharedArrayPool("ai_bgr_frame", bgr_ack, slot_count=2)
+    rgb = np.arange(3 * 5 * 3, dtype=np.uint8).reshape(3, 5, 3)
+    expected_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    try:
+        packet = _share_ai_frames(
+            rgb,
+            expected_bgr,
+            12,
+            120,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert packet is not None
+        payload = _take_shared_ai_frames(
+            packet,
+            {
+                "ai_rgb_frame": rgb_ack,
+                "ai_bgr_frame": bgr_ack,
+            },
+            expected_frame_id=12,
+        )
+        reconstructed_bgr = cv2.cvtColor(payload.rgb, cv2.COLOR_RGB2BGR)
+        assert np.array_equal(payload.rgb, rgb)
+        assert np.array_equal(reconstructed_bgr, expected_bgr)
+        payload.close()
+    finally:
+        rgb_pool.close()
+        bgr_pool.close()
+
+
+def test_dropped_ai_queue_packet_releases_rgb_lease_slot() -> None:
+    rgb_ack: queue.Queue[int] = queue.Queue()
+    rgb_pool = SharedArrayPool("ai_rgb_frame", rgb_ack, slot_count=1)
+    bgr_pool = SharedArrayPool(
+        "ai_bgr_frame",
+        queue.Queue(),
+        slot_count=1,
+    )
+    work_queue: queue.Queue[object] = queue.Queue(maxsize=1)
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    pools = {
+        "ai_rgb_frame": rgb_pool,
+        "ai_bgr_frame": bgr_pool,
+    }
+    try:
+        packet = _share_ai_frames(
+            frame,
+            frame,
+            1,
+            1,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert packet is not None
+        work_queue.put_nowait((1, 1.0, packet))
+
+        _put_latest(
+            work_queue,
+            "replacement",
+            release_func=lambda value: _release_shared_payload(value, pools),
+        )
+
+        replacement = _share_ai_frames(
+            frame,
+            frame,
+            2,
+            2,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert replacement is not None
+        _release_shared_payload(replacement, pools)
+    finally:
+        rgb_pool.close()
+        bgr_pool.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["detection", "ocr"])
+def test_ai_worker_releases_lease_after_future_or_ocr_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    class FakeDetector:
+        runtime_backend = "lite2"
+        core_mask_name = "NPU_CORE_2"
+        pipeline_depth = 1
+
+        def __init__(self, _config: dict[str, object]) -> None:
+            pass
+
+        def open(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def detect_with_timing(
+            self,
+            _frame: np.ndarray,
+            *,
+            frame_id: int,
+        ) -> tuple[list[object], dict[str, float]]:
+            if failure_stage == "detection":
+                raise RuntimeError("future failed")
+            return [], {"frame_id": float(frame_id)}
+
+    class FakeOcrSession:
+        last_attempt = None
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def would_run_recognizer(
+            self,
+            _frame: np.ndarray,
+            _detections: list[object],
+        ) -> bool:
+            return failure_stage == "ocr"
+
+        def update(
+            self,
+            _frame: np.ndarray,
+            _frame_id: int,
+            _detections: list[object],
+        ) -> None:
+            if failure_stage == "ocr":
+                raise RuntimeError("ocr failed")
+            return None
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(runtime_app, "RknnObjectDetector", FakeDetector)
+    monkeypatch.setattr(runtime_app, "RoadSignOcrSession", FakeOcrSession)
+
+    rgb_ack: queue.Queue[int] = queue.Queue()
+    bgr_ack: queue.Queue[int] = queue.Queue()
+    rgb_pool = SharedArrayPool("ai_rgb_frame", rgb_ack, slot_count=1)
+    bgr_pool = SharedArrayPool("ai_bgr_frame", bgr_ack, slot_count=1)
+    input_queue: queue.Queue[object] = queue.Queue()
+    output_queue: queue.Queue[object] = queue.Queue()
+    startup_queue: queue.Queue[object] = queue.Queue()
+    frame = np.full((2, 2, 3), 17, dtype=np.uint8)
+    try:
+        packet = _share_ai_frames(
+            frame,
+            frame,
+            5,
+            5,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert packet is not None
+        input_queue.put((5, 5.0, packet))
+        input_queue.put(None)
+
+        _ai_inference_worker(
+            {
+                "ai_frame_transport": AI_FRAME_TRANSPORT_LEASE,
+            },
+            {},
+            ".",
+            input_queue,
+            output_queue,
+            queue.Queue(),
+            rgb_ack,
+            bgr_ack,
+            startup_queue,
+            threading.Event(),
+        )
+
+        assert startup_queue.get_nowait()[0] == "ready"
+        assert output_queue.get_nowait()[0] == 5
+        replacement = _share_ai_frames(
+            frame,
+            frame,
+            6,
+            6,
+            rgb_pool,
+            bgr_pool,
+            AI_FRAME_TRANSPORT_LEASE,
+        )
+        assert replacement is not None
+        _release_shared_payload(
+            replacement,
+            {
+                "ai_rgb_frame": rgb_pool,
+                "ai_bgr_frame": bgr_pool,
+            },
+        )
     finally:
         rgb_pool.close()
         bgr_pool.close()

@@ -22,6 +22,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict
 
+import cv2
 import numpy as np
 import yaml
 
@@ -86,6 +87,12 @@ from utils.roi import compute_normalized_roi_rect
 
 SHARED_ARRAY_MARKER = "__xsmart_shared_array__"
 SHARED_FRAME_MARKER = "__xsmart_shared_frame__"
+AI_FRAME_TRANSPORT_COPY = "rgb_bgr_copy"
+AI_FRAME_TRANSPORT_LEASE = "rgb_lease"
+AI_FRAME_TRANSPORTS = {
+    AI_FRAME_TRANSPORT_COPY,
+    AI_FRAME_TRANSPORT_LEASE,
+}
 
 
 @dataclass
@@ -155,6 +162,7 @@ class SharedArrayPool:
             "name": shm.name,
             "shape": shape,
             "dtype": dtype.str,
+            "shared_at": time.perf_counter(),
         }
 
     def release_descriptor(self, descriptor: Dict[str, Any]) -> None:
@@ -203,6 +211,60 @@ class SharedArrayPool:
         return None
 
 
+@dataclass
+class SharedArrayLease:
+    """Keep one shared-memory ndarray mapped until its consumer is finished."""
+
+    descriptor: Dict[str, Any]
+    ack_queues: Dict[str, Any]
+    shm: shared_memory.SharedMemory
+    array: np.ndarray | None
+    shared_at: float
+    map_ms: float
+    closed: bool = False
+
+    def close(self) -> float:
+        """Close the mapping, acknowledge its slot, and return slot hold time."""
+
+        if self.closed:
+            return 0.0
+        hold_ms = max(0.0, (time.perf_counter() - self.shared_at) * 1000.0)
+        self.array = None
+        self.shm.close()
+        _ack_shared_descriptor(self.descriptor, self.ack_queues)
+        self.closed = True
+        return hold_ms
+
+
+@dataclass
+class AiFramePayload:
+    """One exact AI frame, copied or leased according to the configured mode."""
+
+    rgb: np.ndarray
+    bgr: np.ndarray | None
+    leases: list[SharedArrayLease]
+    timing: dict[str, float]
+
+    def current_hold_ms(self) -> float:
+        now = time.perf_counter()
+        return max(
+            (
+                max(0.0, (now - lease.shared_at) * 1000.0)
+                for lease in self.leases
+            ),
+            default=0.0,
+        )
+
+    def close(self) -> float:
+        hold_ms = 0.0
+        self.rgb = np.empty((0, 0, 3), dtype=np.uint8)
+        self.bgr = None
+        for lease in self.leases:
+            hold_ms = max(hold_ms, lease.close())
+        self.leases.clear()
+        return hold_ms
+
+
 def _is_shared_array_descriptor(value: Any) -> bool:
     return isinstance(value, dict) and bool(value.get(SHARED_ARRAY_MARKER))
 
@@ -245,6 +307,38 @@ def _take_shared_ndarray(descriptor: Dict[str, Any], ack_queues: Dict[str, Any])
         shm.close()
         _ack_shared_descriptor(descriptor, ack_queues)
     return array
+
+
+def _lease_shared_ndarray(
+    descriptor: Dict[str, Any],
+    ack_queues: Dict[str, Any],
+) -> SharedArrayLease:
+    """Map a pooled ndarray without copying or acknowledging its slot."""
+
+    started = time.perf_counter()
+    try:
+        shm = shared_memory.SharedMemory(name=str(descriptor["name"]))
+    except FileNotFoundError:
+        _ack_shared_descriptor(descriptor, ack_queues)
+        raise
+    try:
+        array = np.ndarray(
+            tuple(descriptor["shape"]),
+            dtype=np.dtype(str(descriptor["dtype"])),
+            buffer=shm.buf,
+        )
+        return SharedArrayLease(
+            descriptor=descriptor,
+            ack_queues=ack_queues,
+            shm=shm,
+            array=array,
+            shared_at=float(descriptor.get("shared_at", time.perf_counter())),
+            map_ms=(time.perf_counter() - started) * 1000.0,
+        )
+    except Exception:
+        shm.close()
+        _ack_shared_descriptor(descriptor, ack_queues)
+        raise
 
 
 def _release_shared_payload(value: Any, pools: Dict[str, SharedArrayPool] | None = None) -> None:
@@ -318,19 +412,39 @@ def _share_ai_frames(
     source_frame_id: int,
     rgb_pool: SharedArrayPool,
     bgr_pool: SharedArrayPool,
+    transport: str = AI_FRAME_TRANSPORT_COPY,
 ) -> Dict[str, Any] | None:
-    """Copy one aligned RGB/BGR pair into the AI shared-memory pools."""
+    """Publish one exact AI frame using the selected shared-memory transport."""
 
+    transport = str(transport).lower()
+    if transport not in AI_FRAME_TRANSPORTS:
+        raise ValueError(
+            "rknn_object_detector.ai_frame_transport must be "
+            f"one of {sorted(AI_FRAME_TRANSPORTS)}, got {transport!r}"
+        )
     descriptor: Dict[str, Any] = {
         "frame_id": int(frame_id),
         "source_frame_id": int(source_frame_id),
+        "transport": transport,
+        "pool_rgb_write_ms": 0.0,
+        "pool_bgr_write_ms": 0.0,
     }
     pools = {rgb_pool.pool_id: rgb_pool, bgr_pool.pool_id: bgr_pool}
     try:
+        started = time.perf_counter()
         descriptor["rgb"] = rgb_pool.write(frame_rgb)
+        descriptor["pool_rgb_write_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
         if descriptor["rgb"] is None:
             return None
+        if transport == AI_FRAME_TRANSPORT_LEASE:
+            return descriptor
+        started = time.perf_counter()
         descriptor["bgr"] = bgr_pool.write(frame_bgr)
+        descriptor["pool_bgr_write_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
         if descriptor["bgr"] is None:
             _release_shared_payload(descriptor, pools)
             return None
@@ -344,25 +458,63 @@ def _take_shared_ai_frames(
     descriptor: Dict[str, Any],
     ack_queues: Dict[str, Any],
     expected_frame_id: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Rebuild one aligned RGB/BGR pair for object inference and OCR."""
+) -> AiFramePayload:
+    """Rebuild one aligned AI frame using copy or zero-copy lease semantics."""
 
     remaining = dict(descriptor)
+    leases: list[SharedArrayLease] = []
     try:
         descriptor_frame_id = int(remaining.pop("frame_id"))
         remaining.pop("source_frame_id")
+        transport = str(
+            remaining.pop("transport", AI_FRAME_TRANSPORT_COPY)
+        ).lower()
+        if transport not in AI_FRAME_TRANSPORTS:
+            raise ValueError(f"unsupported AI frame transport: {transport!r}")
+        timing = {
+            "pool_rgb_write_ms": float(
+                remaining.pop("pool_rgb_write_ms", 0.0)
+            ),
+            "pool_bgr_write_ms": float(
+                remaining.pop("pool_bgr_write_ms", 0.0)
+            ),
+            "worker_map_ms": 0.0,
+            "worker_copy_ms": 0.0,
+        }
         if descriptor_frame_id != int(expected_frame_id):
             raise ValueError(
                 f"AI RGB/BGR packet frame mismatch: {descriptor_frame_id} != {expected_frame_id}"
             )
+        if transport == AI_FRAME_TRANSPORT_LEASE:
+            rgb_lease = _lease_shared_ndarray(remaining.pop("rgb"), ack_queues)
+            leases.append(rgb_lease)
+            assert rgb_lease.array is not None
+            timing["worker_map_ms"] = rgb_lease.map_ms
+            return AiFramePayload(
+                rgb=rgb_lease.array,
+                bgr=None,
+                leases=leases,
+                timing=timing,
+            )
+        copied_started = time.perf_counter()
         frame_rgb = _take_shared_ndarray(remaining.pop("rgb"), ack_queues)
         frame_bgr = _take_shared_ndarray(remaining.pop("bgr"), ack_queues)
+        timing["worker_copy_ms"] = (
+            time.perf_counter() - copied_started
+        ) * 1000.0
         if frame_rgb.shape != frame_bgr.shape:
             raise ValueError(
                 f"AI RGB/BGR frame shape mismatch: {frame_rgb.shape} != {frame_bgr.shape}"
             )
-        return frame_rgb, frame_bgr
+        return AiFramePayload(
+            rgb=frame_rgb,
+            bgr=frame_bgr,
+            leases=leases,
+            timing=timing,
+        )
     except Exception:
+        for lease in leases:
+            lease.close()
         _ack_shared_payload(remaining, ack_queues)
         raise
 
@@ -467,6 +619,21 @@ def _ai_inference_worker(
         )
         detector.close()
         return
+    ai_frame_transport = str(
+        detector_config.get("ai_frame_transport", AI_FRAME_TRANSPORT_LEASE)
+    ).lower()
+    if ai_frame_transport not in AI_FRAME_TRANSPORTS:
+        startup_queue.put(
+            (
+                "error",
+                "ValueError: rknn_object_detector.ai_frame_transport must be "
+                f"one of {sorted(AI_FRAME_TRANSPORTS)}, "
+                f"got {ai_frame_transport!r}",
+            )
+        )
+        detector.close()
+        ocr_session.close()
+        return
     startup_queue.put(
         (
             "ready",
@@ -474,6 +641,7 @@ def _ai_inference_worker(
                 "runtime_backend": detector.runtime_backend,
                 "core_mask": detector.core_mask_name,
                 "pipeline_depth": detector.pipeline_depth,
+                "ai_frame_transport": ai_frame_transport,
             },
         )
     )
@@ -490,7 +658,7 @@ def _ai_inference_worker(
             int,
             float,
             float,
-            np.ndarray,
+            AiFramePayload,
         ]
     ] = []
     input_closed = False
@@ -521,10 +689,33 @@ def _ai_inference_worker(
                     frame_id,
                     captured_at,
                     ipc_finished,
-                    frame_bgr,
+                    frame_payload,
                 ) = pending.pop(0)
                 try:
                     detections, timing, detected_at = future.result()
+                    timing = {
+                        **timing,
+                        "pool_rgb_write_ms": frame_payload.timing[
+                            "pool_rgb_write_ms"
+                        ],
+                        "pool_bgr_write_ms": frame_payload.timing[
+                            "pool_bgr_write_ms"
+                        ],
+                        "worker_map_ms": frame_payload.timing["worker_map_ms"],
+                        "worker_copy_ms": frame_payload.timing["worker_copy_ms"],
+                    }
+                    bgr_started = time.perf_counter()
+                    frame_bgr = frame_payload.bgr
+                    if frame_bgr is None:
+                        frame_bgr = cv2.cvtColor(
+                            frame_payload.rgb,
+                            cv2.COLOR_RGB2BGR,
+                        )
+                    timing["worker_bgr_convert_ms"] = (
+                        time.perf_counter() - bgr_started
+                        if frame_payload.bgr is None
+                        else 0.0
+                    ) * 1000.0
                     # OCR also uses NPU2. Only drain the detector pipeline when
                     # this exact frame will actually enter the OCR recognizer;
                     # ordinary detection results must be published immediately.
@@ -562,6 +753,7 @@ def _ai_inference_worker(
                             last_ocr_result = ocr_result
                     except Exception:
                         traceback.print_exc()
+                    timing["slot_hold_ms"] = frame_payload.current_hold_ms()
                     _put_latest(
                         output_queue,
                         (
@@ -594,6 +786,8 @@ def _ai_inference_worker(
                             last_ocr_attempt,
                         ),
                     )
+                finally:
+                    frame_payload.close()
                 continue
             if input_closed:
                 if not pending:
@@ -608,8 +802,9 @@ def _ai_inference_worker(
                 continue
 
             frame_id, captured_at, frame_payload = item
+            ai_frame: AiFramePayload | None = None
             try:
-                frame_rgb, frame_bgr = _take_shared_ai_frames(
+                ai_frame = _take_shared_ai_frames(
                     frame_payload,
                     ack_queues,
                     expected_frame_id=int(frame_id),
@@ -619,16 +814,19 @@ def _ai_inference_worker(
                     (
                         executor.submit(
                             run_detection,
-                            frame_rgb,
+                            ai_frame.rgb,
                             int(frame_id),
                         ),
                         int(frame_id),
                         float(captured_at),
                         ipc_finished,
-                        frame_bgr,
+                        ai_frame,
                     )
                 )
+                ai_frame = None
             except Exception:
+                if ai_frame is not None:
+                    ai_frame.close()
                 traceback.print_exc()
                 if detector.runtime_backend == "c_api":
                     raise
@@ -648,6 +846,8 @@ def _ai_inference_worker(
                 )
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
+        for _future, _frame_id, _captured_at, _ipc_finished, frame_payload in pending:
+            frame_payload.close()
         detector.close()
         ocr_session.close()
 
@@ -1051,6 +1251,15 @@ class UpperMachineApp:
         )
         self.drop_stale_lane_results = bool(lane_config.get("drop_stale_results", True))
         ai_config = config.get("rknn_object_detector", {})
+        self.ai_frame_transport = str(
+            ai_config.get("ai_frame_transport", AI_FRAME_TRANSPORT_LEASE)
+        ).lower()
+        if self.ai_frame_transport not in AI_FRAME_TRANSPORTS:
+            raise ValueError(
+                "rknn_object_detector.ai_frame_transport must be "
+                f"one of {sorted(AI_FRAME_TRANSPORTS)}, "
+                f"got {self.ai_frame_transport!r}"
+            )
         self.ai_inference_stride = max(1, int(ai_config.get("inference_stride", 1)))
         self.ai_max_result_age_frames = max(0, int(ai_config.get("max_result_age_frames", 12)))
         self.drop_stale_ai_results = bool(ai_config.get("drop_stale_results", True))
@@ -1350,6 +1559,9 @@ class UpperMachineApp:
                 "object_pipeline_depth": ai_startup_details.get(
                     "pipeline_depth"
                 ),
+                "object_ai_frame_transport": ai_startup_details.get(
+                    "ai_frame_transport"
+                ),
             }
         )
         if self.road_sign_analyzer_config.enable:
@@ -1393,6 +1605,7 @@ class UpperMachineApp:
                     captured_frame.source_frame_id,
                     self.ai_rgb_frame_pool,
                     self.ai_bgr_frame_pool,
+                    self.ai_frame_transport,
                 )
             if ai_frame_payload is not None:
                 _put_latest(
@@ -2024,6 +2237,14 @@ class UpperMachineApp:
                 if self.last_ai_frame_id >= 0
                 else None
             ),
+            "ai_pool_rgb_write_ms": ai_timing.get("pool_rgb_write_ms"),
+            "ai_pool_bgr_write_ms": ai_timing.get("pool_bgr_write_ms"),
+            "ai_worker_map_ms": ai_timing.get("worker_map_ms"),
+            "ai_worker_copy_ms": ai_timing.get("worker_copy_ms"),
+            "ai_worker_bgr_convert_ms": ai_timing.get(
+                "worker_bgr_convert_ms"
+            ),
+            "ai_slot_hold_ms": ai_timing.get("slot_hold_ms"),
             "camera_wait_ms": float(camera_wait_ms),
             "color_conversion_ms": float(color_conversion_ms),
             "current_frame_to_send_ms": max(

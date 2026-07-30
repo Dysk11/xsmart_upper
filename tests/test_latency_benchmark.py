@@ -143,6 +143,8 @@ def test_benchmark_cli_disables_off_path_ui_and_logging(tmp_path: Path) -> None:
         mode="shared_memory",
         bridge="mock",
         video=None,
+        shared_memory_name="xsmart_isolated_benchmark",
+        ai_frame_transport="rgb_lease",
         warmup_sec=10.0,
         duration_sec=60.0,
         system_sample_interval_sec=1.0,
@@ -157,3 +159,11 @@ def test_benchmark_cli_disables_off_path_ui_and_logging(tmp_path: Path) -> None:
     assert config["visualizer"]["show_window"] is False
     assert config["visualizer"]["save_video"] is False
     assert config["logger"]["enable"] is False
+    assert (
+        config["camera"]["shared_memory_name"]
+        == "xsmart_isolated_benchmark"
+    )
+    assert (
+        config["rknn_object_detector"]["ai_frame_transport"]
+        == "rgb_lease"
+    )
