@@ -66,7 +66,12 @@ from core.planning.road_sign_analyzer import (
 from core.object.rknn_detector import RknnObjectDetector
 from core.lane.rknn_segmenter import LaneInference, RknnLaneSegmenter, SegmentationResult
 from core.lane.capi_backend import CapiLaneBackend, NativeLaneResult
-from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
+from core.ocr.road_sign import (
+    OcrCycleCompletion,
+    OcrStopLatch,
+    OcrTrigger,
+    RoadSignOcrSession,
+)
 from core.planning.target_selector import TargetPointResult, TargetSelector
 from core.runtime.latency_benchmark import LatencyBenchmark
 from core.visualization.visualizer import (
@@ -594,7 +599,7 @@ def _ai_inference_worker(
     project_root: str,
     input_queue: Any,
     output_queue: Any,
-    ocr_trigger_queue: Any,
+    ocr_event_queue: Any,
     rgb_ack_queue: Any,
     bgr_ack_queue: Any,
     startup_queue: Any,
@@ -608,7 +613,8 @@ def _ai_inference_worker(
         ocr_session = RoadSignOcrSession(
             ocr_config,
             project_root=Path(project_root),
-            trigger_callback=ocr_trigger_queue.put,
+            trigger_callback=ocr_event_queue.put,
+            completion_callback=ocr_event_queue.put,
         )
     except Exception as error:
         startup_queue.put(
@@ -1375,7 +1381,7 @@ class UpperMachineApp:
         self.ai_input_queue = self.mp_context.Queue(maxsize=1)
         self.ai_output_queue = self.mp_context.Queue(maxsize=1)
         self.ai_startup_queue = self.mp_context.Queue(maxsize=1)
-        self.ocr_trigger_queue = self.mp_context.Queue()
+        self.ocr_event_queue = self.mp_context.Queue()
         self.road_sign_analysis_input_queue = self.mp_context.Queue(maxsize=1)
         self.road_sign_analysis_output_queue = self.mp_context.Queue(maxsize=1)
         self.ui_queue = self.mp_context.Queue(maxsize=1)
@@ -1468,7 +1474,7 @@ class UpperMachineApp:
                 str(project_root),
                 self.ai_input_queue,
                 self.ai_output_queue,
-                self.ocr_trigger_queue,
+                self.ocr_event_queue,
                 self.ai_rgb_ack_queue,
                 self.ai_bgr_ack_queue,
                 self.ai_startup_queue,
@@ -1628,23 +1634,34 @@ class UpperMachineApp:
             now = time.monotonic()
             while True:
                 try:
-                    ocr_trigger = self.ocr_trigger_queue.get_nowait()
+                    ocr_event = self.ocr_event_queue.get_nowait()
                 except queue.Empty:
                     break
-                if not isinstance(ocr_trigger, OcrTrigger):
-                    continue
-                if self.ocr_stop_latch.start(
-                    ocr_trigger.trigger_id,
-                    ocr_trigger.started_at,
-                ):
-                    self.road_sign_approach.mark_ocr_started()
-                    self.road_sign_analysis_state.cancel_pending(reset_decision=True)
-                    self.pending_analysis_trigger_id = 0
-                    print(
-                        f"[OCR] trigger={ocr_trigger.trigger_id} frame={ocr_trigger.frame_id} "
-                        "status=vehicle_stop",
-                        flush=True,
-                    )
+                if isinstance(ocr_event, OcrTrigger):
+                    if self.ocr_stop_latch.start(
+                        ocr_event.trigger_id,
+                        ocr_event.started_at,
+                    ):
+                        self.road_sign_approach.mark_ocr_started()
+                        self.road_sign_analysis_state.cancel_pending(reset_decision=True)
+                        self.pending_analysis_trigger_id = 0
+                        print(
+                            f"[OCR] trigger={ocr_event.trigger_id} frame={ocr_event.frame_id} "
+                            "status=vehicle_stop",
+                            flush=True,
+                        )
+                elif isinstance(ocr_event, OcrCycleCompletion):
+                    if self.ocr_stop_latch.complete(ocr_event.trigger_id):
+                        self.road_sign_analysis_state.cancel_pending(
+                            reset_decision=True
+                        )
+                        self.pending_analysis_trigger_id = 0
+                        print(
+                            f"[OCR] trigger={ocr_event.trigger_id} "
+                            f"frame={ocr_event.frame_id} status=no_result_release "
+                            f"reason={ocr_event.reason}",
+                            flush=True,
+                        )
             expired_trigger_id = self.ocr_stop_latch.expire_if_needed(now)
             if expired_trigger_id is not None:
                 cancelled_event_id = self.road_sign_analysis_state.cancel_pending(

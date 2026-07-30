@@ -519,15 +519,17 @@ PP-OCRv4 Det/Rec RKNN 模型。候选缺失或面积变化超限会重新累计�
 会话继续保持到流程完成或总超时。只有整体
 置信度达到 `0.60` 的非空文字才写入
 `outputs/logs/ocr/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后按
-`ocr.cooldown_seconds` 配置全局 OCR 冷却时间，默认 20 秒。
+`ocr.cooldown_seconds` 配置全局 OCR 冷却时间，当前默认 10 秒。
 主循环在整个 `ROAD_SIGN_WAIT` 期间持续向下位机发送 `speed_state=0x00`。
-停车覆盖面积稳定等待、岔路确认、OCR 重试和后续千帆 API 请求；API 正常返回或产生
+停车覆盖面积稳定等待、岔路确认和后续千帆 API 请求；API 正常返回或产生
 fallback 决策后恢复配置档位。`ocr.stop_timeout_sec` 控制 OCR/API 总等待上限，默认
 20 秒；超时后取消 pending 请求、忽略迟到结果并保持当前分支。关闭路牌 API 时，
 OCR 完成后同样保持当前分支。
 每次 OCR 尝试都会在控制台输出 `[OCR]` 行，并在调试窗口用紫色框标出裁剪区域；
-紫框默认显示 1 秒后清除，最新文字、置信度和耗时继续保留。低分候选只显示，
-不写 JSONL，也不启动冷却。
+紫框默认显示 1 秒后清除，最新文字、置信度和耗时继续保留。空文本、低于
+`ocr.accept_score` 的文字或 OCR 推理异常会立即解除本次 OCR 停车并进入全局冷却，
+不写 JSONL、不请求路牌 API；同一路牌必须先在新检测结果中消失，之后才能重新触发。
+`ocr.retry_interval_sec` 只用于有效 OCR 事件写日志失败后的重试。
 模型、阈值、NPU 核和输出目录均在 `config.yaml` 的
 `ocr` 中配置。板端只需要 RKNN-Toolkit-Lite2，不使用 ONNX 或
 PaddlePaddle；额外 Python 依赖为 `shapely`、`pyclipper` 和 `six`。

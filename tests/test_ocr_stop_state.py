@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from core.object.blocking import DetectedObject
 from core.ocr.recognizer import OcrResult
-from core.ocr.road_sign import OcrStopLatch, OcrTrigger, RoadSignOcrSession
+from core.ocr.road_sign import (
+    OcrCycleCompletion,
+    OcrStopLatch,
+    OcrTrigger,
+    RoadSignOcrSession,
+)
 
 
 class FakeRecognizer:
@@ -42,6 +48,8 @@ def make_session(
     *,
     now: list[float] | None = None,
     triggers: list[OcrTrigger] | None = None,
+    completions: list[OcrCycleCompletion] | None = None,
+    events: list[object] | None = None,
     **config: object,
 ) -> tuple[RoadSignOcrSession, FakeRecognizer]:
     recognizer = FakeRecognizer(results)
@@ -60,7 +68,16 @@ def make_session(
     session_kwargs: dict[str, object] = {
         "recognizer": recognizer,
         "event_logger": FakeLogger(),
-        "trigger_callback": triggers.append if triggers is not None else None,
+        "trigger_callback": (
+            events.append
+            if events is not None
+            else (triggers.append if triggers is not None else None)
+        ),
+        "completion_callback": (
+            events.append
+            if events is not None
+            else (completions.append if completions is not None else None)
+        ),
     }
     if now is not None:
         session_kwargs["clock"] = lambda: now[0]
@@ -68,36 +85,51 @@ def make_session(
     return session, recognizer
 
 
-def test_ocr_retries_share_trigger_and_rearm_after_candidate_disappears() -> None:
+@pytest.mark.parametrize(
+    ("failed_result", "expected_reason"),
+    [
+        (OcrResult(frame_id=1), "empty"),
+        (OcrResult(frame_id=1, text="left", confidence=0.59), "low_confidence"),
+        (OcrResult(frame_id=1, error="inference failed"), "error"),
+    ],
+)
+def test_unusable_ocr_result_releases_once_and_requires_rearm(
+    failed_result: OcrResult,
+    expected_reason: str,
+) -> None:
     now = [0.0]
-    triggers: list[OcrTrigger] = []
+    events: list[object] = []
     session, recognizer = make_session(
         [
-            OcrResult(frame_id=1, error="retry"),
-            OcrResult(frame_id=2, text="left", confidence=0.9),
+            failed_result,
             OcrResult(frame_id=4, text="right", confidence=0.9),
         ],
         now=now,
-        triggers=triggers,
+        events=events,
+        cooldown_seconds=1.0,
     )
     frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
     session.update(frame, 1, [make_detection()])
-    now[0] = 0.5
-    accepted = session.update(frame, 2, [make_detection()])
 
-    assert recognizer.call_count == 2
-    assert [item.trigger_id for item in triggers] == [1]
-    assert triggers[0].started_at == 0.0
-    assert accepted is not None and accepted.trigger_id == 1
+    assert recognizer.call_count == 1
+    assert len(events) == 2
+    assert isinstance(events[0], OcrTrigger)
+    assert isinstance(events[1], OcrCycleCompletion)
+    assert events[0].trigger_id == events[1].trigger_id == 1
+    assert events[1].reason == expected_reason
+
+    now[0] = 1.1
+    session.update(frame, 2, [make_detection()])
+    assert recognizer.call_count == 1
 
     session.update(frame, 3, [])
-    now[0] = 0.6
+    now[0] = 1.2
     second = session.update(frame, 4, [make_detection()])
 
-    assert recognizer.call_count == 3
-    assert [item.trigger_id for item in triggers] == [1, 2]
-    assert triggers[1].started_at == 0.6
+    assert recognizer.call_count == 2
+    assert isinstance(events[2], OcrTrigger)
+    assert events[2].trigger_id == 2
     assert second is not None and second.trigger_id == 2
 
 
@@ -111,6 +143,35 @@ def test_stop_latch_duplicate_trigger_does_not_reset_timeout() -> None:
     assert not latch.active
     assert not latch.start(7, 121.0)
     assert latch.start(8, 121.0)
+
+
+def test_no_result_cooldown_remains_active_after_candidate_disappears() -> None:
+    now = [0.0]
+    session, recognizer = make_session(
+        [
+            OcrResult(frame_id=1),
+            OcrResult(frame_id=4, text="left", confidence=0.9),
+        ],
+        now=now,
+        cooldown_seconds=1.0,
+    )
+    frame = np.zeros((140, 160, 3), dtype=np.uint8)
+    eligible = [make_detection()]
+
+    session.update(frame, 1, eligible)
+    now[0] = 0.1
+    session.update(frame, 2, [])
+    now[0] = 0.5
+    session.update(frame, 3, eligible)
+
+    assert recognizer.call_count == 1
+    assert not session.would_run_recognizer(frame, eligible)
+
+    now[0] = 1.0
+    assert session.would_run_recognizer(frame, eligible)
+    accepted = session.update(frame, 4, eligible)
+    assert recognizer.call_count == 2
+    assert accepted is not None and accepted.text == "left"
 
 
 def test_missing_or_ineligible_road_sign_does_not_start_ocr() -> None:
@@ -159,6 +220,8 @@ def test_would_run_recognizer_matches_same_frame_eligibility_and_retry_gate() ->
     session.update(frame, 1, eligible)
     assert not session.would_run_recognizer(frame, eligible)
     now[0] = 0.5
+    assert not session.would_run_recognizer(frame, eligible)
+    session.update(frame, 2, [])
     assert session.would_run_recognizer(frame, eligible)
 
 
@@ -210,13 +273,13 @@ def test_top_and_bottom_edges_do_not_block_ocr() -> None:
     assert accepted is not None
 
 
-def test_edge_frame_pauses_retry_without_creating_another_trigger() -> None:
+def test_edge_frame_does_not_rearm_completed_no_result_cycle() -> None:
     now = [0.0]
     triggers: list[OcrTrigger] = []
     session, recognizer = make_session(
         [
-            OcrResult(frame_id=1, error="retry"),
-            OcrResult(frame_id=3, text="right", confidence=0.9),
+            OcrResult(frame_id=1, error="failed"),
+            OcrResult(frame_id=5, text="right", confidence=0.9),
         ],
         now=now,
         triggers=triggers,
@@ -230,16 +293,25 @@ def test_edge_frame_pauses_retry_without_creating_another_trigger() -> None:
     assert recognizer.call_count == 1
     assert len(triggers) == 1
 
-    accepted = session.update(
+    session.update(
         frame,
         3,
         [make_detection((1, 20, 158, 100))],
     )
+    assert recognizer.call_count == 1
+    assert len(triggers) == 1
+
+    session.update(frame, 4, [])
+    accepted = session.update(
+        frame,
+        5,
+        [make_detection((1, 20, 158, 100))],
+    )
 
     assert recognizer.call_count == 2
-    assert len(triggers) == 1
+    assert len(triggers) == 2
     assert accepted is not None
-    assert accepted.trigger_id == triggers[0].trigger_id
+    assert accepted.trigger_id == triggers[1].trigger_id
 
 
 def test_edge_highest_priority_candidate_discards_entire_frame() -> None:
@@ -270,28 +342,19 @@ def test_edge_highest_priority_candidate_discards_entire_frame() -> None:
     assert accepted is not None
 
 
-def test_timeout_suppresses_same_visible_sign_until_it_disappears() -> None:
-    now = [0.0]
-    triggers: list[OcrTrigger] = []
-    session, recognizer = make_session(
-        [
-            OcrResult(frame_id=1, error="retry"),
-            OcrResult(frame_id=4, text="left", confidence=0.9),
-        ],
-        now=now,
-        triggers=triggers,
-        retry_interval_sec=100.0,
+def test_stale_or_duplicate_completion_cannot_unlock_newer_cycle() -> None:
+    latch = OcrStopLatch(timeout_sec=20.0)
+    first = OcrCycleCompletion(
+        trigger_id=1,
+        frame_id=10,
+        completed_at=1.0,
+        reason="empty",
     )
-    frame = np.zeros((140, 160, 3), dtype=np.uint8)
 
-    session.update(frame, 1, [make_detection()])
-    now[0] = 20.0
-    session.update(frame, 2, [make_detection()])
-    now[0] = 20.1
-    session.update(frame, 3, [])
-    accepted = session.update(frame, 4, [make_detection()])
-
-    assert recognizer.call_count == 2
-    assert [item.trigger_id for item in triggers] == [1, 2]
-    assert accepted is not None
-    assert accepted.trigger_id == 2
+    assert latch.start(1, 0.0)
+    assert latch.complete(first.trigger_id)
+    assert latch.start(2, 2.0)
+    assert not latch.complete(first.trigger_id)
+    assert latch.owns(2)
+    assert not latch.complete(99)
+    assert latch.owns(2)

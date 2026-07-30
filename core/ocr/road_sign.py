@@ -42,6 +42,16 @@ class OcrTrigger:
     started_at: float
 
 
+@dataclass(frozen=True)
+class OcrCycleCompletion:
+    """Reliable notification that an OCR stop cycle has no usable result."""
+
+    trigger_id: int
+    frame_id: int
+    completed_at: float
+    reason: str
+
+
 class OcrStopLatch:
     """Latch vehicle stop from OCR start until API completion or total timeout."""
 
@@ -190,6 +200,7 @@ class RoadSignOcrSession:
         event_logger: Any | None = None,
         clock: Callable[[], float] = time.monotonic,
         trigger_callback: Callable[[OcrTrigger], None] | None = None,
+        completion_callback: Callable[[OcrCycleCompletion], None] | None = None,
     ) -> None:
         self.config = config
         self.enabled = bool(config.get("enable", False))
@@ -210,6 +221,7 @@ class RoadSignOcrSession:
             raise ValueError("ocr.stop_timeout_sec must be greater than zero")
         self.clock = clock
         self.trigger_callback = trigger_callback
+        self.completion_callback = completion_callback
 
         root = project_root or Path.cwd()
         output_dir = Path(str(config.get("output_dir", "outputs/logs")))
@@ -311,7 +323,24 @@ class RoadSignOcrSession:
         self.last_attempt = candidate
         if candidate.error or not candidate.text or candidate.confidence < self.accept_score:
             self.last_error = candidate.error
-            self._next_retry_at = now + self.retry_interval_sec
+            if candidate.error:
+                reason = "error"
+            elif not candidate.text:
+                reason = "empty"
+            else:
+                reason = "low_confidence"
+            self._cycle_completed = True
+            self._cooldown_until = now + self.cooldown_seconds
+            self._next_retry_at = self._cooldown_until
+            if self.completion_callback is not None:
+                self.completion_callback(
+                    OcrCycleCompletion(
+                        trigger_id=self._active_trigger_id,
+                        frame_id=frame_id,
+                        completed_at=now,
+                        reason=reason,
+                    )
+                )
             return self._last_result
 
         self._event_counter += 1
