@@ -18,17 +18,17 @@ import numpy as np
 from core.lane.rknn_segmenter import SegmentationInstance, SegmentationResult
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 SLOT_COUNT = 2
 GLOBAL_HEADER_SIZE = 64
 INPUT_SLOT_HEADER_SIZE = 64
-RESULT_SLOT_HEADER_SIZE = 256
+RESULT_SLOT_HEADER_SIZE = 288
 INPUT_MAGIC = b"XSLNIN1\0"
 RESULT_MAGIC = b"XSLNOT1\0"
 
 GLOBAL_HEADER = struct.Struct("<8sIIIIQIIII16x")
 INPUT_SLOT_HEADER = struct.Struct("<QQQQIIIII12x")
-RESULT_BASE_HEADER = struct.Struct("<QQQQQQIIIIIIIdddddddQQQQQQQ")
+RESULT_BASE_HEADER = struct.Struct("<QQQQQQIIIIIIIdddddddddddQQQQQQQ")
 RESULT_INSTANCE = struct.Struct("<iiiif")
 
 BACKEND_STATE_INITIALIZING = 0
@@ -236,6 +236,10 @@ class LatestResultSharedMemory:
             inference_ms,
             output_sync_ms,
             postprocess_ms,
+            decode_ms,
+            prototype_ms,
+            resize_union_ms,
+            pack_ms,
             total_ms,
             publish_ms,
             claimed_count,
@@ -305,6 +309,10 @@ class LatestResultSharedMemory:
                 "output_sync_ms": float(output_sync_ms),
                 "postprocess_queue_ms": 0.0,
                 "postprocess_ms": float(postprocess_ms),
+                "decode_ms": float(decode_ms),
+                "prototype_ms": float(prototype_ms),
+                "resize_union_ms": float(resize_union_ms),
+                "pack_ms": float(pack_ms),
                 "total_ms": float(total_ms),
                 "publish_ms": float(publish_ms),
             },
@@ -354,6 +362,16 @@ class CapiLaneBackend:
         self.output_mode = str(config.get("output_mode", "float")).lower()
         if self.output_mode not in {"float", "native"}:
             raise ValueError("C API output_mode must be float or native")
+        self.postprocess_backend = str(
+            config.get("postprocess_backend", "reference")
+        ).lower()
+        if self.postprocess_backend not in {"reference", "neon_exact"}:
+            raise ValueError(
+                "C API postprocess_backend must be reference or neon_exact"
+            )
+        self.validate_postprocess_exact = bool(
+            config.get("validate_postprocess_exact", False)
+        )
         self.startup_timeout_sec = max(0.1, float(config.get("startup_timeout_sec", 8.0)))
         core_names = list(config.get("worker_core_masks", ["NPU_CORE_0", "NPU_CORE_1"]))
         if len(core_names) != 2:
@@ -422,6 +440,10 @@ class CapiLaneBackend:
             self.preprocess_backend,
             "--output-mode",
             self.output_mode,
+            "--postprocess-backend",
+            self.postprocess_backend,
+            "--validate-postprocess-exact",
+            "1" if self.validate_postprocess_exact else "0",
             "--score-threshold",
             str(self.score_threshold),
             "--nms-threshold",

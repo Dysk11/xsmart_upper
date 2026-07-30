@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
+from core.lane.native_geometry import NativeRowRunExtractor
 from utils.math_utils import (
     clamp,
     safe_divide,
@@ -116,6 +118,104 @@ ARTICLE_ROW_WEIGHTS = np.asarray(
 CURRENT_ROUTE_DISTANCE_MARGIN_PX = 1.0
 
 
+class RowRunSlice(Sequence[tuple[int, int]]):
+    """A zero-copy view of one row in CSR run storage."""
+
+    def __init__(
+        self,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        begin: int,
+        end: int,
+    ) -> None:
+        self._starts = starts
+        self._ends = ends
+        self._begin = int(begin)
+        self._end = int(end)
+
+    def __len__(self) -> int:
+        return self._end - self._begin
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [
+                self[item]
+                for item in range(*index.indices(len(self)))
+            ]
+        normalized = int(index)
+        if normalized < 0:
+            normalized += len(self)
+        if normalized < 0 or normalized >= len(self):
+            raise IndexError(index)
+        absolute = self._begin + normalized
+        return int(self._starts[absolute]), int(self._ends[absolute])
+
+    def __iter__(self):
+        for absolute in range(self._begin, self._end):
+            yield int(self._starts[absolute]), int(self._ends[absolute])
+
+    def centers(self) -> list[float]:
+        return [
+            0.5 * (int(self._starts[index]) + int(self._ends[index]))
+            for index in range(self._begin, self._end)
+        ]
+
+    def outer_bounds(self) -> tuple[int, int]:
+        if self._begin >= self._end:
+            raise ValueError("empty row-run slice has no outer bounds")
+        return (
+            int(self._starts[self._begin]),
+            int(self._ends[self._end - 1]),
+        )
+
+    def nearest(self, candidate_x: float) -> tuple[int, int]:
+        if self._begin >= self._end:
+            raise ValueError("empty row-run slice has no nearest run")
+        best_index = self._begin
+        best_distance = float("inf")
+        for index in range(self._begin, self._end):
+            center = 0.5 * (
+                int(self._starts[index]) + int(self._ends[index])
+            )
+            distance = abs(center - float(candidate_x))
+            if distance < best_distance:
+                best_distance = distance
+                best_index = index
+        return int(self._starts[best_index]), int(self._ends[best_index])
+
+
+class RowRuns(Sequence[RowRunSlice]):
+    """CSR row-run storage shared by the NumPy and native extractors."""
+
+    def __init__(
+        self,
+        offsets: np.ndarray,
+        starts: np.ndarray,
+        ends: np.ndarray,
+    ) -> None:
+        self.offsets = np.asarray(offsets, dtype=np.uint32)
+        self.starts = np.asarray(starts, dtype=np.int32)
+        self.ends = np.asarray(ends, dtype=np.int32)
+
+    def __len__(self) -> int:
+        return max(0, int(self.offsets.size) - 1)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        normalized = int(index)
+        if normalized < 0:
+            normalized += len(self)
+        if normalized < 0 or normalized >= len(self):
+            raise IndexError(index)
+        return RowRunSlice(
+            self.starts,
+            self.ends,
+            int(self.offsets[normalized]),
+            int(self.offsets[normalized + 1]),
+        )
+
+
 class LaneDetector:
     """使用传统视觉方法检测蓝色航道中心线。"""
 
@@ -130,6 +230,20 @@ class LaneDetector:
         """
 
         self.config = config
+        self.last_timing: dict[str, float] = {}
+        self.row_runs_backend = str(
+            config.get("row_runs_backend", "numpy")
+        ).lower()
+        if self.row_runs_backend not in {"numpy", "native"}:
+            raise ValueError("lane_geometry.row_runs_backend must be numpy or native")
+        self.native_row_run_extractor: NativeRowRunExtractor | None = None
+        if self.row_runs_backend == "native":
+            library_path = str(config.get("native_row_runs_library", "")).strip()
+            if not library_path:
+                raise ValueError(
+                    "lane_geometry.native_row_runs_library is required for native row runs"
+                )
+            self.native_row_run_extractor = NativeRowRunExtractor(library_path)
         self.color_space = str(config.get("color_space", "hsv")).lower()
         self.hsv_config = config.get("hsv", {})
         self.lab_config = config.get("lab", {})
@@ -311,13 +425,26 @@ class LaneDetector:
     ) -> LaneDetectionResult:
         """Extract lane geometry from an externally produced binary ROI mask."""
 
+        started = time.perf_counter()
         if roi_mask.size == 0:
             result = self._empty_result((1, 1))
             result.segmentation_status = segmentation_status
+            self.last_timing = {
+                "mask_prepare_ms": (time.perf_counter() - started) * 1000.0,
+                "row_runs_ms": 0.0,
+                "boundary_trace_ms": 0.0,
+                "fork_centerline_ms": 0.0,
+                "result_build_ms": 0.0,
+            }
             return result
         if roi_mask.ndim == 3:
             roi_mask = cv2.cvtColor(roi_mask, cv2.COLOR_BGR2GRAY)
-        mask = np.where(roi_mask > 0, 255, 0).astype(np.uint8)
+        if roi_mask.dtype == np.uint8:
+            mask = np.ascontiguousarray(roi_mask)
+        else:
+            mask = np.ascontiguousarray(roi_mask > 0, dtype=np.uint8)
+            mask *= np.uint8(255)
+        mask_prepare_ms = (time.perf_counter() - started) * 1000.0
         return self._detect_from_boundaries(
             mask,
             route_direction=route_direction,
@@ -326,6 +453,7 @@ class LaneDetector:
             segmentation_status=segmentation_status,
             segmentation_instance_count=segmentation_instance_count,
             include_track_boundary_rows=include_track_boundary_rows,
+            mask_prepare_ms=mask_prepare_ms,
         )
 
     def _detect_from_boundaries(
@@ -337,15 +465,19 @@ class LaneDetector:
         segmentation_status: str,
         segmentation_instance_count: int,
         include_track_boundary_rows: bool,
+        mask_prepare_ms: float = 0.0,
     ) -> LaneDetectionResult:
         """Build the driving centerline directly from row-wise track boundaries."""
 
+        row_runs_started = time.perf_counter()
         row_runs = self._build_row_runs(mask)
+        row_runs_ms = (time.perf_counter() - row_runs_started) * 1000.0
         roi_center_x = (
             0.5 * float(mask.shape[1])
             if vehicle_center_x is None
             else clamp(float(vehicle_center_x), 0.0, float(max(0, mask.shape[1] - 1)))
         )
+        boundary_started = time.perf_counter()
         (
             left_points,
             right_points,
@@ -360,6 +492,10 @@ class LaneDetector:
             row_runs=row_runs,
             bottom_center_x=roi_center_x,
         )
+        boundary_trace_ms = (time.perf_counter() - boundary_started) * 1000.0
+        fork_centerline_started = time.perf_counter()
+        fork_branch_ms = 0.0
+        finalize_started = fork_centerline_started
         fork_result = self._geometric_fork_result(
             left_points,
             right_points,
@@ -386,6 +522,7 @@ class LaneDetector:
             if requested_direction is not None:
                 fork_result.reason = f"waiting for {requested_direction} fork"
         else:
+            fork_branch_started = time.perf_counter()
             (
                 left_candidate_points,
                 right_candidate_points,
@@ -522,7 +659,11 @@ class LaneDetector:
                     fork_result.reason = (
                         f"fork shared region; following normal centerline; {roughness_debug}"
                     )
+            fork_branch_ms = (
+                time.perf_counter() - fork_branch_started
+            ) * 1000.0
 
+        finalize_started = time.perf_counter()
         centerline_points = self._smooth_article_centerline(raw_centers, mask.shape[1])
         if not fork_result.fork_detected and requested_direction is None:
             centerline_points, track_hold_reason = self._stabilize_normal_track_switch(
@@ -547,6 +688,10 @@ class LaneDetector:
             self.last_lane_width_px = lane_width_px
             self.last_centerline_points = centerline_points
 
+        fork_centerline_ms = (
+            time.perf_counter() - fork_centerline_started
+        ) * 1000.0
+        result_build_started = time.perf_counter()
         track_boundary_rows: list[LaneBoundaryRow] = []
         if include_track_boundary_rows:
             extracted_by_y = {
@@ -599,7 +744,7 @@ class LaneDetector:
                     )
                 )
 
-        return LaneDetectionResult(
+        result = LaneDetectionResult(
             centerline_points=centerline_points,
             lateral_error_px=lateral_error_px,
             heading_error_deg=heading_error_deg,
@@ -620,6 +765,22 @@ class LaneDetector:
             segmentation_instance_count=segmentation_instance_count,
             track_boundary_rows=track_boundary_rows,
         )
+        self.last_timing = {
+            "mask_prepare_ms": float(mask_prepare_ms),
+            "row_runs_ms": row_runs_ms,
+            "boundary_trace_ms": boundary_trace_ms,
+            "fork_centerline_ms": fork_centerline_ms,
+            "fork_branch_ms": fork_branch_ms,
+            "geometry_finalize_ms": (
+                result_build_started - finalize_started
+            )
+            * 1000.0,
+            "result_build_ms": (
+                time.perf_counter() - result_build_started
+            )
+            * 1000.0,
+        }
+        return result
 
     def _perspective_lane_width(self, y: int, height: int) -> float:
         """Interpolate the configured lane width from ROI top to bottom."""
@@ -648,8 +809,11 @@ class LaneDetector:
             runs = row_runs[y]
             if not runs:
                 continue
-            outer_left = min(run[0] for run in runs)
-            outer_right = max(run[1] for run in runs)
+            if isinstance(runs, RowRunSlice):
+                outer_left, outer_right = runs.outer_bounds()
+            else:
+                outer_left = min(run[0] for run in runs)
+                outer_right = max(run[1] for run in runs)
             expected_width = self._perspective_lane_width(y, height)
             half_width = 0.5 * expected_width
             left_center = int(round(min(float(outer_right), float(outer_left) + half_width)))
@@ -849,37 +1013,48 @@ class LaneDetector:
             runs = row_runs[int(y)]
             if not runs:
                 continue
-            left, right = min(
-                runs,
-                key=lambda run: abs(0.5 * (run[0] + run[1]) - float(candidate_x)),
-            )
+            if isinstance(runs, RowRunSlice):
+                left, right = runs.nearest(float(candidate_x))
+            else:
+                left, right = min(
+                    runs,
+                    key=lambda run: abs(
+                        0.5 * (run[0] + run[1]) - float(candidate_x)
+                    ),
+                )
             selected_mask[int(y), :] = 0
             selected_mask[int(y), int(left) : int(right) + 1] = 255
         return selected_mask
 
-    def _build_row_runs(self, mask: np.ndarray) -> list[list[tuple[int, int]]]:
+    def _build_row_runs(self, mask: np.ndarray) -> RowRuns:
         """Precompute valid foreground runs for every row in one NumPy pass."""
 
         height, width = mask.shape[:2]
-        padded = np.zeros((height, width + 2), dtype=np.uint8)
-        padded[:, 1 : width + 1] = mask > 0
-        transitions = np.diff(padded.astype(np.int8, copy=False), axis=1)
-        start_rows, start_xs = np.nonzero(transitions == 1)
-        end_rows, end_exclusive_xs = np.nonzero(transitions == -1)
+        if self.native_row_run_extractor is not None:
+            offsets, starts, ends = self.native_row_run_extractor.extract(
+                mask,
+                self.min_run_width_px,
+            )
+            return RowRuns(offsets, starts, ends)
 
-        row_runs: list[list[tuple[int, int]]] = [[] for _ in range(height)]
-        for start_row, start_x, end_row, end_exclusive_x in zip(
-            start_rows,
-            start_xs,
-            end_rows,
-            end_exclusive_xs,
-        ):
-            if start_row != end_row:
-                continue
-            if int(end_exclusive_x) - int(start_x) < self.min_run_width_px:
-                continue
-            row_runs[int(start_row)].append((int(start_x), int(end_exclusive_x) - 1))
-        return row_runs
+        padded = np.zeros((height, width + 2), dtype=np.uint8)
+        np.not_equal(mask, 0, out=padded[:, 1 : width + 1])
+        transitions = np.diff(padded, axis=1)
+        start_rows, start_xs = np.nonzero(transitions == 1)
+        end_rows, end_exclusive_xs = np.nonzero(transitions == np.uint8(255))
+        widths = end_exclusive_xs.astype(np.int32) - start_xs.astype(np.int32)
+        valid = (start_rows == end_rows) & (widths >= self.min_run_width_px)
+        filtered_rows = start_rows[valid]
+        starts = start_xs[valid].astype(np.int32, copy=False)
+        ends = (end_exclusive_xs[valid] - 1).astype(np.int32, copy=False)
+        counts = np.bincount(filtered_rows, minlength=height).astype(
+            np.uint32,
+            copy=False,
+        )
+        offsets = np.empty(height + 1, dtype=np.uint32)
+        offsets[0] = 0
+        np.cumsum(counts, dtype=np.uint32, out=offsets[1:])
+        return RowRuns(offsets, starts, ends)
 
     def _extract_row_boundaries(
         self,
@@ -905,6 +1080,49 @@ class LaneDetector:
             if bottom_center_x is None
             else clamp(float(bottom_center_x), 0.0, float(max(0, width - 1)))
         )
+        if (
+            self.native_row_run_extractor is not None
+            and isinstance(row_runs, RowRuns)
+        ):
+            rows, left_branch_rows, right_branch_rows = (
+                self.native_row_run_extractor.trace_boundaries(
+                    row_runs.offsets,
+                    row_runs.starts,
+                    row_runs.ends,
+                    width=width,
+                    max_single_side_gap_rows=self.max_single_side_gap_rows,
+                    route_direction=route_direction,
+                    bottom_center_x=mapped_bottom_center,
+                    historical_center_x=historical_center,
+                )
+            )
+            for y, left, right, left_lost, right_lost in rows:
+                if not left_lost and not right_lost:
+                    selected_mask[y, left : right + 1] = 255
+            left_points = [(left, y) for y, left, _right, _ll, _rl in rows]
+            right_points = [
+                (right, y) for y, _left, right, _ll, _rl in rows
+            ]
+            centers = [
+                (int(round((left + right) * 0.5)), y)
+                for y, left, right, _ll, _rl in rows
+            ]
+            left_lost = [
+                is_lost for _y, _left, _right, is_lost, _right_lost in rows
+            ]
+            right_lost = [
+                is_lost for _y, _left, _right, _left_lost, is_lost in rows
+            ]
+            return (
+                left_points,
+                right_points,
+                centers,
+                left_lost,
+                right_lost,
+                selected_mask,
+                left_branch_rows,
+                right_branch_rows,
+            )
         first_valid_row = True
         rows: list[tuple[int, int, int, bool, bool]] = []
         left_branch_rows: list[tuple[int, int]] = []
@@ -921,7 +1139,11 @@ class LaneDetector:
                 continue
 
             single_side_gap = 0
-            centers = [0.5 * (left + right) for left, right in runs]
+            centers = (
+                runs.centers()
+                if isinstance(runs, RowRunSlice)
+                else [0.5 * (left + right) for left, right in runs]
+            )
             select_from_vehicle_center = (
                 first_valid_row
                 and len(runs) > 1
@@ -1037,12 +1259,13 @@ class LaneDetector:
             limited.append((current_x, y))
             previous_x = current_x
         smoothed: list[tuple[int, int]] = []
-        for index, (_x, y) in enumerate(limited):
+        stride = max(1, self.scan_step)
+        for index in range(0, len(limited), stride):
+            y = limited[index][1]
             start = max(0, index - 2)
             end = min(len(limited), index + 3)
             mean_x = sum(item[0] for item in limited[start:end]) / float(end - start)
-            if index % max(1, self.scan_step) == 0:
-                smoothed.append((int(round(mean_x)), y))
+            smoothed.append((int(round(mean_x)), y))
         return smoothed
 
     def _article_metrics(self, centerline_points, shape):

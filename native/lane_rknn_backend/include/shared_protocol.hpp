@@ -5,10 +5,10 @@
 
 namespace xsmart {
 
-constexpr std::uint32_t kProtocolVersion = 2;
+constexpr std::uint32_t kProtocolVersion = 3;
 constexpr std::size_t kGlobalHeaderSize = 64;
 constexpr std::size_t kInputSlotHeaderSize = 64;
-constexpr std::size_t kResultSlotHeaderSize = 256;
+constexpr std::size_t kResultSlotHeaderSize = 288;
 constexpr std::size_t kSlotCount = 2;
 
 constexpr char kInputMagic[8] = {'X', 'S', 'L', 'N', 'I', 'N', '1', '\0'};
@@ -85,6 +85,10 @@ struct ResultSlotHeader {
   double inference_ms;
   double output_sync_ms;
   double postprocess_ms;
+  double decode_ms;
+  double prototype_ms;
+  double resize_union_ms;
+  double pack_ms;
   double total_ms;
   double publish_ms;
   std::uint64_t claimed_count;

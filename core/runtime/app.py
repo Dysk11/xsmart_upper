@@ -1121,6 +1121,14 @@ def prepare_runtime_config(config: Dict[str, Any], project_root: Path) -> Dict[s
                 str(rknn_segmenter_config["c_api_binary"]),
             )
         )
+    lane_geometry_config = runtime_config.setdefault("lane_geometry", {})
+    if lane_geometry_config.get("native_row_runs_library"):
+        lane_geometry_config["native_row_runs_library"] = str(
+            resolve_project_path(
+                project_root,
+                str(lane_geometry_config["native_row_runs_library"]),
+            )
+        )
 
     ocr_config = runtime_config.setdefault("ocr", {})
     for path_key in ("det_model_path", "rec_model_path", "output_dir"):
@@ -2222,6 +2230,11 @@ class UpperMachineApp:
         )
         lane_captured_at = self.last_segmentation_captured_at
         ai_captured_at = self.last_ai_captured_at
+        geometry_timing = getattr(
+            getattr(self, "detector", None),
+            "last_timing",
+            {},
+        )
         return {
             "current_frame_id": int(current_frame_id),
             "source_frame_id": int(source_frame_id),
@@ -2315,6 +2328,10 @@ class UpperMachineApp:
             "lane_npu_inference_ms": lane_timing.get("inference_ms"),
             "lane_postprocess_queue_ms": lane_timing.get("postprocess_queue_ms"),
             "lane_postprocess_ms": lane_timing.get("postprocess_ms"),
+            "lane_decode_ms": lane_timing.get("decode_ms"),
+            "lane_prototype_ms": lane_timing.get("prototype_ms"),
+            "lane_resize_union_ms": lane_timing.get("resize_union_ms"),
+            "lane_pack_ms": lane_timing.get("pack_ms"),
             "lane_worker_total_ms": lane_timing.get("total_ms"),
             "lane_input_sync_ms": lane_timing.get("input_sync_ms"),
             "lane_output_sync_ms": lane_timing.get("output_sync_ms"),
@@ -2356,6 +2373,23 @@ class UpperMachineApp:
                 "notification_read_error_count"
             ),
             "geometry_ms": float(geometry_ms),
+            "geometry_mask_prepare_ms": geometry_timing.get(
+                "mask_prepare_ms"
+            ),
+            "geometry_row_runs_ms": geometry_timing.get("row_runs_ms"),
+            "geometry_boundary_trace_ms": geometry_timing.get(
+                "boundary_trace_ms"
+            ),
+            "geometry_fork_centerline_ms": geometry_timing.get(
+                "fork_centerline_ms"
+            ),
+            "geometry_fork_branch_ms": geometry_timing.get("fork_branch_ms"),
+            "geometry_finalize_ms": geometry_timing.get(
+                "geometry_finalize_ms"
+            ),
+            "geometry_result_build_ms": geometry_timing.get(
+                "result_build_ms"
+            ),
             "track_ms": float(track_ms),
             "planning_ms": float(planning_ms),
             "protocol_ms": float(protocol_ms),

@@ -71,6 +71,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select preallocated float outputs or native zero-copy outputs.",
     )
     parser.add_argument(
+        "--postprocess-backend",
+        choices=("reference", "neon_exact"),
+        help="Override the native lane post-processing implementation.",
+    )
+    parser.add_argument(
+        "--row-runs-backend",
+        choices=("numpy", "native"),
+        help="Override the stateless lane row-run extractor.",
+    )
+    parser.add_argument(
+        "--validate-postprocess-exact",
+        action="store_true",
+        help="Compare reference and neon prototype projection on each native output.",
+    )
+    parser.add_argument(
         "--fresh-result-wait-ms",
         type=float,
         help="Override the realtime C API eventfd wait budget.",
@@ -115,6 +130,13 @@ def build_benchmark_config(args: argparse.Namespace) -> dict:
         lane_config["preprocess_backend"] = args.preprocess
     if getattr(args, "output_mode", None):
         lane_config["output_mode"] = args.output_mode
+    if getattr(args, "postprocess_backend", None):
+        lane_config["postprocess_backend"] = args.postprocess_backend
+    if getattr(args, "validate_postprocess_exact", False):
+        lane_config["validate_postprocess_exact"] = True
+    geometry_config = config.setdefault("lane_geometry", {})
+    if getattr(args, "row_runs_backend", None):
+        geometry_config["row_runs_backend"] = args.row_runs_backend
     if getattr(args, "fresh_result_wait_ms", None) is not None:
         lane_config["fresh_result_wait_ms"] = max(
             0.0,

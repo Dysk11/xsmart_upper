@@ -2,6 +2,10 @@
 
 #include <rknn_api.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #if defined(XSMART_HAVE_RGA)
 #include <im2d.h>
 #endif
@@ -138,6 +142,8 @@ struct Options {
   std::array<int, 2> cpu_cores = {6, 7};
   std::string preprocess = "auto";
   std::string output_mode = "float";
+  std::string postprocess_backend = "reference";
+  bool validate_postprocess_exact = false;
   float score_threshold = 0.30F;
   float nms_threshold = 0.45F;
   float mask_threshold = 0.50F;
@@ -180,6 +186,10 @@ Options parse_options(const int argc, char** argv) {
       options.preprocess = value;
     } else if (key == "--output-mode") {
       options.output_mode = value;
+    } else if (key == "--postprocess-backend") {
+      options.postprocess_backend = value;
+    } else if (key == "--validate-postprocess-exact") {
+      options.validate_postprocess_exact = std::stoi(value) != 0;
     } else if (key == "--score-threshold") {
       options.score_threshold = std::stof(value);
     } else if (key == "--nms-threshold") {
@@ -201,6 +211,11 @@ Options parse_options(const int argc, char** argv) {
   if (options.preprocess != "auto" && options.preprocess != "direct" &&
       options.preprocess != "rga") {
     throw std::invalid_argument("--preprocess must be auto, direct or rga");
+  }
+  if (options.postprocess_backend != "reference" &&
+      options.postprocess_backend != "neon_exact") {
+    throw std::invalid_argument(
+        "--postprocess-backend must be reference or neon_exact");
   }
   if (options.output_mode != "float" && options.output_mode != "native") {
     throw std::invalid_argument("--output-mode must be float or native");
@@ -348,6 +363,135 @@ class TensorView {
 
   const TensorShape& shape() const { return logical_; }
 
+  bool supports_neon_exact_projection() const {
+#if defined(__aarch64__)
+    return native_.fmt == RKNN_TENSOR_NC1HWC2 && native_.n_dims == 5 &&
+           (native_.dims[4] == 2 || native_.dims[4] == 16) &&
+           native_.type == RKNN_TENSOR_INT8 &&
+           native_.qnt_type == RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC &&
+           logical_.c == 32 && logical_.h == 120 && logical_.w == 160;
+#else
+    return false;
+#endif
+  }
+
+  void project_reference(const std::array<float, 32>& coefficients,
+                         float* destination) const {
+    for (std::uint32_t y = 0; y < logical_.h; ++y) {
+      for (std::uint32_t x = 0; x < logical_.w; ++x) {
+        float value_sum = 0.0F;
+        for (std::uint32_t channel = 0; channel < 32; ++channel) {
+          value_sum += coefficients[channel] * value(channel, y, x);
+        }
+        destination[static_cast<std::size_t>(y) * logical_.w + x] = value_sum;
+      }
+    }
+  }
+
+  void project_neon_exact(const std::array<float, 32>& coefficients,
+                          float* destination) const {
+    if (!supports_neon_exact_projection()) {
+      throw std::runtime_error(
+          "neon_exact requires INT8 affine NC1HWC2 prototype output");
+    }
+#if defined(__aarch64__)
+    std::fill(destination,
+              destination + static_cast<std::size_t>(logical_.h) * logical_.w,
+              0.0F);
+    const auto* raw = reinterpret_cast<const std::int8_t*>(data_);
+    const std::uint32_t width_stride =
+        native_.w_stride > 0 ? native_.w_stride : native_.dims[3];
+    const float32x4_t zero_point =
+        vdupq_n_f32(static_cast<float>(native_.zp));
+    const float32x4_t scale = vdupq_n_f32(native_.scale);
+    const std::uint32_t channel_block = native_.dims[4];
+    if (channel_block == 16U) {
+      alignas(16) float dequantized[16];
+      for (std::uint32_t y = 0; y < logical_.h; ++y) {
+        for (std::uint32_t x = 0; x < logical_.w; ++x) {
+          float value_sum = 0.0F;
+          for (std::uint32_t group = 0; group < 2U; ++group) {
+            const auto* pixel =
+                raw + ((static_cast<std::size_t>(group) * logical_.h + y) *
+                           width_stride +
+                       x) *
+                          16U;
+            const int8x16_t quantized = vld1q_s8(pixel);
+            const int16x8_t low16 = vmovl_s8(vget_low_s8(quantized));
+            const int16x8_t high16 = vmovl_s8(vget_high_s8(quantized));
+            const int32x4_t values0 = vmovl_s16(vget_low_s16(low16));
+            const int32x4_t values1 = vmovl_s16(vget_high_s16(low16));
+            const int32x4_t values2 = vmovl_s16(vget_low_s16(high16));
+            const int32x4_t values3 = vmovl_s16(vget_high_s16(high16));
+            vst1q_f32(
+                dequantized,
+                vmulq_f32(
+                    vsubq_f32(vcvtq_f32_s32(values0), zero_point), scale));
+            vst1q_f32(
+                dequantized + 4,
+                vmulq_f32(
+                    vsubq_f32(vcvtq_f32_s32(values1), zero_point), scale));
+            vst1q_f32(
+                dequantized + 8,
+                vmulq_f32(
+                    vsubq_f32(vcvtq_f32_s32(values2), zero_point), scale));
+            vst1q_f32(
+                dequantized + 12,
+                vmulq_f32(
+                    vsubq_f32(vcvtq_f32_s32(values3), zero_point), scale));
+            for (std::uint32_t lane = 0; lane < 16U; ++lane) {
+              const std::uint32_t channel = group * 16U + lane;
+              value_sum = std::fma(
+                  coefficients[channel], dequantized[lane], value_sum);
+            }
+          }
+          destination[static_cast<std::size_t>(y) * logical_.w + x] =
+              value_sum;
+        }
+      }
+      return;
+    }
+    for (std::uint32_t channel = 0; channel < 32; ++channel) {
+      const std::uint32_t channel_group = channel / 2U;
+      const std::uint32_t channel_lane = channel % 2U;
+      const auto* channel_plane =
+          raw + static_cast<std::size_t>(channel_group) * logical_.h *
+                    width_stride * 2U;
+      const float coefficient = coefficients[channel];
+      for (std::uint32_t y = 0; y < logical_.h; ++y) {
+        const auto* source =
+            channel_plane + static_cast<std::size_t>(y) * width_stride * 2U;
+        float* target =
+            destination + static_cast<std::size_t>(y) * logical_.w;
+        std::uint32_t x = 0;
+        for (; x + 8U <= logical_.w; x += 8U) {
+          const int8x8x2_t interleaved = vld2_s8(source + x * 2U);
+          const int8x8_t quantized = interleaved.val[channel_lane];
+          const int16x8_t widened16 = vmovl_s8(quantized);
+          const int32x4_t low32 = vmovl_s16(vget_low_s16(widened16));
+          const int32x4_t high32 = vmovl_s16(vget_high_s16(widened16));
+          const float32x4_t low_value = vmulq_f32(
+              vsubq_f32(vcvtq_f32_s32(low32), zero_point), scale);
+          const float32x4_t high_value = vmulq_f32(
+              vsubq_f32(vcvtq_f32_s32(high32), zero_point), scale);
+          vst1q_f32(target + x,
+                    vmlaq_n_f32(vld1q_f32(target + x), low_value, coefficient));
+          vst1q_f32(
+              target + x + 4U,
+              vmlaq_n_f32(vld1q_f32(target + x + 4U), high_value, coefficient));
+        }
+        for (; x < logical_.w; ++x) {
+          target[x] += coefficient * value(channel, y, x);
+        }
+      }
+    }
+#else
+    (void)coefficients;
+    (void)destination;
+    throw std::runtime_error("neon_exact requires an AArch64 build");
+#endif
+  }
+
   float value(const std::uint32_t c, const std::uint32_t y,
               const std::uint32_t x) const {
     const std::size_t index = native_index(c, y, x);
@@ -448,17 +592,24 @@ struct InferenceOutput {
   double inference_ms = 0.0;
   double output_sync_ms = 0.0;
   double postprocess_ms = 0.0;
+  double decode_ms = 0.0;
+  double prototype_ms = 0.0;
+  double resize_union_ms = 0.0;
+  double pack_ms = 0.0;
   double total_ms = 0.0;
 };
 
 class RknnWorkerRuntime {
  public:
   RknnWorkerRuntime(const rknn_context context, std::string preprocess_mode,
-                    std::string output_mode,
+                    std::string output_mode, std::string postprocess_backend,
+                    const bool validate_postprocess_exact,
                     const float score_threshold, const float nms_threshold,
                     const float mask_threshold, const std::uint32_t max_instances)
       : context_(context), preprocess_mode_(std::move(preprocess_mode)),
         output_mode_(std::move(output_mode)),
+        postprocess_backend_(std::move(postprocess_backend)),
+        validate_postprocess_exact_(validate_postprocess_exact),
         score_threshold_(score_threshold), nms_threshold_(nms_threshold),
         mask_threshold_(std::clamp(mask_threshold, 1.0e-6F, 1.0F - 1.0e-6F)),
         max_instances_(max_instances) {
@@ -467,8 +618,10 @@ class RknnWorkerRuntime {
     selected_.reserve(max_instances_);
     low_resolution_.resize(
         static_cast<std::size_t>(max_instances_) * 120U * 160U);
+    validation_reference_.resize(120U * 160U);
     union_input_.resize(
         static_cast<std::size_t>(input_width_) * input_height_);
+    initialize_resize_tables();
   }
 
   RknnWorkerRuntime(const RknnWorkerRuntime&) = delete;
@@ -557,6 +710,10 @@ class RknnWorkerRuntime {
 
  private:
   void initialize_io() {
+    if (postprocess_backend_ == "neon_exact" && output_mode_ != "native") {
+      throw std::runtime_error(
+          "neon_exact requires output_mode=native");
+    }
     rknn_input_output_num count {};
     if (rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &count, sizeof(count)) !=
             RKNN_SUCC ||
@@ -639,6 +796,53 @@ class RknnWorkerRuntime {
       }
       output_memories_.push_back(memory);
     }
+    if (postprocess_backend_ == "neon_exact") {
+      TensorView prototype(native_output_attrs_[6], logical_output_attrs_[6],
+                           output_memories_[6]->virt_addr);
+      if (!prototype.supports_neon_exact_projection()) {
+        const auto& attr = native_output_attrs_[6];
+        throw std::runtime_error(
+            "neon_exact requested but prototype output is not INT8 affine "
+            "NC1HWC2 [1,32,120,160]: fmt=" +
+            std::to_string(static_cast<int>(attr.fmt)) +
+            " type=" + std::to_string(static_cast<int>(attr.type)) +
+            " qnt=" + std::to_string(static_cast<int>(attr.qnt_type)) +
+            " n_dims=" + std::to_string(attr.n_dims) +
+            " dims=" + std::to_string(attr.dims[0]) + "," +
+            std::to_string(attr.dims[1]) + "," +
+            std::to_string(attr.dims[2]) + "," +
+            std::to_string(attr.dims[3]) + "," +
+            std::to_string(attr.dims[4]) +
+            " w_stride=" + std::to_string(attr.w_stride));
+      }
+    }
+  }
+
+  void initialize_resize_tables() {
+    resize_x0_.resize(input_width_);
+    resize_x1_.resize(input_width_);
+    resize_wx_.resize(input_width_);
+    for (std::uint32_t x = 0; x < input_width_; ++x) {
+      const float source_x =
+          (static_cast<float>(x) + 0.5F) * 160.0F / input_width_ - 0.5F;
+      const int floor_x = static_cast<int>(std::floor(source_x));
+      resize_x0_[x] = std::clamp(floor_x, 0, 159);
+      resize_x1_[x] = std::min(159, resize_x0_[x] + 1);
+      resize_wx_[x] =
+          std::clamp(source_x - std::floor(source_x), 0.0F, 1.0F);
+    }
+    resize_y0_.resize(input_height_);
+    resize_y1_.resize(input_height_);
+    resize_wy_.resize(input_height_);
+    for (std::uint32_t y = 0; y < input_height_; ++y) {
+      const float source_y =
+          (static_cast<float>(y) + 0.5F) * 120.0F / input_height_ - 0.5F;
+      const int floor_y = static_cast<int>(std::floor(source_y));
+      resize_y0_[y] = std::clamp(floor_y, 0, 119);
+      resize_y1_[y] = std::min(119, resize_y0_[y] + 1);
+      resize_wy_[y] =
+          std::clamp(source_y - std::floor(source_y), 0.0F, 1.0F);
+    }
   }
 
   void release_io() {
@@ -706,6 +910,11 @@ class RknnWorkerRuntime {
     }
 #endif
     if (exact) {
+      if (destination_width_stride == input_width_) {
+        std::memcpy(destination, job.rgb.data(),
+                    static_cast<std::size_t>(input_height_) * source_row_bytes);
+        return true;
+      }
       for (std::uint32_t row = 0; row < input_height_; ++row) {
         std::memcpy(
             destination + static_cast<std::size_t>(row) * destination_row_bytes,
@@ -785,6 +994,7 @@ class RknnWorkerRuntime {
       }
     }
 
+    const auto decode_started = Clock::now();
     candidates_.clear();
     std::uint32_t source_index = 0;
     for (std::uint32_t level = 0; level < 3; ++level) {
@@ -854,6 +1064,7 @@ class RknnWorkerRuntime {
         }
       }
     }
+    output->decode_ms = elapsed_ms(decode_started, Clock::now());
 
     output->packed_mask.assign(
         (static_cast<std::size_t>(info.source_width) * info.source_height + 7U) /
@@ -874,33 +1085,44 @@ class RknnWorkerRuntime {
       const auto& candidate = selected_[selected_index];
       float* low_resolution =
           low_resolution_.data() + selected_index * prototype_plane;
-      for (std::uint32_t y = 0; y < 120; ++y) {
-        for (std::uint32_t x = 0; x < 160; ++x) {
-          float value = 0.0F;
-          for (std::uint32_t channel = 0; channel < 32; ++channel) {
-            value += candidate.coefficients[channel] *
-                     prototype.value(channel, y, x);
+      const auto prototype_started = Clock::now();
+      if (postprocess_backend_ == "neon_exact") {
+        prototype.project_neon_exact(candidate.coefficients, low_resolution);
+        if (validate_postprocess_exact_) {
+          prototype.project_reference(candidate.coefficients,
+                                      validation_reference_.data());
+          if (std::memcmp(low_resolution, validation_reference_.data(),
+                          prototype_plane * sizeof(float)) != 0) {
+            std::size_t mismatch = 0;
+            while (mismatch < prototype_plane &&
+                   std::memcmp(low_resolution + mismatch,
+                               validation_reference_.data() + mismatch,
+                               sizeof(float)) == 0) {
+              ++mismatch;
+            }
+            throw std::runtime_error(
+                "neon_exact prototype mismatch at index " +
+                std::to_string(mismatch));
           }
-          low_resolution[static_cast<std::size_t>(y) * 160U + x] = value;
         }
+      } else {
+        prototype.project_reference(candidate.coefficients, low_resolution);
       }
+      output->prototype_ms +=
+          elapsed_ms(prototype_started, Clock::now());
       const int x1 = std::clamp<int>(std::floor(candidate.x1), 0, input_width_);
       const int y1 = std::clamp<int>(std::floor(candidate.y1), 0, input_height_);
       const int x2 = std::clamp<int>(std::ceil(candidate.x2), 0, input_width_);
       const int y2 = std::clamp<int>(std::ceil(candidate.y2), 0, input_height_);
+      const auto resize_started = Clock::now();
       for (int y = y1; y < y2; ++y) {
-        const float source_y =
-            (static_cast<float>(y) + 0.5F) * 120.0F / input_height_ - 0.5F;
-        const int py0 = std::clamp<int>(std::floor(source_y), 0, 119);
-        const int py1 = std::min(119, py0 + 1);
-        const float wy = std::clamp(source_y - std::floor(source_y), 0.0F, 1.0F);
+        const int py0 = resize_y0_[static_cast<std::size_t>(y)];
+        const int py1 = resize_y1_[static_cast<std::size_t>(y)];
+        const float wy = resize_wy_[static_cast<std::size_t>(y)];
         for (int x = x1; x < x2; ++x) {
-          const float source_x =
-              (static_cast<float>(x) + 0.5F) * 160.0F / input_width_ - 0.5F;
-          const int px0 = std::clamp<int>(std::floor(source_x), 0, 159);
-          const int px1 = std::min(159, px0 + 1);
-          const float wx =
-              std::clamp(source_x - std::floor(source_x), 0.0F, 1.0F);
+          const int px0 = resize_x0_[static_cast<std::size_t>(x)];
+          const int px1 = resize_x1_[static_cast<std::size_t>(x)];
+          const float wx = resize_wx_[static_cast<std::size_t>(x)];
           const float top =
               low_resolution[static_cast<std::size_t>(py0) * 160U + px0] *
                   (1.0F - wx) +
@@ -914,6 +1136,7 @@ class RknnWorkerRuntime {
           }
         }
       }
+      output->resize_union_ms += elapsed_ms(resize_started, Clock::now());
       ResultInstance instance {};
       instance.x1 = std::clamp<int>(
           std::lround((candidate.x1 - info.pad_x) / info.scale), 0,
@@ -931,35 +1154,62 @@ class RknnWorkerRuntime {
       output->instances.push_back(instance);
     }
 
-    for (std::uint32_t source_y = 0; source_y < info.source_height; ++source_y) {
-      const std::uint32_t resized_y =
-          std::min(info.resized_height - 1U,
-                   static_cast<std::uint32_t>(
-                       static_cast<std::uint64_t>(source_y) *
-                       info.resized_height / info.source_height));
-      const std::uint32_t input_y = info.pad_y + resized_y;
-      for (std::uint32_t source_x = 0; source_x < info.source_width; ++source_x) {
-        const std::uint32_t resized_x =
-            std::min(info.resized_width - 1U,
+    const auto pack_started = Clock::now();
+    const bool exact_output =
+        info.source_width == input_width_ &&
+        info.source_height == input_height_ && info.pad_x == 0U &&
+        info.pad_y == 0U && info.resized_width == input_width_ &&
+        info.resized_height == input_height_;
+    if (exact_output) {
+      const std::size_t pixel_count =
+          static_cast<std::size_t>(input_width_) * input_height_;
+      for (std::size_t base = 0; base < pixel_count; base += 8U) {
+        std::uint8_t packed = 0U;
+        const std::size_t limit = std::min<std::size_t>(8U, pixel_count - base);
+        for (std::size_t bit = 0; bit < limit; ++bit) {
+          if (union_input_[base + bit] != 0U) {
+            packed |= static_cast<std::uint8_t>(1U << bit);
+          }
+        }
+        output->packed_mask[base / 8U] = packed;
+      }
+    } else {
+      for (std::uint32_t source_y = 0; source_y < info.source_height;
+           ++source_y) {
+        const std::uint32_t resized_y =
+            std::min(info.resized_height - 1U,
                      static_cast<std::uint32_t>(
-                         static_cast<std::uint64_t>(source_x) *
-                         info.resized_width / info.source_width));
-        const std::uint32_t input_x = info.pad_x + resized_x;
-        if (union_input_[static_cast<std::size_t>(input_y) * input_width_ +
-                         input_x] != 0U) {
-          const std::size_t bit =
-              static_cast<std::size_t>(source_y) * info.source_width + source_x;
-          output->packed_mask[bit / 8U] |=
-              static_cast<std::uint8_t>(1U << (bit % 8U));
+                         static_cast<std::uint64_t>(source_y) *
+                         info.resized_height / info.source_height));
+        const std::uint32_t input_y = info.pad_y + resized_y;
+        for (std::uint32_t source_x = 0; source_x < info.source_width;
+             ++source_x) {
+          const std::uint32_t resized_x =
+              std::min(info.resized_width - 1U,
+                       static_cast<std::uint32_t>(
+                           static_cast<std::uint64_t>(source_x) *
+                           info.resized_width / info.source_width));
+          const std::uint32_t input_x = info.pad_x + resized_x;
+          if (union_input_[static_cast<std::size_t>(input_y) * input_width_ +
+                           input_x] != 0U) {
+            const std::size_t bit =
+                static_cast<std::size_t>(source_y) * info.source_width +
+                source_x;
+            output->packed_mask[bit / 8U] |=
+                static_cast<std::uint8_t>(1U << (bit % 8U));
+          }
         }
       }
     }
+    output->pack_ms = elapsed_ms(pack_started, Clock::now());
     output->status = ResultStatus::kOk;
   }
 
   rknn_context context_ = 0;
   std::string preprocess_mode_;
   std::string output_mode_;
+  std::string postprocess_backend_;
+  bool validate_postprocess_exact_ = false;
   float score_threshold_ = 0.30F;
   float nms_threshold_ = 0.45F;
   float mask_threshold_ = 0.50F;
@@ -977,7 +1227,14 @@ class RknnWorkerRuntime {
   std::vector<Candidate> candidates_;
   std::vector<Candidate> selected_;
   std::vector<float> low_resolution_;
+  std::vector<float> validation_reference_;
   std::vector<std::uint8_t> union_input_;
+  std::vector<int> resize_x0_;
+  std::vector<int> resize_x1_;
+  std::vector<float> resize_wx_;
+  std::vector<int> resize_y0_;
+  std::vector<int> resize_y1_;
+  std::vector<float> resize_wy_;
 };
 
 struct Counters {
@@ -1046,6 +1303,10 @@ class ResultPublisher {
     snapshot.inference_ms = output.inference_ms;
     snapshot.output_sync_ms = output.output_sync_ms;
     snapshot.postprocess_ms = output.postprocess_ms;
+    snapshot.decode_ms = output.decode_ms;
+    snapshot.prototype_ms = output.prototype_ms;
+    snapshot.resize_union_ms = output.resize_union_ms;
+    snapshot.pack_ms = output.pack_ms;
     snapshot.total_ms = output.total_ms;
     snapshot.claimed_count = counters_.claimed.load(std::memory_order_relaxed);
     snapshot.completed_count =
@@ -1235,6 +1496,7 @@ int run_backend(const Options& options) {
     for (std::size_t index = 0; index < 2; ++index) {
       auto runtime = std::make_unique<RknnWorkerRuntime>(
           contexts[index], options.preprocess, options.output_mode,
+          options.postprocess_backend, options.validate_postprocess_exact,
           options.score_threshold,
           options.nms_threshold, options.mask_threshold, options.max_instances);
       workers[index] = std::make_unique<Worker>(
@@ -1248,6 +1510,9 @@ int run_backend(const Options& options) {
               << ',' << options.cpu_cores[1]
               << " preprocess=" << options.preprocess
               << " output_mode=" << options.output_mode
+              << " postprocess_backend=" << options.postprocess_backend
+              << " validate_postprocess_exact="
+              << (options.validate_postprocess_exact ? 1 : 0)
               << '\n';
 
     std::uint64_t last_claimed_publish_sequence = 0;

@@ -39,6 +39,8 @@ rknn_lane_segmenter:
   c_api_binary: native/lane_rknn_backend/build/lane_rknn_backend
   preprocess_backend: direct
   output_mode: native
+  postprocess_backend: neon_exact
+  validate_postprocess_exact: false
   startup_timeout_sec: 8.0
   core_mask: NPU_CORE_0
   parallel: true
@@ -50,10 +52,12 @@ rknn_lane_segmenter:
   max_result_age_ms: 50.0
   result_notification: eventfd
   target_result_lag_frames: 1
-  fresh_result_wait_ms: 2.0
+  fresh_result_wait_ms: 0.0
   drop_stale_results: true
 
 lane_geometry:
+  row_runs_backend: native
+  native_row_runs_library: native/lane_geometry_backend/build/libxsmart_lane_geometry.so
   roi:
     top_ratio: 0.585
     bottom_ratio: 1.0
