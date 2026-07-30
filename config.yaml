@@ -50,7 +50,7 @@ rknn_lane_segmenter:
   max_result_age_ms: 50.0
   result_notification: eventfd
   target_result_lag_frames: 1
-  fresh_result_wait_ms: 0.0
+  fresh_result_wait_ms: 2.0
   drop_stale_results: true
 
 lane_geometry:
@@ -265,8 +265,8 @@ visualizer:
   save_dir: outputs/visual
   video_name: xsmart.mp4
   video_fourcc: mp4v
-  video_fps: 25
-  frame_stride: 1
+  video_fps: 30
+  frame_stride: 2
 
 logger:
   enable: false
