@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -203,9 +204,22 @@ class LaneTracker:
         if not previous_points or not current_points:
             return list(current_points)
 
+        ordered_previous_points = sorted(
+            previous_points,
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        descending_y_keys = [
+            -int(previous_y)
+            for _previous_x, previous_y in ordered_previous_points
+        ]
         smoothed_points: List[Tuple[int, int]] = []
         for curr_x, curr_y in current_points:
-            previous_x = self._sample_previous_centerline_x(previous_points, curr_y)
+            previous_x = self._sample_ordered_previous_centerline_x(
+                ordered_previous_points,
+                curr_y,
+                descending_y_keys,
+            )
             delta_x = max(
                 -self.max_centerline_point_shift_px,
                 min(self.max_centerline_point_shift_px, float(curr_x - previous_x)),
@@ -237,16 +251,36 @@ class LaneTracker:
             return float(previous_points[0][0])
 
         ordered_points = sorted(previous_points, key=lambda item: item[1], reverse=True)
+        return self._sample_ordered_previous_centerline_x(
+            ordered_points,
+            target_y,
+        )
+
+    @staticmethod
+    def _sample_ordered_previous_centerline_x(
+        ordered_points: List[Tuple[int, int]],
+        target_y: int,
+        descending_y_keys: List[int] | None = None,
+    ) -> float:
+        """Interpolate one x coordinate from points already ordered by descending y."""
+
         if target_y >= ordered_points[0][1]:
             return float(ordered_points[0][0])
         if target_y <= ordered_points[-1][1]:
             return float(ordered_points[-1][0])
 
-        for index in range(len(ordered_points) - 1):
-            x1, y1 = ordered_points[index]
-            x2, y2 = ordered_points[index + 1]
-            if y1 >= target_y >= y2 and y1 != y2:
-                ratio = float(target_y - y1) / float(y2 - y1)
-                return float(x1 + (x2 - x1) * ratio)
+        if descending_y_keys is None:
+            descending_y_keys = [
+                -int(previous_y)
+                for _previous_x, previous_y in ordered_points
+            ]
+        lower_index = bisect_left(descending_y_keys, -int(target_y))
+        upper_index = max(0, lower_index - 1)
+        lower_index = min(len(ordered_points) - 1, lower_index)
+        x1, y1 = ordered_points[upper_index]
+        x2, y2 = ordered_points[lower_index]
+        if y1 != y2:
+            ratio = float(target_y - y1) / float(y2 - y1)
+            return float(x1 + (x2 - x1) * ratio)
 
         return float(ordered_points[-1][0])
