@@ -14,6 +14,7 @@ import requests
 
 
 QUESTION_SUFFIX = (
+    "."
     "只有“左”和“右”两个方向，回答最终要走哪个方向。"
     "只用“left”或“right”回答。"
 )
