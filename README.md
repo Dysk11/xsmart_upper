@@ -388,13 +388,16 @@ car_avoidance:
   enabled: true
   entry_duration_s: 1.0
   edge_slow_margin_px: 20
+  route_offset_px: 0
   release_duration_s: 1.0
   speed_state: 1
 ```
 
-规划器在相同 ROI 行上对齐正常中心线与锁定侧 track 边界，进入时用 1 秒时间
-smoothstep 从正常路线过渡到边界路线；新 AI 检测结果确认 avoidance ROI 内已无 car 后，
-模式切换为 `CAR_AVOID_RECOVERY`，再用 1 秒 smoothstep 回到当前正常中心线。
+`route_offset_px` 为非负像素值：锁定左边界时向左偏移，锁定右边界时向右偏移；
+偏移结果会裁剪到巡线 ROI 的水平范围，默认 `0` 保持原路线不变。规划器在相同 ROI
+行上对齐正常中心线与偏移后的锁定侧 track 边界，进入时用 1 秒时间 smoothstep
+从正常路线过渡到避障路线；新 AI 检测结果确认 avoidance ROI 内已无 car 后，模式切换为
+`CAR_AVOID_RECOVERY`，再用 1 秒 smoothstep 回到当前正常中心线。
 锁定侧边界每帧只做一次稠密化和短缺口线性插值，所有目标行复用该结果；进入和
 恢复阶段对齐相同 y 行后直接逐点混合，不重复排序边界。该方法不进行栅格搜索或
 曲线拟合。

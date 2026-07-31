@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
 
@@ -58,6 +59,7 @@ class CarAvoidancePlanner:
         self.entry_duration_s = float(config.get("entry_duration_s", 1.0))
         self.release_duration_s = float(config.get("release_duration_s", 1.0))
         self.edge_slow_margin_px = float(config.get("edge_slow_margin_px", 20.0))
+        self.route_offset_px = float(config.get("route_offset_px", 0.0))
         self.speed_state = validate_moving_speed_state(
             config.get("speed_state", 0x01),
             "car_avoidance.speed_state",
@@ -69,6 +71,10 @@ class CarAvoidancePlanner:
             raise ValueError("car_avoidance.release_duration_s must be > 0")
         if self.edge_slow_margin_px < 0.0:
             raise ValueError("car_avoidance.edge_slow_margin_px must be >= 0")
+        if not math.isfinite(self.route_offset_px) or self.route_offset_px < 0.0:
+            raise ValueError(
+                "car_avoidance.route_offset_px must be finite and >= 0"
+            )
         if self.max_boundary_gap_rows < 0:
             raise ValueError(
                 "lane_geometry.boundary.max_single_side_gap_rows must be >= 0"
@@ -271,6 +277,7 @@ class CarAvoidancePlanner:
             base_route=base_route,
             boundary_rows=track_boundary_rows,
             side=self._locked_side,
+            roi_width=roi_width,
             roi_height=roi_height,
         )
         if not boundary_route:
@@ -513,6 +520,7 @@ class CarAvoidancePlanner:
         base_route: Sequence[Point],
         boundary_rows: Sequence[LaneBoundaryRow],
         side: str,
+        roi_width: int,
         roi_height: int,
     ) -> tuple[list[Point], str]:
         dense_boundary = self._build_dense_boundary(
@@ -520,12 +528,19 @@ class CarAvoidancePlanner:
             side=side,
             roi_height=roi_height,
         )
+        offset_x = -self.route_offset_px if side == "left" else self.route_offset_px
+        max_x = float(max(0, roi_width - 1))
         route: list[Point] = []
         for _, y in base_route:
             boundary_x = self._sample_dense_boundary(dense_boundary, y)
             if boundary_x is None:
                 return [], f"missing {side} track boundary at roi_y={y:.1f}"
-            route.append((float(boundary_x), float(y)))
+            route.append(
+                (
+                    clamp(float(boundary_x) + offset_x, 0.0, max_x),
+                    float(y),
+                )
+            )
         return route, ""
 
     def _build_dense_boundary(

@@ -20,6 +20,7 @@ def make_planner(**overrides: object) -> CarAvoidancePlanner:
         "enabled": True,
         "entry_duration_s": 1.0,
         "edge_slow_margin_px": 20,
+        "route_offset_px": 0,
         "release_duration_s": 1.0,
     }
     config.update(overrides)
@@ -414,6 +415,7 @@ def test_dense_boundary_preserves_fractional_y_interpolation() -> None:
         [(0.0, 80.5)],
         rows,
         side="left",
+        roi_width=200,
         roi_height=200,
     )
 
@@ -429,11 +431,87 @@ def test_exact_valid_boundary_does_not_require_an_adjacent_valid_row() -> None:
         [(0.0, 80.0)],
         rows,
         side="left",
+        roi_width=200,
         roi_height=200,
     )
 
     assert reason == ""
     assert route == pytest.approx([(40.0, 80.0)])
+
+
+@pytest.mark.parametrize(
+    ("center_x", "expected_side", "expected_x"),
+    [
+        (90.0, "left", 30.0),
+        (110.0, "right", 170.0),
+    ],
+)
+def test_route_offset_moves_outward_from_locked_boundary(
+    center_x: float,
+    expected_side: str,
+    expected_x: float,
+) -> None:
+    planner = make_planner(route_offset_px=10)
+    centerline = [(center_x, float(y)) for y in range(199, -1, -4)]
+
+    result = fully_entered(
+        [car((80, 60, 120, 100))],
+        planner=planner,
+        centerline=centerline,
+    )
+
+    assert result.locked_side == expected_side
+    assert route_x(result) == pytest.approx(expected_x)
+    assert CarAvoidancePlanner._interpolate_x(
+        result.boundary_route_points,
+        80.0,
+    ) == pytest.approx(expected_x)
+    assert_route_clear(result)
+
+
+def test_route_offset_is_clamped_to_roi_and_triggers_edge_limit() -> None:
+    result = fully_entered(
+        [car((80, 60, 120, 100))],
+        planner=make_planner(route_offset_px=50),
+    )
+
+    assert result.locked_side == "left"
+    assert route_x(result) == pytest.approx(0.0)
+    assert result.edge_limited
+    assert result.mode == "CAR_AVOID_EDGE"
+
+
+def test_offset_route_collision_with_secondary_car_stops() -> None:
+    result = fully_entered(
+        [
+            car((80, 60, 120, 100)),
+            car((25, 20, 35, 50)),
+        ],
+        planner=make_planner(route_offset_px=10),
+    )
+
+    assert result.locked_side == "left"
+    assert route_x(result) == pytest.approx(30.0)
+    assert result.stop_required
+    assert result.mode == "CAR_AVOID_STOP"
+    assert "intersects an original car box" in result.reason
+
+
+def test_offset_route_is_used_through_entry_and_recovery() -> None:
+    planner = make_planner(route_offset_px=10)
+    obj = car((80, 60, 120, 100))
+
+    started = plan([obj], planner=planner, detection_id=1, now=10.0)
+    halfway_in = plan([obj], planner=planner, detection_id=1, now=10.5)
+    active = plan([obj], planner=planner, detection_id=1, now=11.0)
+    started_out = plan([], planner=planner, detection_id=2, now=12.0)
+    halfway_out = plan([], planner=planner, detection_id=2, now=12.5)
+
+    assert route_x(started) == pytest.approx(90.0)
+    assert route_x(halfway_in) == pytest.approx(60.0)
+    assert route_x(active) == pytest.approx(30.0)
+    assert route_x(started_out) == pytest.approx(route_x(active))
+    assert route_x(halfway_out) == pytest.approx(60.0)
 
 
 @pytest.mark.parametrize(
@@ -647,7 +725,7 @@ def test_recovery_smoothstep_returns_to_current_centerline_in_one_second() -> No
 
 
 def test_car_reappearing_during_recovery_has_no_route_jump() -> None:
-    planner = make_planner(speed_state=1)
+    planner = make_planner(speed_state=1, route_offset_px=10)
     obj = car((80, 60, 120, 100))
     plan([obj], planner=planner, detection_id=1, now=1.0)
     plan([obj], planner=planner, detection_id=1, now=2.0)
@@ -667,7 +745,7 @@ def test_car_reappearing_during_recovery_has_no_route_jump() -> None:
     assert reappeared.locked_side == "left"
     assert reappeared_hint is not None
     assert reappeared_hint.speed_state_override == 1
-    assert route_x(resumed) == pytest.approx(52.5)
+    assert route_x(resumed) == pytest.approx(45.0)
 
 
 def test_car_in_roi_without_centerline_stops() -> None:
@@ -691,6 +769,9 @@ def test_non_car_objects_do_not_activate_avoidance() -> None:
     [
         ({"entry_duration_s": 0}, "entry_duration_s"),
         ({"edge_slow_margin_px": -1}, "edge_slow_margin_px"),
+        ({"route_offset_px": -1}, "route_offset_px"),
+        ({"route_offset_px": float("nan")}, "route_offset_px"),
+        ({"route_offset_px": float("inf")}, "route_offset_px"),
         ({"release_duration_s": 0}, "release_duration_s"),
     ],
 )

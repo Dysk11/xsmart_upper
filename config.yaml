@@ -168,6 +168,7 @@ car_avoidance:
   enabled: true
   entry_duration_s: 0.25
   edge_slow_margin_px: 20
+  route_offset_px: 0
   release_duration_s: 2.0
   speed_state: 1
 
