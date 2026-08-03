@@ -15,10 +15,11 @@
 
 注意：
 
-- 下位机 TC264 已经由队友完成位置环、速度环等底层闭环；
+- 下位机已完成位置环、速度环等底层闭环（具体实现不属于本仓库）；
 - 本项目**不实现**底层 PID、PWM 输出、电机闭环；
 - 上位机只输出高层目标量，例如 `target_speed` 和 `steer_deg`；
-- 若后续需要切换为 TC264 的真实协议，只需替换 `core/io/protocol.py` 与 `core/io/bridge.py`。
+- 上位机与下位机的全部交互集中在 `core/io/protocol.py`（协议打包）与
+  `core/io/bridge.py`（发送通道）两个接口点，其余模块不感知下位机细节。
 
 ## RK3588 部署与环境配置
 
@@ -136,8 +137,8 @@ models/ocr/ppocr_keys_v1.txt
 
 - `camera.mode`：`shared_memory`（默认，与 AR 系统共享 `shm_ar_video`）、
   `camera`（需确认 `device_id`）或 `video`（回放调试，需 `video_path`）；
-- `bridge.type`：测试用 `mock`；实车用 `serial`，并把 `bridge.serial.port`
-  设为实际串口（CH340 通常为 `/dev/ttyUSB0`，115200 8N1）；
+- `bridge.type`：测试用 `mock`；实车用 `serial`，`bridge.serial` 下的端口与
+  通信参数按现场实际通道配置；
 - `visualizer.show_window`：无显示环境设为 `false` 或启动加 `--no-gui`；
   `visualizer.font_path` 板端可留空，程序会自动尝试 wqy-zenhei / Noto CJK
   等系统字体；
@@ -370,7 +371,7 @@ python tools/benchmark_latency.py \
 Serial benchmarking is intentionally blocked unless vehicle motion has been
 physically disabled and `--serial-safety-confirmed` is supplied. The serial
 endpoint is the return of host-side `write()` plus `flush()`; it does not
-include TC264 parsing or mechanical response.
+include lower-machine parsing or mechanical response.
 
 ---
 
@@ -447,9 +448,9 @@ required three 10-second-warmup/60-second-sample runs for both backends.
 car 避让 > Go/Stop 路径 > 吃 coin > 普通巡线
 ```
 
-行人框触发目标点穿越锁存后，运行模式为 `PEDESTRIAN_WAIT`，目标速度和协议
-`speed_state` 均为 0。`car` 原始检测框无法从指定侧安全绕过时使用
-`CAR_AVOID_STOP`，同样发送零速度。
+行人框触发目标点穿越锁存后，运行模式为 `PEDESTRIAN_WAIT`，目标速度和
+`speed_state` 均为停车档。`car` 原始检测框无法从指定侧安全绕过时使用
+`CAR_AVOID_STOP`，同样输出停车指令。
 
 ## 4. coin 目标逻辑
 
@@ -591,48 +592,29 @@ car_avoidance:
 
 ---
 
-## 默认协议说明
+## 各模块与下位机的接口
 
-默认协议位于 `core/io/protocol.py`，使用固定 7 字节二进制帧。高层 payload 仍包含
-`target_speed` 等规划字段仍用于内部策略与日志；运行时根据
-`bridge.drive_speed_state` 写入帧尾字节的低 2 位，停车命令固定写入 `0x00`。
+上位机与下位机之间只有两个接口点，其余模块一律不直接访问串口或构造协议帧：
 
-## UART 通信协议说明
+- `core/io/protocol.py`：协议层，唯一负责把高层控制量打包成下位机可解析的
+  帧；调整帧格式时只修改这里。
+- `core/io/bridge.py`：桥接层，唯一负责把协议帧发送出去；`type: mock` 为
+  模拟输出，`type: serial` 走串口通道，更换物理通道时只修改这里。
 
-本项目通过 CH340 串口 USB 转 TTL 模块将树莓派/RK3588 与下位机（如 Arduino 或 TC264）连接。
+各模块对下位机的接口：
 
-- **配置**: 115200 8N1 (115200 波特率, 8 数据位, 无校验位, 1 停止位)
-- **帧结构**: 2 字节帧头 + 2 字节误差 (Int16) + 2 字节转向角度 (Int16) + 1 字节速度状态
+| 模块 | 对下位机的接口 | 说明 |
+| :--- | :--- | :--- |
+| `core/io/protocol.py` | 高层控制量 → 协议帧 | 唯一协议打包入口，内容由规划结果与 `bridge` 配置决定 |
+| `core/io/bridge.py` | 协议帧 → 串口/模拟输出 | 唯一发送通道，不参与决策 |
+| `core/planning/high_level.py` | `ControlCommand`（`target_speed`、`steer_deg`、`speed_state_override`、`force_mode` 等） | 决策层只产出高层目标量 |
+| `core/planning/*` 与 `core/object/pedestrian_safety.py`（目标选择、避让、行人安全、金币、路径标记、路牌分析） | `ModuleHints` 模式/限速提示 | 只影响 `ControlCommand`，不直接访问串口 |
+| `core/lane/*`、`core/object/*`、`core/ocr/*` | 无直接输出 | 感知结果只交给规划层，不感知下位机 |
 
-| 字节偏移 | 长度 | 定义 | 说明 |
-| :--- | :--- | :--- | :--- |
-| 0 | 1 | 帧头 1 | 固定为 `0xAA` |
-| 1 | 1 | 帧头 2 | 固定为 `0x55` |
-| 2 | 2 | 横向误差 | `lateral_error_px` 转为 Int16 (大端序) |
-| 4 | 2 | 转向角度 | `steer_deg` 转为 Int16 (大端序) |
-| 6 | 1 | 速度状态 | 低 2 位：`0x00` 停止、`0x01` 低速、`0x02` 中速、`0x03` 高速；高 6 位固定为 `0` |
-
-示例代码：
-```python
-data = bytearray([
-    0xAA, 0x55,
-    (error >> 8) & 0xFF, error & 0xFF,
-    (angle >> 8) & 0xFF, angle & 0xFF,
-    speed_state & 0x03
-])
-ser.write(data)
-```
-
-TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读取会导致后续帧错位。
-
-正常行驶档位通过 `bridge.drive_speed_state` 配置，只允许 `1`（低速）、`2`（中速）
-或 `3`（高速），默认值为 `2`。原始横向误差绝对值达到
-`planner.lateral_error_slowdown_threshold_px` 时使用 `planner.curve_speed_state`；
-误差退出阈值后继续保持 `planner.curve_speed_hold_sec` 秒，再恢复正常行驶档位；
-最新有效 AI 结果中有 `car` 框接触或进入 avoidance ROI 时使用
-`car_avoidance.speed_state`，新的无车结果到达后立即释放，即使避障路径仍在恢复。
-`human` 和 `road_sign` 继续按 `hazard_slowdown.hold_sec` 从正常档位降低一级。
-多个档位请求同时生效时取最低档且不累计降档；任何停车命令都固定发送 `0x00`。
+速度档位语义：`bridge.drive_speed_state` 为正常行驶档位（只允许 `1`/`2`/`3`）；
+弯道、car 避让、行人/路牌减速等请求与正常档位仲裁时取最低档且不累计降档；
+任何停车请求都覆盖为停车档（`speed_state=0`）。具体字节编码、串口参数与下位机
+解析规则不在本仓库文档范围，以下位机侧协议文档为准。
 
 ## RKNN 航道分割部署
 
@@ -650,12 +632,6 @@ TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读�
 backend ready`；Lite2 模式输出 `RKNN lane segmenter loaded`。调试窗口在 ROI
 内半透明显示 `track` mask，并显示 `track: ok conf=...`。加载或推理失败不会
 静默回退到 HSV，而会输出一次明确告警并按丢线处理。默认不会保存视频或截图。
-
-## 如何对接 TC264
-
-1. TC264 已经实现底层闭环，本项目只输出高层目标量；
-2. 若需修改协议，请集中修改 `core/io/protocol.py` 和 `core/io/bridge.py`；
-3. 扩展模块输出建议统一整理为 `ModuleHints` 交给 `planner.py`。
 
 ## 巡线算法设计说明
 
@@ -683,7 +659,8 @@ PP-OCRv4 Det/Rec RKNN 模型。候选缺失或面积变化超限会重新累计�
 置信度达到 `0.60` 的非空文字才写入
 `outputs/logs/ocr/ocr_events_YYYYMMDD_HHMMSS.jsonl`；成功后按
 `ocr.cooldown_seconds` 配置全局 OCR 冷却时间，当前默认 10 秒。
-主循环在整个 `ROAD_SIGN_WAIT` 期间持续向下位机发送 `speed_state=0x00`。
+主循环在整个 `ROAD_SIGN_WAIT` 期间持续向下位机输出停车指令（`speed_state`
+为停车档）。
 停车覆盖面积稳定等待、岔路确认和后续千帆 API 请求；API 正常返回或产生
 fallback 决策后恢复配置档位。`ocr.stop_timeout_sec` 控制 OCR/API 总等待上限，默认
 20 秒；超时后取消 pending 请求、忽略迟到结果并保持当前分支。关闭路牌 API 时，
