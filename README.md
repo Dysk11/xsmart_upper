@@ -20,6 +20,208 @@
 - 上位机只输出高层目标量，例如 `target_speed` 和 `steer_deg`；
 - 若后续需要切换为 TC264 的真实协议，只需替换 `core/io/protocol.py` 与 `core/io/bridge.py`。
 
+## RK3588 部署与环境配置
+
+本项目面向 RK3588/RK3588S（示例板卡 Orange Pi 5）的 Linux aarch64 系统部署：
+巡线与目标检测使用 RKNN C API 原生后端，OCR 使用 RKNNLite。以下步骤均在板端
+终端执行，项目根路径示例为 `/home/orangepi/xsmart_upper`，其他板卡可整体替换。
+
+### 环境要求
+
+- 硬件：RK3588/RK3588S（如 Orange Pi 5），建议 4 GB 以上内存；
+- 系统：Linux aarch64（Ubuntu/Debian），Python 3.10+；
+- NPU 驱动与运行时：RKNPU2 Runtime（`librknnrt.so`），与 RKNN-Toolkit2 2.3.2
+  同版本系，确认 `/dev/rknpu` 存在；
+- 构建工具：`g++`（C++17）、`make`、`cmake`；可选 `librga`（缺失时巡线原生
+  后端自动走 CPU 预处理路径）；
+- Python 依赖：`requirements.txt` 列出的包，另需 `rknn-toolkit-lite2==2.3.2`
+  （OCR 的 RKNNLite 执行器依赖，与板端 `librknnrt.so` 保持同版本系）。
+
+### 获取代码
+
+建议在板端直接 `git clone`；也可以从开发机 scp 整个工程（`main.py`、
+`config.yaml`、`core/`、`native/`、`models/`、`tools/`、`utils/`）。从 Windows
+上传的文件可能带 CRLF 行尾，需先修正：
+
+```bash
+sed -i 's/\r$//' config.yaml main.py README.md
+find core native tools utils -type f \
+  \( -name '*.py' -o -name '*.sh' -o -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+  -exec sed -i 's/\r$//' {} +
+git diff --check
+```
+
+`config.yaml` 中的模型、原生库、视频与输出目录路径均按项目根目录解析，
+部署时保持目录结构完整即可。
+
+### 板端环境配置
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake python3-venv fonts-wqy-zenhei
+# 如板卡镜像缺少 RGA，请按板卡 SDK 额外安装 librga 及其头文件（可选）
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -r requirements.txt
+pip install rknn-toolkit-lite2==2.3.2
+```
+
+确认 NPU 运行时可用：
+
+```bash
+ls -l /dev/rknpu
+ldconfig -p | grep rknnrt   # 或 find /usr /usr/local -name 'librknnrt.so' 2>/dev/null
+```
+
+### 构建原生后端
+
+先按板端实际安装位置设置 RKNN/RGA 头文件与库目录（以下为 Orange Pi 5
+实测路径示例）：
+
+```bash
+export RKNN_INCLUDE_DIR=/home/orangepi/Downloads/xsmart_upper_native/native/include
+export RKNN_LIBRARY_DIR=/usr/lib
+export RGA_INCLUDE_DIR=/usr/include/rga
+export RGA_LIBRARY_DIR=/usr/lib
+```
+
+依次构建三个后端，产物均生成在各自的 `build/` 目录：
+
+```bash
+# 1) 巡线 RKNN C API 二进制：native/lane_rknn_backend/build/lane_rknn_backend
+bash native/lane_rknn_backend/build_board.sh
+# 或使用 cmake：
+# cmake -S native/lane_rknn_backend -B native/lane_rknn_backend/build -DCMAKE_BUILD_TYPE=Release
+# cmake --build native/lane_rknn_backend/build -j
+
+# 2) 目标检测 C API 共享库：native/object_rknn_backend/build/libxsmart_object_rknn.so
+cmake -S native/object_rknn_backend -B native/object_rknn_backend/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/object_rknn_backend/build -j
+# 板端无 cmake 时可直接编译：
+# mkdir -p native/object_rknn_backend/build
+# g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -fPIC -shared \
+#   -Inative/object_rknn_backend/include -I"${RKNN_INCLUDE_DIR}" \
+#   native/object_rknn_backend/src/object_backend.cpp \
+#   -L"${RKNN_LIBRARY_DIR:-/lib}" -lrknnrt -pthread \
+#   -o native/object_rknn_backend/build/libxsmart_object_rknn.so
+
+# 3) 巡线几何行游程库：native/lane_geometry_backend/build/libxsmart_lane_geometry.so
+cmake -S native/lane_geometry_backend -B native/lane_geometry_backend/build -DCMAKE_BUILD_TYPE=Release
+cmake --build native/lane_geometry_backend/build -j
+```
+
+构建完成后确认以下产物存在（与 `config.yaml` 中的路径一致）：
+
+```text
+native/lane_rknn_backend/build/lane_rknn_backend
+native/object_rknn_backend/build/libxsmart_object_rknn.so
+native/lane_geometry_backend/build/libxsmart_lane_geometry.so
+```
+
+### 模型与配置文件
+
+`models/` 下三个目录必须完整复制，至少包含：
+
+```text
+models/lane/yolov5n_seg_track_480x640_int8_rk3588.rknn
+models/object/rknn_7classes_0727.rknn
+models/ocr/ppocrv4_det.rknn
+models/ocr/ppocrv4_rec.rknn
+models/ocr/ppocr_keys_v1.txt
+```
+
+板端启动前按现场情况检查/修改 `config.yaml`：
+
+- `camera.mode`：`shared_memory`（默认，与 AR 系统共享 `shm_ar_video`）、
+  `camera`（需确认 `device_id`）或 `video`（回放调试，需 `video_path`）；
+- `bridge.type`：测试用 `mock`；实车用 `serial`，并把 `bridge.serial.port`
+  设为实际串口（CH340 通常为 `/dev/ttyUSB0`，115200 8N1）；
+- `visualizer.show_window`：无显示环境设为 `false` 或启动加 `--no-gui`；
+  `visualizer.font_path` 板端可留空，程序会自动尝试 wqy-zenhei / Noto CJK
+  等系统字体；
+- `road_sign_analyzer`：需要千帆路牌分析时先
+  `export QIANFAN_API_KEY='你的 API Key'` 再启动（详见“RK3588 路牌分析与
+  岔路决策”）。
+
+### 启动与验证
+
+共享内存模式（与 AR 系统同机，默认配置）：
+
+```bash
+python3 main.py
+```
+
+摄像头实车模式：
+
+```bash
+python3 main.py --mode camera --bridge serial
+```
+
+视频回放调试（建议 `--bridge mock`，避免误发串口指令）：
+
+```bash
+python3 main.py --mode video --video /path/to/demo.mp4 --bridge mock
+```
+
+无显示环境：
+
+```bash
+python3 main.py --mode shared_memory --bridge serial --no-gui
+```
+
+正常启动时，生产配置（`runtime_backend: c_api`）终端应出现：
+
+```text
+[LANE_C_API] native dual-context backend ready
+RKNN C API detector loaded on NPU2: ...
+```
+
+Lite2 模式（仅回退/基准场景）会输出 `RKNN lane segmenter loaded`。路牌识别时
+出现 `[OCR]`、`[ROAD_SIGN_ANALYZER]` 日志；按 Ctrl+C 退出。
+
+板端校验（需要测试视频，做固定帧与原生后端一致性检查）：
+
+```bash
+python3 tools/validate_capi_lane.py --video /path/to/test.mp4
+python3 tools/validate_capi_object.py --video /path/to/test.mp4
+python3 tools/validate_lane_geometry_backend.py
+```
+
+注意：`--bridge serial` 会真实向下位机发送指令，实车联调前请确认车辆断电
+或架空，避免意外移动。
+
+### 可选：systemd 开机自启
+
+将以下内容保存为 `/etc/systemd/system/xsmart_upper.service`（路径按实际
+部署替换）：
+
+```ini
+[Unit]
+Description=X-SmartCar Upper Machine
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/orangepi/xsmart_upper
+ExecStart=/home/orangepi/xsmart_upper/.venv/bin/python3 /home/orangepi/xsmart_upper/main.py --mode shared_memory --bridge serial --no-gui
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now xsmart_upper
+sudo systemctl status xsmart_upper
+```
+
+启用自启后不要再手动启动同一配置，避免两个实例同时发送串口指令；
+临时手动运行前先 `sudo systemctl stop xsmart_upper`。
+
 ## 目录结构
 
 ```text
@@ -45,23 +247,6 @@ xsmart_upper/
     fps.py
   README.md
   requirements.txt
-```
-
-## 安装方法
-
-建议先进入项目目录，再创建虚拟环境：
-
-```bash
-cd xsmart_upper
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-如果 RK3588S 上已经有系统 Python，也可以直接安装：
-
-```bash
-pip install -r requirements.txt
 ```
 
 ## 配置文件说明
@@ -147,10 +332,10 @@ camera:
 
 ## 如何运行实时摄像头模式
 
-默认配置就是摄像头模式，先确认 `config.yaml` 中的 `camera.device_id` 和串口参数正确，然后运行：
+摄像头模式需先确认 `config.yaml` 中的 `camera.device_id` 和串口参数正确，然后运行：
 
 ```bash
-python main.py
+python3 main.py --mode camera
 ```
 
 ## 如何运行视频回放模式
@@ -158,7 +343,7 @@ python main.py
 方法一：直接使用主程序切换到视频模式
 
 ```bash
-python main.py --mode video --video /path/to/demo.mp4 --bridge mock
+python3 main.py --mode video --video /path/to/demo.mp4 --bridge mock
 ```
 
 ## Camera-to-command latency benchmark
@@ -229,31 +414,8 @@ rknn_object_detector:
   core_mask: NPU_CORE_2
 ```
 
-目标检测原生库在 RK3588 板端构建：
-
-```bash
-cmake -S native/object_rknn_backend -B native/object_rknn_backend/build \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build native/object_rknn_backend/build -j
-```
-
-If the board image does not include CMake, build the same library directly:
-
-```bash
-mkdir -p native/object_rknn_backend/build
-g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -fPIC -shared \
-  -Inative/object_rknn_backend/include -I"${RKNN_INCLUDE_DIR}" \
-  native/object_rknn_backend/src/object_backend.cpp \
-  -L"${RKNN_LIBRARY_DIR:-/lib}" -lrknnrt -pthread \
-  -o native/object_rknn_backend/build/libxsmart_object_rknn.so
-```
-
-构建时使用与板端 `librknnrt.so` 匹配的 RKNN 2.3.2 头文件。固定帧一致性检查：
-
-```bash
-python tools/validate_capi_object.py \
-  --video outputs/video/record_20260708_135111.mp4
-```
+目标检测原生库在板端构建，构建命令与固定帧一致性校验见“RK3588 部署与
+环境配置”。构建时使用与板端 `librknnrt.so` 匹配的 RKNN 2.3.2 头文件。
 
 生产配置不回退到 Lite2；`--object-backend lite2` 仅供
 `tools/benchmark_latency.py` 做同条件 A/B 基准。
@@ -483,13 +645,11 @@ TC264 必须按固定 7 字节重新解包；继续按旧的 6 字节步长读�
 - 类别：`0 = track`；默认置信度阈值 `0.25`、NMS IoU `0.45`、mask 阈值 `0.5`。
 - 转换环境：RKNN-Toolkit2 `2.3.2`，目标平台 `rk3588`，W8A8 per-channel INT8。
 
-板端应安装与 Toolkit2 2.3.2 兼容的 RKNN Toolkit Lite2 和 RKNPU2 Runtime。准备好依赖后运行：
-
-```bash
-python3 main.py --mode camera --bridge serial
-```
-
-正常启动时终端会输出 `RKNN lane segmenter loaded`。调试窗口在 ROI 内半透明显示 `track` mask，并显示 `track: ok conf=...`。加载或推理失败不会静默回退到 HSV，而会输出一次明确告警并按丢线处理。默认不会保存视频或截图。
+板端环境安装、原生后端构建与启动步骤见“RK3588 部署与环境配置”。生产配置
+（`runtime_backend: c_api`）启动时终端输出 `[LANE_C_API] native dual-context
+backend ready`；Lite2 模式输出 `RKNN lane segmenter loaded`。调试窗口在 ROI
+内半透明显示 `track` mask，并显示 `track: ok conf=...`。加载或推理失败不会
+静默回退到 HSV，而会输出一次明确告警并按丢线处理。默认不会保存视频或截图。
 
 ## 如何对接 TC264
 
